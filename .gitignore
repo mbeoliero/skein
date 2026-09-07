@@ -1,0 +1,7 @@
+/bin/
+*.test
+*.out
+
+.agents
+.claude
+skills-lock.json

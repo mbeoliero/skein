@@ -1,0 +1,50 @@
+version: "2"
+sql:
+  - engine: postgresql
+    schema: migrations
+    queries: internal/store/queries
+    gen:
+      go:
+        package: store
+        out: internal/store
+        sql_package: pgx/v5
+        emit_methods_with_db_argument: true
+        emit_empty_slices: true
+        emit_exported_queries: true
+        rename:
+          id: Id
+          workflow_run_id: WorkflowRunId
+        overrides:
+          - db_type: uuid
+            go_type: uuid.UUID
+          - db_type: uuid
+            nullable: true
+            go_type:
+              type: "*uuid.UUID"
+          - db_type: pg_catalog.int8
+            nullable: true
+            go_type:
+              type: "*int64"
+          - db_type: pg_catalog.int4
+            nullable: true
+            go_type:
+              type: "*int32"
+          - db_type: pg_catalog.int2
+            nullable: true
+            go_type:
+              type: "*int16"
+          - db_type: text
+            nullable: true
+            go_type:
+              type: "*string"
+          - db_type: timestamptz
+            go_type: time.Time
+          - db_type: timestamptz
+            nullable: true
+            go_type:
+              type: "*time.Time"
+          - db_type: pg_catalog.interval
+            go_type: time.Duration
+          - db_type: jsonb
+            go_type:
+              type: "[]byte"

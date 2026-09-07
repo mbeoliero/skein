@@ -1,0 +1,459 @@
+// Package store is the persistence layer: the sqlc output in *.sql.go plus this file,
+// which holds one method per design §6 transaction. Nothing outside this package writes SQL.
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+	"uuid"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+var (
+	// ErrLeaseLost: a fenced statement matched zero rows (§7.2). Roll back, drop, never retry.
+	ErrLeaseLost  = errors.New("store: lease lost")
+	ErrNotFound   = errors.New("store: not found")
+	ErrDuplicate  = errors.New("store: duplicate")
+	ErrReferenced = errors.New("store: referenced")
+	// ErrInvalidOutput: jsonb rejected a settlement document, the output or the errors
+	// entry (SQLSTATE class 22). The text ends up in job_run.errors, hence no "store:" prefix.
+	ErrInvalidOutput = errors.New("rejected by the database")
+)
+
+type Store struct {
+	pool       *pgxpool.Pool
+	q          *Queries
+	path       string // quoted schema name: CREATE SCHEMA and qualified names
+	searchPath string // path + ", pg_temp": the transaction-local search_path
+}
+
+// Open quotes the schema once. pg_temp is listed after it on purpose: a temporary
+// schema that is not named in search_path is searched before every schema that is,
+// so a temp table named job_run in the host's session (TriggerTx, or left on a pooled
+// connection) would silently take the library's reads and writes.
+func Open(pool *pgxpool.Pool, schema string) *Store {
+	path := pgx.Identifier{schema}.Sanitize()
+	return &Store{pool: pool, q: New(), path: path, searchPath: path + ", pg_temp"}
+}
+
+// beginner is what a transaction is opened on: the pool, or one connection when a
+// session-scoped lock must stay on it (Maintain).
+type beginner interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+// cleanupTimeout bounds what runs after a failure or a cancellation: a rollback, the
+// restore of the caller's search_path, the maintenance unlock. Detached from the
+// caller's ctx (which may be the reason for the cleanup) but never unbounded.
+const cleanupTimeout = 5 * time.Second
+
+func cleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+}
+
+// tx runs fn in its own transaction on the pool.
+func (s *Store) tx(ctx context.Context, fn func(ctx context.Context, tx pgx.Tx) error) error {
+	return s.txOn(ctx, s.pool, fn)
+}
+
+// txOn runs fn in one transaction on db with search_path set to the skein schema for
+// that transaction only (set_config(..., true)); the host's pool is not touched.
+func (s *Store) txOn(ctx context.Context, db beginner, fn func(ctx context.Context, tx pgx.Tx) error) (err error) {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			rctx, cancel := cleanupCtx(ctx)
+			defer cancel()
+			_ = tx.Rollback(rctx)
+		}
+	}()
+	if err = s.q.SetSearchPath(ctx, tx, s.searchPath); err != nil {
+		return err
+	}
+	if err = fn(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// inCallerTx runs fn inside the caller's transaction (TriggerTx) and restores the
+// caller's search_path before returning, whatever fn returned.
+func (s *Store) inCallerTx(ctx context.Context, tx pgx.Tx, fn func(ctx context.Context, tx pgx.Tx) error) error {
+	old, err := s.q.CurrentSearchPath(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if err := s.q.SetSearchPath(ctx, tx, s.searchPath); err != nil {
+		return err
+	}
+	err = fn(ctx, tx)
+	// The restore runs on its own bounded ctx: with the caller's ctx already cancelled
+	// pgx would not even send it, and the caller's transaction would go on inside the
+	// library's schema. A failed restore is returned alone: the transaction can no
+	// longer be trusted, so a business result such as ErrDuplicate must not be acted on.
+	rctx, cancel := cleanupCtx(ctx)
+	defer cancel()
+	if rerr := s.q.SetSearchPath(rctx, tx, old); rerr != nil {
+		return fmt.Errorf("store: restore search_path: %w", rerr)
+	}
+	return err
+}
+
+// ───────────── migrations (§6.9, §8) ─────────────
+
+type Migration struct {
+	Version int
+	SQL     string
+}
+
+// Migrate creates the schema if needed and applies every migration newer than the
+// recorded version, all in one transaction under an advisory lock.
+func (s *Store) Migrate(ctx context.Context, migrations []Migration) (err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			rctx, cancel := cleanupCtx(ctx)
+			defer cancel()
+			_ = tx.Rollback(rctx)
+		}
+	}()
+	// The only SQL outside queries/: CREATE SCHEMA takes an identifier, not a parameter.
+	if _, err = tx.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+s.path); err != nil {
+		return err
+	}
+	if err = s.q.SetSearchPath(ctx, tx, s.searchPath); err != nil {
+		return err
+	}
+	if err = s.q.MigrateLock(ctx, tx); err != nil {
+		return err
+	}
+	current, err := s.schemaVersion(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for _, m := range migrations {
+		if m.Version <= current {
+			continue
+		}
+		if _, err = tx.Exec(ctx, m.SQL); err != nil {
+			return fmt.Errorf("migration %d: %w", m.Version, err)
+		}
+		if err = s.q.RecordSchemaVersion(ctx, tx, int32(m.Version)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// SchemaVersion is 0 before the first migration.
+func (s *Store) SchemaVersion(ctx context.Context) (v int, err error) {
+	err = s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		v, err = s.schemaVersion(ctx, tx)
+		return err
+	})
+	return v, err
+}
+
+func (s *Store) schemaVersion(ctx context.Context, tx pgx.Tx) (int, error) {
+	found, err := s.q.SchemaVersionTableExists(ctx, tx, s.path+".schema_version")
+	if err != nil || !found {
+		return 0, err
+	}
+	v, err := s.q.CurrentSchemaVersion(ctx, tx)
+	return int(v), err
+}
+
+// ───────────── definitions (§6.1) ─────────────
+
+func (s *Store) DeclareJob(ctx context.Context, p DeclareJobParams) error {
+	return s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		return s.q.DeclareJob(ctx, tx, p)
+	})
+}
+
+func (s *Store) DeleteJob(ctx context.Context, name string) error {
+	return s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		n, err := s.q.DeleteJob(ctx, tx, name)
+		if isReferenced(err) {
+			return ErrReferenced
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+// ───────────── submit (§6.1) ─────────────
+
+// TriggerJob snapshots the job into a pending run. With tx == nil it uses its own
+// transaction; otherwise it runs inside the caller's. ErrDuplicate carries the id
+// of the in-flight run that holds the dedup key (0 if it finished meanwhile).
+func (s *Store) TriggerJob(ctx context.Context, tx pgx.Tx, p TriggerJobParams) (id int64, err error) {
+	fn := func(ctx context.Context, tx pgx.Tx) error {
+		id, err = s.triggerJob(ctx, tx, p)
+		return err
+	}
+	if tx == nil {
+		err = s.tx(ctx, fn)
+	} else {
+		err = s.inCallerTx(ctx, tx, fn)
+	}
+	return id, err
+}
+
+// dedupRounds bounds the insert / lookup loop of a dedup conflict (§6.1): the run
+// holding the key can finish between the INSERT and the lookup, and then the key is
+// free again, so the INSERT is simply repeated. Three rounds cover a key that keeps
+// changing hands; after that ErrDuplicate carries id 0 and the caller retries.
+const dedupRounds = 3
+
+func (s *Store) triggerJob(ctx context.Context, tx pgx.Tx, p TriggerJobParams) (int64, error) {
+	for range dedupRounds {
+		id, err := s.q.TriggerJob(ctx, tx, p)
+		if err == nil {
+			return id, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return 0, err
+		}
+		found, err := s.q.JobExists(ctx, tx, p.JobName)
+		if err != nil {
+			return 0, err
+		}
+		if !found {
+			return 0, ErrNotFound
+		}
+		if p.DedupKey == nil {
+			return 0, ErrDuplicate // the (schedule_name, scheduled_at) index: that beat exists, nothing to look up
+		}
+		id, err = s.q.FindInflightRun(ctx, tx, FindInflightRunParams{JobName: p.JobName, DedupKey: *p.DedupKey})
+		if err == nil {
+			return id, ErrDuplicate
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return 0, err
+		}
+	}
+	return 0, ErrDuplicate
+}
+
+func (s *Store) GetJobRun(ctx context.Context, id int64) (r JobRun, err error) {
+	err = s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		r, err = s.q.GetJobRun(ctx, tx, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	})
+	return r, err
+}
+
+// ───────────── claim (§6.3) ─────────────
+
+// Claimed is what both claim branches hand to the worker.
+type Claimed ClaimPendingRow
+
+// ClaimPending is branch one: due pending rows, ordered by run_at.
+func (s *Store) ClaimPending(ctx context.Context, types []string, limit int, owner string, ttl time.Duration) (out []Claimed, err error) {
+	err = s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := s.q.ClaimPending(ctx, tx, ClaimPendingParams{ExecutorTypes: types, Lim: int32(limit), Owner: owner, LeaseTtl: ttl})
+		for _, r := range rows {
+			out = append(out, Claimed(r))
+		}
+		return err
+	})
+	return out, err
+}
+
+// ClaimExpired is branch two: running rows whose lease expired; attempt +1, an interrupted entry appended.
+func (s *Store) ClaimExpired(ctx context.Context, types []string, limit int, owner string, ttl time.Duration) (out []Claimed, err error) {
+	err = s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := s.q.ClaimExpired(ctx, tx, ClaimExpiredParams{ExecutorTypes: types, Lim: int32(limit), Owner: owner, LeaseTtl: ttl})
+		for _, r := range rows {
+			out = append(out, Claimed(r))
+		}
+		return err
+	})
+	return out, err
+}
+
+// NextPendingAt is the nearest future run_at among types (§6.3 / §6.11): nil when
+// nothing is scheduled ahead. dbNow is the clock it was read against.
+func (s *Store) NextPendingAt(ctx context.Context, types []string) (next *time.Time, dbNow time.Time, err error) {
+	err = s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := s.q.NextPendingAt(ctx, tx, types)
+		if err != nil {
+			return err
+		}
+		for _, r := range rows {
+			if next == nil || r.NextDue.Before(*next) {
+				next, dbNow = &r.NextDue, r.DbNow
+			}
+		}
+		return nil
+	})
+	return next, dbNow, err
+}
+
+// ───────────── heartbeat (§6.4) ─────────────
+
+// Heartbeat renews every (id, token) pair in one statement; ids absent from the
+// result no longer belong to the caller.
+func (s *Store) Heartbeat(ctx context.Context, ids []int64, tokens []uuid.UUID, ttl, cancelTimeout time.Duration) (rows []HeartbeatRow, err error) {
+	err = s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err = s.q.Heartbeat(ctx, tx, HeartbeatParams{Ids: ids, Tokens: tokens, LeaseTtl: ttl, CancelTimeout: cancelTimeout})
+		return err
+	})
+	return rows, err
+}
+
+// ───────────── settle (§6.5) ─────────────
+
+type Outcome int
+
+// The zero Outcome is invalid on purpose: Settle rejects it instead of guessing.
+const (
+	Succeeded Outcome = iota + 1
+	Cancelled
+	Released    // graceful shutdown: pending again, attempt unchanged
+	Retry       // retryable failure with attempts left
+	Failed      // permanent failure or no attempts left
+	Interrupted // reclaimed with attempt >= max_attempts (§6.3 step 3)
+)
+
+type Settlement struct {
+	Id            int64
+	Token         uuid.UUID
+	WorkflowRunId *int64 // node instance: the parent is locked first and propagate runs after
+	JobName       string
+	Outcome       Outcome
+	Output        []byte        // Succeeded
+	Err           []byte        // one-element JSON array: Released, Retry, Failed
+	Backoff       time.Duration // Retry
+}
+
+type Settled struct {
+	State         string
+	ReleasedCount int // Released only: entries of kind released on this run, for the alert
+}
+
+// Settle is the only path out of running. The fence is WHERE lease_token = $token AND
+// state = 'running'; zero rows is ErrLeaseLost and nothing is written. For a node the
+// parent row is locked first (lock order §7.3) and propagate runs in the same transaction.
+func (s *Store) Settle(ctx context.Context, st Settlement) (res Settled, err error) {
+	err = s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		var wfState string
+		var dag Dag
+		if st.WorkflowRunId != nil {
+			w, err := s.q.LockWorkflowRun(ctx, tx, *st.WorkflowRunId)
+			if err != nil {
+				return err
+			}
+			wfState = w.State
+			if dag, err = parseDag(w.Dag); err != nil {
+				return err
+			}
+		}
+		wfCancelling := wfState == "cancelling"
+		var state string
+		var err error
+		switch st.Outcome {
+		case Succeeded:
+			state, err = s.q.SettleSucceeded(ctx, tx, SettleSucceededParams{Id: st.Id, Token: st.Token, Output: st.Output})
+		case Cancelled:
+			state, err = s.q.SettleCancelled(ctx, tx, SettleCancelledParams{Id: st.Id, Token: st.Token})
+		case Released:
+			var row SettleReleasedRow
+			row, err = s.q.SettleReleased(ctx, tx, SettleReleasedParams{Id: st.Id, Token: st.Token, Err: st.Err, WfCancelling: wfCancelling})
+			state, res.ReleasedCount = row.State, int(row.ReleasedCount)
+		case Retry:
+			state, err = s.q.SettleRetry(ctx, tx, SettleRetryParams{Id: st.Id, Token: st.Token, Err: st.Err, Backoff: st.Backoff, WfCancelling: wfCancelling})
+		case Failed:
+			state, err = s.q.SettleFailed(ctx, tx, SettleFailedParams{Id: st.Id, Token: st.Token, Err: st.Err, WfCancelling: wfCancelling})
+		case Interrupted:
+			state, err = s.q.SettleInterrupted(ctx, tx, SettleInterruptedParams{Id: st.Id, Token: st.Token, WfCancelling: wfCancelling})
+		default:
+			return fmt.Errorf("store: unknown outcome %d", st.Outcome)
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrLeaseLost
+		}
+		if reason, ok := dataException(err); ok {
+			// the output or the errors entry: either is deterministic, never a retry
+			return fmt.Errorf("%w: %s", ErrInvalidOutput, reason)
+		}
+		if err != nil {
+			return err
+		}
+		res.State = state
+		if st.WorkflowRunId != nil && terminal(state) {
+			return s.propagate(ctx, tx, *st.WorkflowRunId, dag, wfState, st.JobName, state)
+		}
+		return nil
+	})
+	return res, err
+}
+
+// isReferenced: ON DELETE RESTRICT raises 23001 (restrict_violation); 23503 is the plain FK violation.
+func isReferenced(err error) bool {
+	return isPgCode(err, "23001") || isPgCode(err, "23503")
+}
+
+func isPgCode(err error, code string) bool {
+	pgErr, ok := errors.AsType[*pgconn.PgError](err)
+	return ok && pgErr.Code == code
+}
+
+// dataException: SQLSTATE class 22, what jsonb raises for a document it cannot store
+// (22P02 invalid syntax, 22P05 \u0000, 22003 numeric overflow); the reason is the
+// server's message plus detail.
+func dataException(err error) (reason string, ok bool) {
+	pgErr, ok := errors.AsType[*pgconn.PgError](err)
+	if !ok || !strings.HasPrefix(pgErr.Code, "22") {
+		return "", false
+	}
+	return strings.TrimSpace(pgErr.Message + " " + pgErr.Detail), true
+}
+
+// ───────────── cancel (§6.6) ─────────────
+
+// ErrNode: the run is a workflow node; nodes are cancelled through their workflow.
+var ErrNode = errors.New("store: run is a workflow node")
+
+// CancelRun cancels a plain run: pending ends now, running is flagged for its holder,
+// in one statement so a row moving between the two is re-checked on its new version.
+// Zero rows means the row is terminal (idempotent), a node, or missing.
+func (s *Store) CancelRun(ctx context.Context, id int64) error {
+	return s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := s.q.CancelRun(ctx, tx, id)
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		isNode, err := s.q.RunIsNode(ctx, tx, id)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			return ErrNotFound
+		case err != nil:
+			return err
+		case isNode:
+			return ErrNode
+		}
+		return nil
+	})
+}
