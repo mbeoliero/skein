@@ -178,6 +178,72 @@ func TestRaceSettleVsResume(t *testing.T) {
 	}
 }
 
+func TestRaceSnoozeVsWorkflowCancellation(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"cancel", "fail_fast"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			pool, schema := freshSchema(t)
+			e := startEngine(t, pool, submitOnly(schema), nil)
+			for _, job := range []string{"x", "y", "z"} {
+				declare(t, e, JobSpec{Name: job, ExecutorType: "x"})
+			}
+			nodes := []Node{{Job: "y"}, {Job: "z", Deps: []string{"y"}}}
+			roots, want := 1, WorkflowCancelled
+			if name == "fail_fast" {
+				nodes = append(nodes, Node{Job: "x"})
+				roots, want = 2, WorkflowFailed
+			}
+			declareWorkflow(t, e, WorkflowSpec{Name: "w", Nodes: nodes})
+			st, ctx := store.Open(pool, schema), t.Context()
+			for round := range raceRounds() {
+				id := triggerWorkflow(t, e, "w", "")
+				got, err := st.ClaimPending(ctx, []string{"x"}, roots, "A", time.Minute)
+				if err != nil || len(got) != roots {
+					t.Fatalf("round %d claim: %v %v", round, got, err)
+				}
+				var snoozing, failing store.Claimed
+				for _, c := range got {
+					if c.JobName == "y" {
+						snoozing = c
+					} else {
+						failing = c
+					}
+				}
+				errs := parallel(
+					func() error {
+						s := settlementFor(snoozing, store.Snoozed)
+						s.Delay = 24 * time.Hour
+						_, err := st.Settle(ctx, s)
+						return err
+					},
+					func() error {
+						if name == "cancel" {
+							return st.CancelWorkflow(ctx, id)
+						}
+						s := settlementFor(failing, store.Failed)
+						s.Err = encodeErr(errEntry{Attempt: 1, Kind: "business", Message: "failed"})
+						_, err := st.Settle(ctx, s)
+						return err
+					},
+				)
+				noDeadlock(t, round, errs)
+				if errs[0] != nil || errs[1] != nil {
+					t.Fatalf("round %d: snooze %v cancel %v", round, errs[0], errs[1])
+				}
+				run, err := e.Workflows().GetRun(ctx, id)
+				if err != nil || run.State != want {
+					t.Fatalf("round %d: workflow %+v %v", round, run, err)
+				}
+				y, z := nodeOf(t, run, "y"), nodeOf(t, run, "z")
+				if y.State != StateCancelled || y.Attempt != 0 || y.Output != nil || z.State != StateCancelled {
+					t.Fatalf("round %d: y %+v z %+v", round, y, z)
+				}
+			}
+		})
+	}
+}
+
 // A heartbeat renewing two running nodes of one workflow races the fail-fast settle
 // of one of them: fail-fast must not wait for additional running rows (§7.3).
 func TestRaceHeartbeatVsFailFast(t *testing.T) {

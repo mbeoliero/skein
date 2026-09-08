@@ -31,7 +31,7 @@ func qualified(schema, table string) string { return pgx.Identifier{schema, tabl
 // interrupted attempt.
 func stealLease(t *testing.T, pool *pgxpool.Pool, schema string, id int64, owner string) {
 	t.Helper()
-	execSQL(t, pool, "UPDATE "+qualified(schema, "job_run")+" SET lease_token = gen_random_uuid(), lease_owner = '"+owner+"', lease_expires_at = now() + interval '1 minute', attempt = attempt + 1 WHERE id = "+itoa(id))
+	execSql(t, pool, "UPDATE "+qualified(schema, "job_run")+" SET lease_token = gen_random_uuid(), lease_owner = '"+owner+"', lease_expires_at = now() + interval '1 minute', attempt = attempt + 1 WHERE id = "+itoa(id))
 }
 
 func leaseToken(t *testing.T, pool *pgxpool.Pool, schema string, id int64) uuid.UUID {
@@ -71,6 +71,195 @@ func TestKillTakeover(t *testing.T) {
 	}
 }
 
+func TestSnoozeSurvivesProcessExit(t *testing.T) {
+	t.Parallel()
+	pool, schema := freshSchema(t)
+	sub := startEngine(t, pool, submitOnly(schema), nil)
+	declare(t, sub, JobSpec{Name: "j", ExecutorType: "snooze", Retry: RetryPolicy{MaxAttempts: 1}})
+	id := trigger(t, sub, "j", "")
+	child := startHelper(t, schema, "SKEIN_HELPER_MODE=snooze")
+	var saved *JobRun
+	waitFor(t, "committed snooze", func() bool {
+		var err error
+		saved, err = sub.Runs().Get(t.Context(), id)
+		return err == nil && saved.State == StatePending && saved.StartedAt != nil
+	})
+	if saved.LeaseExpiresAt != nil || saved.LeaseOwner != "" || saved.Attempt != 0 || len(errorsOf(t, saved)) != 0 {
+		t.Fatalf("snoozed run: %+v", saved)
+	}
+	if err := child.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = child.Wait()
+	b := startEngine(t, pool, fastConfig(schema), func(e *Engine) {
+		e.Register("snooze", func(ctx context.Context, req *Request) (RawJSON, error) {
+			return RawJSON(`"resumed"`), nil
+		})
+	})
+	run, err := b.Runs().Get(t.Context(), id)
+	if err != nil || run.State != StatePending || !run.RunAt.Equal(saved.RunAt) {
+		t.Fatalf("after restart: %+v %v", run, err)
+	}
+	execSql(t, pool, "UPDATE "+qualified(schema, "job_run")+" SET run_at = now() WHERE id = "+itoa(id))
+	run = waitRun(t, b, id, StateSucceeded)
+	if run.Id != id || run.Attempt != 0 || len(errorsOf(t, run)) != 0 || string(run.Output) != `"resumed"` {
+		t.Fatalf("after wake: %+v", run)
+	}
+}
+
+func TestSnoozePendingCanBeCancelled(t *testing.T) {
+	t.Parallel()
+	pool, schema := freshSchema(t)
+	e := startEngine(t, pool, submitOnly(schema), nil)
+	declare(t, e, JobSpec{Name: "j", ExecutorType: "x"})
+	id := trigger(t, e, "j", "")
+	c := claimAsDeadHolder(t, pool, schema, "x")
+	s := settlementFor(c, store.Snoozed)
+	s.Delay = 24 * time.Hour
+	if res, err := e.st.Settle(t.Context(), s); err != nil || res.State != "pending" {
+		t.Fatalf("snooze: %+v %v", res, err)
+	}
+	if err := e.Runs().Cancel(t.Context(), id); err != nil {
+		t.Fatal(err)
+	}
+	run := waitRun(t, e, id, StateCancelled)
+	if run.Attempt != 0 || len(errorsOf(t, run)) != 0 || run.Output != nil {
+		t.Fatalf("cancelled snooze: %+v", run)
+	}
+}
+
+func TestSnoozeFailedSettlementReclaimed(t *testing.T) {
+	t.Parallel()
+	pool, schema := freshSchema(t)
+	e := startEngine(t, pool, submitOnly(schema), nil)
+	declare(t, e, JobSpec{Name: "j", ExecutorType: "x"})
+	id := trigger(t, e, "j", "")
+	c := claimAsDeadHolder(t, pool, schema, "x")
+	jr, reject := qualified(schema, "job_run"), qualified(schema, "reject_snooze")
+	execSql(t, pool, "CREATE FUNCTION "+reject+`() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN RAISE EXCEPTION 'forced snooze rollback' USING ERRCODE = '40001'; END $$;
+		CREATE TRIGGER reject_snooze BEFORE UPDATE ON `+jr+`
+		FOR EACH ROW WHEN (OLD.state = 'running' AND NEW.state = 'pending') EXECUTE FUNCTION `+reject+"()")
+
+	e.settleResult(
+		e.log,
+		c,
+		parseRetry(c.RetryPolicy),
+		nil,
+		Snooze(time.Hour),
+		nil,
+		time.Millisecond,
+	)
+	run, err := e.Runs().Get(t.Context(), id)
+	if err != nil || run.State != StateRunning || run.Attempt != 0 || len(errorsOf(t, run)) != 0 {
+		t.Fatalf("failed settlement changed run: %+v %v", run, err)
+	}
+	if leaseToken(t, pool, schema, id) != c.LeaseToken {
+		t.Fatal("failed settlement cleared its lease")
+	}
+	execSql(t, pool, "DROP TRIGGER reject_snooze ON "+jr)
+	execSql(t, pool, "UPDATE "+jr+" SET lease_expires_at = now() - interval '1 second' WHERE id = "+itoa(id))
+	got, err := e.st.ClaimExpired(t.Context(), []string{"x"}, 1, "B", time.Minute)
+	if err != nil || len(got) != 1 || got[0].Attempt != 1 {
+		t.Fatalf("reclaim: %+v %v", got, err)
+	}
+	if _, err := e.st.Settle(t.Context(), settlementFor(got[0], store.Succeeded)); err != nil {
+		t.Fatal(err)
+	}
+	run = waitRun(t, e, id, StateSucceeded)
+	es := errorsOf(t, run)
+	if run.Attempt != 1 || len(es) != 1 || es[0].Kind != "interrupted" {
+		t.Fatalf("reclaimed failure history: %+v", run)
+	}
+}
+
+// The fake provider has its own durable idempotency record, independent of job_run.
+func fakeVideoSubmit(ctx context.Context, pool *pgxpool.Pool, schema, key string) (RawJSON, error) {
+	var out []byte
+	err := pool.QueryRow(ctx,
+		"INSERT INTO "+qualified(schema, "video_task")+" (request_key) VALUES ($1) "+
+			"ON CONFLICT (request_key) DO UPDATE SET request_key = EXCLUDED.request_key "+
+			"RETURNING jsonb_build_object('task_id', task_id, 'deadline', deadline)", key,
+	).Scan(&out)
+	return out, err
+}
+
+func TestSnoozeWorkflowSubmitCrash(t *testing.T) {
+	t.Parallel()
+	pool, schema := freshSchema(t)
+	provider := qualified(schema, "video_task")
+	execSql(t, pool, "CREATE TABLE "+provider+` (
+		request_key text PRIMARY KEY,
+		task_id uuid NOT NULL DEFAULT gen_random_uuid(),
+		deadline timestamptz NOT NULL DEFAULT now() + interval '24 hours'
+	)`)
+
+	sub := startEngine(t, pool, submitOnly(schema), nil)
+	declare(t, sub, JobSpec{Name: "submit", ExecutorType: "submit-crash"})
+	declare(t, sub, JobSpec{Name: "poll", ExecutorType: "poll", Retry: RetryPolicy{MaxAttempts: 1}})
+	declareWorkflow(t, sub, WorkflowSpec{Name: "video", Nodes: []Node{
+		{Job: "submit"}, {Job: "poll", Deps: []string{"submit"}},
+	}})
+	id := triggerWorkflow(t, sub, "video", "")
+	child := startHelper(t, schema, "SKEIN_HELPER_MODE=snooze")
+	var saved []byte
+	waitFor(t, "provider submission before crash", func() bool {
+		return pool.QueryRow(
+			t.Context(),
+			"SELECT jsonb_build_object('task_id', task_id, 'deadline', deadline) FROM "+provider,
+		).Scan(&saved) == nil
+	})
+	before, err := sub.Workflows().GetRun(t.Context(), id)
+	if err != nil || nodeOf(t, before, "submit").State != StateRunning || nodeOf(t, before, "submit").Output != nil {
+		t.Fatalf("submit must not have settled: %+v %v", before, err)
+	}
+	if err := child.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = child.Wait()
+	var ready atomic.Bool
+	b := startEngine(t, pool, fastConfig(schema), func(e *Engine) {
+		e.Register("submit-crash", func(ctx context.Context, req *Request) (RawJSON, error) {
+			return fakeVideoSubmit(ctx, pool, schema, req.IdempotencyKey)
+		})
+		e.Register("poll", func(ctx context.Context, req *Request) (RawJSON, error) {
+			if string(req.Deps["submit"]) != string(saved) {
+				return nil, Permanent(errors.New("task id or deadline changed after reclaim"))
+			}
+			if !ready.Load() {
+				return nil, Snooze(24 * time.Hour)
+			}
+			return RawJSON(`{"video":"done"}`), nil
+		})
+	})
+	var waiting *WorkflowRun
+	waitFor(t, "poll snooze after submit recovery", func() bool {
+		var err error
+		waiting, err = b.Workflows().GetRun(t.Context(), id)
+		if err != nil {
+			return false
+		}
+		poll := nodeOf(t, waiting, "poll")
+		return poll.State == StatePending && poll.StartedAt != nil
+	})
+	submitted := nodeOf(t, waiting, "submit")
+	if submitted.State != StateSucceeded || submitted.Attempt != 1 || string(submitted.Output) != string(saved) {
+		t.Fatalf("recovered submit: %+v", submitted)
+	}
+	var effects int
+	if err := pool.QueryRow(t.Context(), "SELECT count(*) FROM "+provider).Scan(&effects); err != nil || effects != 1 {
+		t.Fatalf("provider effects %d: %v", effects, err)
+	}
+	ready.Store(true)
+	execSql(t, pool, "UPDATE "+qualified(schema, "job_run")+
+		" SET run_at = now() WHERE id = "+itoa(nodeOf(t, waiting, "poll").Id))
+
+	finished := waitWorkflow(t, b, id, WorkflowSucceeded)
+	if !nodeOf(t, finished, "submit").StartedAt.Equal(*submitted.StartedAt) || nodeOf(t, finished, "poll").Attempt != 0 {
+		t.Fatalf("workflow after poll: %+v", finished)
+	}
+}
+
 // A lease that moved to another holder: the old holder's heartbeat and settle write nothing,
 // and its executor is cancelled with the lease-lost cause and its result dropped.
 func TestStaleTokenCannotWrite(t *testing.T) {
@@ -99,8 +288,18 @@ func TestStaleTokenCannotWrite(t *testing.T) {
 	if err != nil || len(rows) != 0 {
 		t.Fatalf("stale heartbeat renewed: %+v %v", rows, err)
 	}
-	if _, err := st.Settle(t.Context(), store.Settlement{Id: id, Token: old, Outcome: store.Succeeded, Output: []byte(`1`)}); !errors.Is(err, store.ErrLeaseLost) {
-		t.Fatalf("stale settle: %v", err)
+	for _, tc := range []struct {
+		name    string
+		outcome store.Outcome
+	}{{name: "succeeded", outcome: store.Succeeded}, {name: "snoozed", outcome: store.Snoozed}} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := st.Settle(t.Context(), store.Settlement{
+				Id: id, Token: old, Outcome: tc.outcome, Output: []byte(`1`), Delay: time.Hour,
+			})
+			if !errors.Is(err, store.ErrLeaseLost) {
+				t.Fatalf("stale settle: %v", err)
+			}
+		})
 	}
 	run, _ := a.Runs().Get(t.Context(), id)
 	if run.State != StateRunning || run.LeaseOwner != "B" || run.Attempt != 1 {
@@ -121,7 +320,7 @@ func TestMaxAttemptsReclaimFails(t *testing.T) {
 		t.Fatalf("claim: %v %v", got, err)
 	}
 	// one earlier interruption already counted, then A dies too
-	execSQL(t, pool, "UPDATE "+qualified(schema, "job_run")+" SET attempt = 1, lease_expires_at = now() - interval '1 second' WHERE id = "+itoa(id))
+	execSql(t, pool, "UPDATE "+qualified(schema, "job_run")+" SET attempt = 1, lease_expires_at = now() - interval '1 second' WHERE id = "+itoa(id))
 
 	calls := 0
 	b := startEngine(t, pool, fastConfig(schema), func(e *Engine) {
@@ -153,7 +352,7 @@ func TestShutdownCancelsBlockedHeartbeat(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(context.Background())
-	execSQL(t, tx, "SELECT id FROM "+qualified(schema, "job_run")+" WHERE id = "+itoa(id)+" FOR UPDATE")
+	execSql(t, tx, "SELECT id FROM "+qualified(schema, "job_run")+" WHERE id = "+itoa(id)+" FOR UPDATE")
 	waitBlocked(t, pool, "hb-blocked")
 
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
@@ -186,8 +385,8 @@ func TestReclaimAtAttemptCapConverges(t *testing.T) {
 		t.Fatalf("claim: %v %v", got, err)
 	}
 	jr := qualified(schema, "job_run")
-	execSQL(t, pool, "UPDATE "+jr+" SET attempt = 32767, lease_expires_at = now() - interval '1 second' WHERE id = "+itoa(capped))
-	execSQL(t, pool, "UPDATE "+jr+" SET lease_expires_at = now() - interval '1 second' WHERE id = "+itoa(healthy))
+	execSql(t, pool, "UPDATE "+jr+" SET attempt = 32767, lease_expires_at = now() - interval '1 second' WHERE id = "+itoa(capped))
+	execSql(t, pool, "UPDATE "+jr+" SET lease_expires_at = now() - interval '1 second' WHERE id = "+itoa(healthy))
 
 	var calls atomic.Int32
 	b := startEngine(t, pool, fastConfig(schema), func(e *Engine) {
@@ -300,7 +499,7 @@ func TestRunAfterShutdownReleases(t *testing.T) {
 func TestHeartbeatFailureDropsExecutors(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
-	own, err := pgxpool.New(context.Background(), testDSN())
+	own, err := pgxpool.New(context.Background(), testDsn())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,39 +552,46 @@ func TestCancelPendingRun(t *testing.T) {
 	}
 }
 
-// Cancel reaches a running row just as its holder settles it back to pending (a
-// retry): the cancel applies to the row's new version. Two statements, one per state,
-// would both match zero rows and report success with the run queued and unflagged,
-// the fourth zero-row meaning §7.2 forbids (§6.6).
+// Cancel must recheck the new pending tuple after a retry or snooze commits (§6.6).
 func TestCancelSeesRunReleasedMeanwhile(t *testing.T) {
 	t.Parallel()
-	pool, schema := freshSchema(t)
-	named := namedPool(t, schema)
-	e := startEngine(t, named, submitOnly(schema), nil)
-	declare(t, e, JobSpec{Name: "j", ExecutorType: "x"})
-	id := trigger(t, e, "j", "")
-	claimAsDeadHolder(t, pool, schema, "x")
+	for _, tc := range []struct {
+		name    string
+		attempt int
+	}{{name: "retry", attempt: 1}, {name: "snooze", attempt: 0}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pool, schema := freshSchema(t)
+			named := namedPool(t, schema)
+			e := startEngine(t, named, submitOnly(schema), nil)
+			declare(t, e, JobSpec{Name: "j", ExecutorType: "x"})
+			id := trigger(t, e, "j", "")
+			claimAsDeadHolder(t, pool, schema, "x")
+			tx, err := pool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(context.Background())
+			jr := qualified(schema, "job_run")
+			execSql(t, tx, "SELECT id FROM "+jr+" WHERE id = "+itoa(id)+" FOR UPDATE")
+			cancelled := make(chan error, 1)
+			ctx := t.Context()
+			go func() { cancelled <- e.Runs().Cancel(ctx, id) }()
+			waitBlocked(t, pool, schema)
+			execSql(t, tx, "UPDATE "+jr+" SET state = 'pending', attempt = "+itoa(int64(tc.attempt))+
+				", run_at = now() + interval '1 hour', lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL "+
+				"WHERE id = "+itoa(id))
 
-	// the holder's retry settle in progress: the row is locked until it commits
-	tx, err := pool.Begin(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback(context.Background())
-	jr := qualified(schema, "job_run")
-	execSQL(t, tx, "SELECT id FROM "+jr+" WHERE id = "+itoa(id)+" FOR UPDATE")
-	cancelled := make(chan error, 1)
-	go func() { cancelled <- e.Runs().Cancel(context.Background(), id) }()
-	waitBlocked(t, pool, schema)
-	execSQL(t, tx, "UPDATE "+jr+" SET state = 'pending', attempt = attempt + 1, run_at = now() + interval '1 hour', lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL WHERE id = "+itoa(id))
-	if err := tx.Commit(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-cancelled; err != nil {
-		t.Fatal(err)
-	}
-	if run, _ := e.Runs().Get(t.Context(), id); run.State != StateCancelled {
-		t.Fatalf("after cancel: %s, cancel_requested %v", run.State, run.CancelRequested)
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-cancelled; err != nil {
+				t.Fatal(err)
+			}
+			if run, _ := e.Runs().Get(ctx, id); run.State != StateCancelled || run.Attempt != tc.attempt {
+				t.Fatalf("after cancel: %+v", run)
+			}
+		})
 	}
 }
 
@@ -418,32 +624,55 @@ func TestCancelRunningRun(t *testing.T) {
 	}
 }
 
-// exec_duration's outcome label is the state the row took: a retry that the cancel-hit
-// CASE turned into cancelled is reported as cancelled, not failed.
+// Metrics follow the persisted state even if cancellation wins only inside settle.
 func TestExecDurationLabelFollowsSettledState(t *testing.T) {
 	t.Parallel()
-	pool, schema := freshSchema(t)
-	rec := &metricsRec{}
-	cfg := submitOnly(schema)
-	cfg.Metrics = rec
-	e := startEngine(t, pool, cfg, nil)
-	declare(t, e, JobSpec{Name: "j", ExecutorType: "x"})
-	id := trigger(t, e, "j", "")
-	c := claimAsDeadHolder(t, pool, schema, "x")
-	if err := e.Runs().Cancel(t.Context(), id); err != nil {
-		t.Fatal(err)
-	}
-	e.settleResult(e.log, c, parseRetry(c.RetryPolicy), nil, errors.New("boom"), nil, time.Millisecond)
-	if run, _ := e.Runs().Get(t.Context(), id); run.State != StateCancelled {
-		t.Fatalf("run %s", run.State)
-	}
-	if rec.get("exec_duration", "executor_type", "x", "outcome", "cancelled") != 1 || rec.get("exec_duration", "executor_type", "x", "outcome", "failed") != 0 {
-		t.Fatalf("labels %v", rec.counts)
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "retry", err: errors.New("boom")},
+		{name: "snooze", err: Snooze(time.Hour)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pool, schema := freshSchema(t)
+			rec := &metricsRec{}
+			cfg := submitOnly(schema)
+			cfg.Metrics = rec
+			e := startEngine(t, pool, cfg, nil)
+			declare(t, e, JobSpec{Name: "j", ExecutorType: "x"})
+			id := trigger(t, e, "j", "")
+			c := claimAsDeadHolder(t, pool, schema, "x")
+			if err := e.Runs().Cancel(t.Context(), id); err != nil {
+				t.Fatal(err)
+			}
+			e.settleResult(
+				e.log,
+				c,
+				parseRetry(c.RetryPolicy),
+				nil,
+				tc.err,
+				nil,
+				time.Millisecond,
+			)
+			if run, _ := e.Runs().Get(t.Context(), id); run.State != StateCancelled {
+				t.Fatalf("run %s", run.State)
+			}
+			for _, outcome := range []string{"cancelled", "failed", "snoozed"} {
+				want := 0
+				if outcome == "cancelled" {
+					want = 1
+				}
+				if got := rec.get("exec_duration", "executor_type", "x", "outcome", outcome); got != want {
+					t.Fatalf("%s observations: %d, want %d", outcome, got, want)
+				}
+			}
+		})
 	}
 }
 
-// The cancel-hit CASE in settle: a retry or a release that lands after Cancel ends
-// the run instead of putting it back in the queue.
+// The cancel-hit CASE also applies to Snooze, without consuming an attempt.
 func TestSettleCancelHit(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
@@ -452,22 +681,37 @@ func TestSettleCancelHit(t *testing.T) {
 	st := store.Open(pool, schema)
 	entry := encodeErr(errEntry{Attempt: 1, Kind: "business", Message: "x"})
 
-	for _, outcome := range []store.Outcome{store.Retry, store.Released, store.Failed} {
-		id := trigger(t, e, "j", "")
-		got, err := st.ClaimPending(t.Context(), []string{"x"}, 1, "A", time.Minute)
-		if err != nil || len(got) != 1 {
-			t.Fatalf("claim: %v %v", got, err)
-		}
-		if err := e.Runs().Cancel(t.Context(), id); err != nil {
-			t.Fatal(err)
-		}
-		res, err := st.Settle(t.Context(), store.Settlement{Id: id, Token: got[0].LeaseToken, Outcome: outcome, Err: entry, Backoff: time.Second})
-		if err != nil || res.State != "cancelled" {
-			t.Fatalf("outcome %d settled as %q: %v", outcome, res.State, err)
-		}
-		if run, _ := e.Runs().Get(t.Context(), id); run.FinishedAt == nil || run.State != StateCancelled {
-			t.Fatalf("outcome %d row %+v", outcome, run)
-		}
+	for _, tc := range []struct {
+		name    string
+		outcome store.Outcome
+	}{
+		{name: "retry", outcome: store.Retry}, {name: "released", outcome: store.Released},
+		{name: "failed", outcome: store.Failed}, {name: "snoozed", outcome: store.Snoozed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := trigger(t, e, "j", "")
+			got, err := st.ClaimPending(t.Context(), []string{"x"}, 1, "A", time.Minute)
+			if err != nil || len(got) != 1 {
+				t.Fatalf("claim: %v %v", got, err)
+			}
+			if err := e.Runs().Cancel(t.Context(), id); err != nil {
+				t.Fatal(err)
+			}
+			res, err := st.Settle(t.Context(), store.Settlement{
+				Id: id, Token: got[0].LeaseToken, Outcome: tc.outcome,
+				Err: entry, Backoff: time.Second, Delay: time.Hour,
+			})
+			if err != nil || res.State != "cancelled" {
+				t.Fatalf("settled as %q: %v", res.State, err)
+			}
+			run, err := e.Runs().Get(t.Context(), id)
+			if err != nil || run.FinishedAt == nil || run.State != StateCancelled {
+				t.Fatalf("row %+v: %v", run, err)
+			}
+			if tc.outcome == store.Snoozed && (run.Attempt != 0 || len(errorsOf(t, run)) != 0) {
+				t.Fatalf("snooze changed failure history: %+v", run)
+			}
+		})
 	}
 }
 
@@ -519,12 +763,68 @@ func TestShutdownLaterCallerHonoursItsCtx(t *testing.T) {
 	}
 }
 
-// ErrDuplicate always carries the in-flight run's id (§6.1). The run holding the key
-// can finish between the INSERT that hit the key and the lookup; then the key is free
-// and the INSERT is repeated, so a caller never sees (0, ErrDuplicate) from that
-// window. Triggers race against completions for a few hundred rounds; each result is
-// either a new run or a duplicate with a real id.
-func TestDedupNeverReturnsIdZero(t *testing.T) {
+func TestShutdownCancelsStart(t *testing.T) {
+	t.Parallel()
+	_, schema := freshSchema(t)
+	poolCfg, err := pgxpool.ParseConfig(testDsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolCfg.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	held, err := pool.Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(held.Release)
+	e, err := New(pool, fastConfig(schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	startCtx, cancelStart := context.WithCancel(t.Context())
+	t.Cleanup(func() {
+		cancelStart()
+		held.Release()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = e.Shutdown(ctx)
+	})
+	started := make(chan error, 1)
+	go func() { started <- e.Start(startCtx) }()
+	waitFor(t, "Start to begin its blocked schema check", func() bool { return e.started.Load() })
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	stopped := make(chan error, 1)
+	go func() { stopped <- e.Shutdown(ctx) }()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("shutdown before execution: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown waited on Start's blocked database acquisition")
+	}
+	// The connection is still held: only the stop signal can end this Start.
+	select {
+	case err := <-started:
+		if err == nil {
+			t.Fatal("Start succeeded after Shutdown")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not cancel the startup query")
+	}
+	if err := e.Start(t.Context()); err == nil {
+		t.Fatal("Start after Shutdown succeeded")
+	}
+}
+
+// §6.1: a winner can finish between INSERT and lookup. Exhausting all three
+// rounds permits (0, ErrDuplicate); this bounded trigger loop retries on its next round.
+func TestDedupWhileWinnersFinish(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
 	e := startEngine(t, pool, fastConfig(schema), func(e *Engine) {
@@ -535,7 +835,7 @@ func TestDedupNeverReturnsIdZero(t *testing.T) {
 	if testing.Short() {
 		rounds = 50
 	}
-	var created, dups atomic.Int32
+	var created, dups, ended atomic.Int32
 	var wg sync.WaitGroup
 	for range 4 {
 		wg.Go(func() {
@@ -546,6 +846,8 @@ func TestDedupNeverReturnsIdZero(t *testing.T) {
 					created.Add(1)
 				case errors.Is(err, ErrDuplicate) && id > 0:
 					dups.Add(1)
+				case errors.Is(err, ErrDuplicate) && id == 0:
+					ended.Add(1)
 				default:
 					t.Errorf("trigger: id %d err %v", id, err)
 					return
@@ -554,7 +856,7 @@ func TestDedupNeverReturnsIdZero(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	t.Logf("created %d, duplicates %d", created.Load(), dups.Load())
+	t.Logf("created %d, duplicates %d, ended winners %d", created.Load(), dups.Load(), ended.Load())
 	if created.Load() == 0 || dups.Load() == 0 {
 		t.Errorf("both outcomes must occur for the test to mean anything: created %d duplicates %d", created.Load(), dups.Load())
 	}

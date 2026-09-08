@@ -79,7 +79,7 @@ func TestPerformanceBaseline(t *testing.T) {
 	_ = wf
 
 	// 100k existing terminal rows with ~1 KB params, finished over the last 20 days
-	execSQL(t, pool, `INSERT INTO `+jr+` (job_name, executor_type, params, timeout, retry_policy, state, run_at, started_at, finished_at, created_at)
+	execSql(t, pool, `INSERT INTO `+jr+` (job_name, executor_type, params, timeout, retry_policy, state, run_at, started_at, finished_at, created_at)
 		SELECT 'seed', 'short', jsonb_build_object('blob', repeat(md5(g::text), 32)), 60, '{"max_attempts":3}',
 		       CASE WHEN g % 2 = 0 THEN 'succeeded' ELSE 'failed' END,
 		       now() - make_interval(secs => random() * 20 * 86400), now() - make_interval(secs => random() * 20 * 86400),
@@ -138,12 +138,19 @@ func TestPerformanceBaseline(t *testing.T) {
 		}
 		return
 	}
-	activeMs := func() float64 {
+	var hasActiveTime bool
+	if err := pool.QueryRow(ctx, "SELECT current_setting('server_version_num')::int >= 140000").Scan(&hasActiveTime); err != nil {
+		t.Fatal(err)
+	}
+	activeMs := func() *float64 {
+		if !hasActiveTime {
+			return nil
+		}
 		var ms float64
 		if err := pool.QueryRow(ctx, "SELECT active_time FROM pg_stat_database WHERE datname = current_database()").Scan(&ms); err != nil {
 			t.Fatalf("active time: %v", err)
 		}
-		return ms
+		return &ms
 	}
 	claimIdxBefore, runningIdxBefore := sizeOf("idx_job_run_claim"), sizeOf("idx_job_run_running")
 	updBefore, hotBefore, _ := settledStats()
@@ -260,7 +267,7 @@ func TestPerformanceBaseline(t *testing.T) {
 	}
 
 	// what the claim index looks like once vacuum has run (pending rows are gone)
-	execSQL(t, pool, "VACUUM "+jr)
+	execSql(t, pool, "VACUUM "+jr)
 	claimIdxAfter := sizeOf("idx_job_run_claim")
 	_, _, deadAfterVacuum := tableStats()
 
@@ -304,7 +311,11 @@ func TestPerformanceBaseline(t *testing.T) {
 	w("| idx_job_run_claim | %d KB before, %d KB peak, %d KB after VACUUM; dead tuples %d before / %d after VACUUM |",
 		claimIdxBefore>>10, claimPeak>>10, claimIdxAfter>>10, deadAfter, deadAfterVacuum)
 	w("| idx_job_run_running | %d KB before, %d KB after |", runningIdxBefore>>10, sizeOf("idx_job_run_running")>>10)
-	w("| DB active time | %.2f s per wall second (pg_stat_database.active_time) |", (activeAfter-activeBefore)/1000/wall.Seconds())
+	if activeBefore == nil {
+		w("| DB active time | N/A (requires PostgreSQL >= 14) |")
+	} else {
+		w("| DB active time | %.2f s per wall second (pg_stat_database.active_time) |", (*activeAfter-*activeBefore)/1000/wall.Seconds())
+	}
 	w("| lock waits | max %d, mean %.2f backends waiting on a lock over %d samples every 100 ms |", maxLock, float64(sumLock)/float64(max(nSamples, 1)), nSamples)
 	report := b.String()
 	fmt.Println(report)

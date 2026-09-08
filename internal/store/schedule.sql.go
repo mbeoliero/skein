@@ -29,7 +29,7 @@ const DbNow = `-- name: DbNow :one
 SELECT now()::timestamptz AS now
 `
 
-// Schedules.Put computes next_run_at from the database clock
+// §6.2 Schedules.Put computes next_run_at from the database clock
 func (q *Queries) DbNow(ctx context.Context, db DBTX) (time.Time, error) {
 	row := db.QueryRow(ctx, DbNow)
 	var now time.Time

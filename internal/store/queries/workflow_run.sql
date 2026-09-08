@@ -36,7 +36,7 @@ SELECT sqlc.embed(w), sqlc.embed(r)
  WHERE w.id = @id ORDER BY r.job_name;
 
 -- name: NodeStates :many
--- propagate / finalize / resume view of the workflow, via idx_job_run_node
+-- §6.5 / §6.7: propagate / finalize / resume view of the workflow, via idx_job_run_node
 SELECT job_name, state FROM job_run WHERE workflow_run_id = @workflow_run_id::bigint;
 
 -- name: NodeOutputs :many
@@ -45,7 +45,7 @@ SELECT job_name, output FROM job_run
  WHERE workflow_run_id = @workflow_run_id::bigint AND job_name = ANY(@job_names::text[]);
 
 -- name: MarkWorkflowCancelling :execrows
--- fail-fast and Workflows.Cancel: running → cancelling; 0 rows = already cancelling or terminal
+-- §6.5 / §6.6: fail-fast and Workflows.Cancel: running → cancelling; 0 rows = already cancelling or terminal
 UPDATE workflow_run SET state = 'cancelling' WHERE id = @id AND state = 'running';
 
 -- name: CancelUnstartedNodes :execrows

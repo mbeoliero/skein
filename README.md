@@ -1,6 +1,6 @@
 # Skein
 
-嵌入 Go 宿主进程的 PostgreSQL 任务调度库：一次性与延迟任务、cron、DAG 工作流、重试、取消、续跑和优雅停机。多个实例共享数据库，无需独立调度服务、选主、Redis 或消息队列。
+嵌入 Go 宿主进程的 PostgreSQL 任务调度库：一次性与延迟任务、cron、DAG 工作流、重试、Snooze、取消、续跑和优雅停机。多个实例共享数据库，无需独立调度服务、选主、Redis 或消息队列。
 
 ## 安装
 
@@ -92,6 +92,28 @@ func run(ctx context.Context) error {
 2. **数据库和连接池由宿主管理。**`Migrate` 创建 schema 与表，不创建数据库；`Start` 只校验版本。自定义 `Config.Schema` 时，迁移须使用同一名称；连接池建议至少 5 个连接：监听独占 1 条，其余留给领取、心跳与结算。
 3. **Executor 应响应 ctx 取消。**`Shutdown` 不关闭连接池；应先处理它的返回值，再关闭宿主资源。`ErrNotDrained` 表示仍有执行器未退出，其租约将由其他兼容实例回收。
 
+### 外部长任务：两节点 + Snooze
+
+视频生成等“先提交、再查询”的任务使用一个两节点工作流：
+
+```text
+video.submit → 成功 output 保存 task_id 和固定 deadline
+    ↓
+video.poll   → 从 Request.Deps["video.submit"] 读取，每次只查询一次
+               未完成：return nil, skein.Snooze(30 * time.Second)
+               已完成：返回最终结果和 nil
+```
+
+Snooze 将**同一个 run** 延迟回 pending，释放执行槽位与租约，不消耗失败次数、不追加 errors、不保存 output。delay 必须为正，支持 24h 及更长时长；真正的查询错误仍按 RetryPolicy 处理。`Request.Attempt` 不是查询次数，正常 Snooze 不增加它。Snooze 后无需继续占用 goroutine 或心跳，多个进程可接续查询。
+
+**总等待 24h 由业务 deadline 约束，不是把 JobSpec.Timeout 设成 24h。** 在提交成功结果中保存固定 deadline，查询前检查，并限制本次请求及下一次 Snooze 不越过剩余预算。Resume 保留成功的 submit，只续跑查询节点，不延长 deadline；重新生成应重新 Trigger。供应商调用仍需使用 `Request.IdempotencyKey` 做幂等；取消工作流不会自动 Abort 外部任务。
+
+完整宿主写法见 [example_test.go 的 ExampleSnooze](example_test.go)（模拟供应商，Go 编译检查）；可运行的两节点、期限及恢复场景见 [snooze_test.go](snooze_test.go)：
+
+```sh
+SKEIN_TEST_REQUIRE_DB=1 go test -count=1 -run '^TestSnooze' -v
+```
+
 ## 开发与测试
 
 测试访问真实 PostgreSQL，每个集成测试创建并清理自己的随机 schema。测试账户需要创建 schema、表及删除这些测试对象的权限；请使用专用测试数据库，不要指向生产库。
@@ -123,6 +145,17 @@ make race
 SKEIN_BENCH=1 go test -count=1 -run '^TestPerformanceBaseline$' -v -timeout 20m
 ```
 
+M7 smoke 同样显式运行：3 个真实进程、1,000 个普通任务、10 个工作流，另有独立精度与事务探针；追加普通任务 / DAG 的反复 Snooze、100 次再启动及全槽位复用检查。不要与其他测试同时测量。
+
+```sh
+mkdir -p /tmp/skein-m7-smoke
+SKEIN_TEST_REQUIRE_DB=1 SKEIN_SCENARIO=1 SKEIN_SCENARIO_PROFILE=smoke \
+  go test -count=1 -parallel=1 -run '^TestScenarioAcceptance$' -timeout 15m \
+  -artifacts -outputdir=/tmp/skein-m7-smoke -v
+```
+
+必须加 `-artifacts` 保留证据。配置、报告口径与实测见 [场景验收](docs/scenarios.md)；full / soak 尚未实现，M7 未完成。
+
 ## 源码导航
 
 主包留在根目录；包内函数负责本进程的执行协调，`internal/store` 负责数据库事务、持久状态转换与工作流推进。目录与职责约定见设计 §8.3；贡献前先读 [AGENTS.md](AGENTS.md)。
@@ -143,6 +176,8 @@ SKEIN_BENCH=1 go test -count=1 -run '^TestPerformanceBaseline$' -v -timeout 20m
 | [workflows_test.go](workflows_test.go) | DAG、汇合、fail-fast、工作流取消与续跑（M3） |
 | [schedules_maintenance_test.go](schedules_maintenance_test.go) | 定时、DST、补一拍、保留清理、Stats 与列表（M4） |
 | [wake_test.go](wake_test.go) | 跨实例即时触发、延迟与退避到点、cron 到点、槽位释放再领、监听重连、触发器规则（M6） |
+| [scenarios_test.go](scenarios_test.go) | 三进程混合负载、Snooze / 槽位复用、独立精度探针及审计核查器负例（M7 smoke，显式运行） |
+| [snooze_test.go](snooze_test.go) | 纯 Snooze、时长边界、到点与槽位、两节点输出传递与固定期限（M8） |
 | [worker_test.go](worker_test.go)、[race_test.go](race_test.go) | 执行准入、失租与完成的交错，以及事务锁序回归 |
 | [skein_test.go](skein_test.go)、[store_test.go](store_test.go) | 基础任务、共享数据库夹具、领取索引与心跳 HOT 比例 |
 
@@ -150,4 +185,5 @@ SKEIN_BENCH=1 go test -count=1 -run '^TestPerformanceBaseline$' -v -timeout 20m
 
 - [设计与 API 契约](docs/design.md)：状态、事务、锁序、配置与故障恢复。
 - [性能基线](docs/baseline.md)：复跑配置、测量数据与限制。
+- [场景验收](docs/scenarios.md)：M7 smoke 的运行入口、证据与边界。
 - [MIT License](LICENSE)：Copyright © 2026 Jaken。

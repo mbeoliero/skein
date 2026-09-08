@@ -165,7 +165,7 @@ func TestBlockedNodeContext(t *testing.T) {
 			}
 			defer tx.Rollback(context.Background())
 			// A row lock does not block NodeContext's plain SELECT.
-			execSQL(t, tx, "LOCK TABLE "+qualified(schema, "workflow_run")+" IN ACCESS EXCLUSIVE MODE")
+			execSql(t, tx, "LOCK TABLE "+qualified(schema, "workflow_run")+" IN ACCESS EXCLUSIVE MODE")
 			e.dispatch(c)
 			waitBlocked(t, pool, schema)
 			if stop {

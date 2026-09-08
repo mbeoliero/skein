@@ -211,7 +211,7 @@ const MarkWorkflowCancelling = `-- name: MarkWorkflowCancelling :execrows
 UPDATE workflow_run SET state = 'cancelling' WHERE id = $1 AND state = 'running'
 `
 
-// fail-fast and Workflows.Cancel: running → cancelling; 0 rows = already cancelling or terminal
+// §6.5 / §6.6: fail-fast and Workflows.Cancel: running → cancelling; 0 rows = already cancelling or terminal
 func (q *Queries) MarkWorkflowCancelling(ctx context.Context, db DBTX, id int64) (int64, error) {
 	result, err := db.Exec(ctx, MarkWorkflowCancelling, id)
 	if err != nil {
@@ -265,7 +265,7 @@ type NodeStatesRow struct {
 	State   string
 }
 
-// propagate / finalize / resume view of the workflow, via idx_job_run_node
+// §6.5 / §6.7: propagate / finalize / resume view of the workflow, via idx_job_run_node
 func (q *Queries) NodeStates(ctx context.Context, db DBTX, workflowRunID int64) ([]NodeStatesRow, error) {
 	rows, err := db.Query(ctx, NodeStates, workflowRunID)
 	if err != nil {

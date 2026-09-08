@@ -1,0 +1,103 @@
+# M7 场景验收
+
+当前只实现 **smoke**；full、注册差异、负载中故障、容量分档及 30 分钟 soak 尚未实现，M7 未完成。这里使用真实 PostgreSQL 和三个 OS 进程，业务及参数分布是固定种子的合成数据，不是生产流量回放。
+
+## 运行
+
+使用专用测试 PostgreSQL，账户须能创建和删除随机测试 schema。默认 DSN 是 `postgres:///postgres?host=/tmp`，可用 `SKEIN_TEST_DSN` 指向其他测试实例。
+
+```sh
+mkdir -p /tmp/skein-m7-smoke
+SKEIN_TEST_REQUIRE_DB=1 SKEIN_SCENARIO=1 SKEIN_SCENARIO_PROFILE=smoke \
+  go test -count=1 -parallel=1 -run '^TestScenarioAcceptance$' -timeout 15m \
+  -artifacts -outputdir=/tmp/skein-m7-smoke -v
+```
+
+`-artifacts` 必须保留：Go 默认会在测试结束后删除 `t.ArtifactDir()`。未设置 `SKEIN_SCENARIO` 时跳过；未知或尚未实现的 profile、不可达数据库、缺少制品选项均失败。不要与普通全集或性能基线同时测量；`-parallel=1` 不会关闭 worker 内部及跨进程并发。
+
+核查器负例属于普通测试，不需要数据库：
+
+```sh
+go test -count=1 -run '^TestScenarioVerifier' -v
+```
+
+## smoke 内容
+
+| 范围 | 数量与核查 |
+|---|---|
+| 普通混合批次 | 600 个短任务、150 个长任务、100 个失败两次后成功、50 个 Permanent、50 个超时两次、50 个取消；取消各半处于 pending / 已确认进入执行器 |
+| 工作流 | 4 个菱形、3 条链、2 个 fail-fast、1 条失败后 Resume 的链；均四节点，核查依赖输出、启动顺序和成功节点不重跑 |
+| 独立精度窗口 | 立即、TriggerTx、延迟、cron、重试各 100 个 run；重试产生 300 次入口采样，其他各 100 次；每批至多 10 个 run |
+| Snooze 追加窗口 | 48 个普通任务各等待两次（3s）；48 个屏障探针在最早到期前同时进入，证明全部槽位可复用；另加 submit → poll → verify 三节点工作流，poll 等待四次（700ms）。共 100 次再启动，max_attempts 均为 1 |
+| 事务与去重 | 事务持有 350ms 后提交、确认回滚、在途重复提交、终态后复用去重键；稳定 pending 赢家必须返回原 id，竞争耗尽的零 id 由独立确定性交错测试覆盖 |
+| 证据核查 | 输入 / 输出摘要、每次调用与租约、失败种类、退避窗口、长于 2s 的调用续租、逐进程并发峰值、副作用唯一及未闭合记录 |
+
+混合批次编码后的参数大小严格为 900 × 1KB、90 × 32KB、10 × 250KB，使用种子 1 生成的 base64 字符集随机内容，不用重复字符填充。当前批次按类型分组提交，延迟短任务会与长任务竞争；这个到达顺序不是随机流量模型。重试与 Resume 不算新提交。追加窗口不替换上述原批次；全部场景共期望 1,642 个 job_run 和 11 个 workflow_run，另有一次不应留下 run 的回滚；预期失败不是漏执行或意外错误。
+
+每个 worker：Concurrency 16、PollInterval 5s、HeartbeatInterval 1s、LeaseTTL 10s、CancelTimeout / ShutdownGrace 5s，退避 100–200ms、抖动 ±20%。执行池上限 8，独立审计池上限 2，LISTEN 另占 1；提交池预算按宿主配置报告，观察池上限 2。普通任务 timeout 1 分钟，超时案例为 1 秒；观察间隔 20ms。长任务不持有连接模拟耗时。
+
+## 如何读制品
+
+终端会打印本轮制品目录。`manifest.jsonl` 记录提交及控制操作、预期结果；相同 id 的后续预期记录是修订，不是新提交。`invocations.jsonl`、`effects.jsonl`、`runs.jsonl`、`workflows.jsonl` 保存实际证据；`workers.jsonl` 与 `worker-<pid>.jsonl` 保存进程统计和日志；`report.md` 是汇总。`SKEIN_SCENARIO_OUT` 可将报告另行追加到指定文件。
+
+- `entry` 比较同一数据库时钟；明确投递的 At 及预期 cron 拍次独立记入清单，并检查实际持久化值一致，不能只相信待验证的 `run_at`。低负载上限仍是 300ms，混合负载不套此阈值。
+- `snooze_reentry` 单列再启动延迟；`snooze_ns` 是实际返回的请求时长，清单独立保存预期时长。每次 pending 的 `next_at` / `pending_clean` 快照须匹配同次 claim 的 `started_at`；后者核对 attempt / errors、空租约、未写入的随带输出及 blocked 后继。到期点须在「返回 + 时长」至「观察 + 时长」之间，下一次 claim 的 `run_at` 须与之相等；缺测不算通过。槽位证明事件为 `snooze_slots_reused`。
+- `exec` 使用进程单调时钟；`settle_confirm` 是从返回前审计到观察到结算的上界，包含观察延迟，不是精确 commit 耗时。
+- fixture SQL 开销包含审计、幂等副作用和控制查询，不包含摘要计算的 CPU，不能直接当作纯插桩成本扣除。所有数值都是带观测成本的端到端结果。
+- 正常窗口的未闭合调用、错误摘要、额外副作用、非预期恢复及 worker ERROR 都使测试失败；测试退出码为最终结果。失败仍保存可取得的证据，不以缺测零值伪装通过。
+- 整轮负载至少在测试 deadline 前 60 秒停止；worker 并发停止，收尾共享 45 秒预算，之后 schema 清理另限 5 秒。smoke 不包含故障注入，不以此证明负载下接管或稳态容量。
+
+M5 的 [历史基线](baseline.md) 保持原配置与结果，不与 smoke 或 `-race` 数据混作性能对照。
+
+## 2026-09-08 首轮实测（尚未加入 Snooze 工作负载）
+
+Go 1.27.0、darwin/arm64；三个 Go worker 均在宿主机。PG 18.4 使用 Homebrew socket，PG 13.23 使用本机 OrbStack 的 `postgres:13-alpine` 和回环 TCP，因此**不能把差值归因于 PG 版本**。
+
+测量基于 `204fba46e4dba87de97d7c470439d2c0a53649f1` 后的未提交工作区，包含并行完成的 M8 / Snooze 修改。场景源码 SHA-256：`7ff407f767a54144f85905b681290f5d12cfb6562731929088da1852b92521aa`。
+
+| 检查 | PG 18.4 | PG 13.23 |
+|---|---:|---:|
+| smoke | 通过 | 通过 |
+| 报告整轮耗时，不含编译 | 37.942s | 42.265s |
+| 混合批次耗时 | 9.728s | 11.632s |
+| 调用 / 去重后副作用 | 1,962 / 1,511 | 1,962 / 1,511 |
+| 三进程并发峰值 | 16 / 16 / 16 | 16 / 16 / 16 |
+
+两轮均为 1,543 个 job_run：1,384 succeeded、102 failed、57 cancelled；失败和取消均与清单一致。10 个工作流全部符合预期；缺失返回、缺失结算观察、非预期计数均为零。
+
+低负载入口延迟，单位 ms，以下均为非 race 运行；完整 p50 / p95 / p99 / max 见原始报告：
+
+| 场景 | 样本 | PG18 p99 | PG18 max | PG13 p99 | PG13 max |
+|---|---:|---:|---:|---:|---:|
+| 立即 | 100 | 7.839 | 8.598 | 13.135 | 14.964 |
+| TriggerTx | 100 | 20.004 | 22.921 | 51.440 | 56.424 |
+| 延迟 | 100 | 22.545 | 23.563 | 57.031 | 58.397 |
+| cron | 100 | 34.036 | 35.588 | 122.327 | 127.536 |
+| 重试 | 300 | 28.525 | 41.829 | 28.235 | 37.963 |
+
+另外通过核查器负例、PG18 smoke `-race`、PG18 普通全集 `-count=1 -parallel=1` 和 `make lint`。`-race` 只用于并发检查，不作为性能对照。PG13 临时容器已删除；没有运行 full / soak，也未把 M7 标为完成。
+
+本机原始制品：PG18 `/tmp/skein-m7-final-pg18/_artifacts/TestScenarioAcceptance/4109358540/`；PG13 `/tmp/skein-m7-final-pg13/_artifacts/TestScenarioAcceptance/1192350294/`；校验命令与完整日志在 `/tmp/skein-m7-final-checks/`。
+
+## 2026-09-08 Snooze 追加验收
+
+保持相同配置、种子与连接预算，追加上述等待 / 槽位窗口。场景源码 SHA-256：`f2fbdd2e76366796d3266b5560e4b066dd8fdb6bc875d6fe11178216ae8c4d7d`。Go 1.27.0，PG18 / PG13 的宿主与连接方式同上；仍为未提交工作区，不将两种部署方式的差异归因于数据库版本。
+
+| 检查 | PG 18.4 | PG 13.23 |
+|---|---:|---:|
+| smoke 最终复跑 | 通过 | 通过 |
+| 报告整轮 / 原混合批次耗时 | 47.399s / 9.842s | 51.829s / 11.330s |
+| job_run / workflow_run | 1,642 / 11 | 1,642 / 11 |
+| 调用 / 去重后副作用 | 2,161 / 1,610 | 2,161 / 1,610 |
+| Snooze pending 快照 / 同时复用槽位 | 100 / 48 | 100 / 48 |
+| 普通 Snooze 再启动 max（96 样本） | 14.736ms | 50.077ms |
+| DAG poll 再启动 max（4 样本，仅小案例） | 19.937ms | 29.501ms |
+| 所有独立精度窗口 max | 65.831ms | 98.395ms |
+
+两轮均为 1,483 succeeded、102 failed、57 cancelled；核查错误、缺失返回、缺失结算观察及非预期计数均为零。全部 100 份 pending 快照符合预期；槽位屏障的 48 个探针均在最早 Snooze 到期前同时进入。与本轮修改前的 overlay 批次逐项比较，原 1,543 个清单条目的案例、类型、输入 / 输出摘要、payload 大小、调用次数及终态预期不变。overlay 仅用于兼容性对照，其报告中的源码摘要来自磁盘当前文件，不作为旧版源码标识。
+
+新增核查器负例先失败再通过；`go test -run '^TestScenarioVerifier'`、PG18 smoke `-race`、required-DB 的 PG18 普通全集及 `make lint` 均通过，所有数据库测量串行。race 制品也核对出相同的任务、调用、副作用与快照数量；不将 race 时延用于性能比较。PG13 临时容器均已删除；没有修改生产代码、配置、迁移或 M5 历史数据。
+
+本轮也保留了失败记录，**不是首次全绿**：PG18 首次在 TriggerTx 的到期前提交前提处失败，当时主机负载升高；PG13 首次出现观察 / 心跳超时，下一轮在原 TriggerTx 精度窗口出现 334.385ms 超限。独立复跑通过，未放宽 300ms 或任何超时。空测试表上的 PG13 EXPLAIN 对照未触发 JIT，但不足以据此确认失败根因；不把这些失败归咎于 Snooze，也不宣称已排除环境或实现抖动。
+
+最终通过制品：PG18 `/tmp/skein-m7-snooze-pg18-rerun/_artifacts/TestScenarioAcceptance/1226407005/`；PG13 `/tmp/skein-m7-snooze-pg13-final/_artifacts/TestScenarioAcceptance/4240288620/`；PG18 race `/tmp/skein-m7-snooze-pg18-race/_artifacts/TestScenarioAcceptance/1784777742/`。本轮日志（包括失败和 overlay 对照）在 `/tmp/skein-m7-snooze-checks/`；失败制品分别保存在 `/tmp/skein-m7-snooze-pg18/`、`/tmp/skein-m7-snooze-pg13/`、`/tmp/skein-m7-snooze-pg13-after/`。full / soak 仍未实现，M7 未完成。

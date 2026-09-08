@@ -144,7 +144,7 @@ type Engine struct {
 	active    sync.Map      // lease token → run id, one entry per executor goroutine still running
 	lastOK    time.Time     // start of the last successful heartbeat (§6.4 local deadline); written by the heartbeat goroutine only, so it keeps its monotonic reading
 
-	lifecycle sync.Mutex      // Start and Shutdown run one at a time
+	lifecycle sync.Mutex      // serializes lifecycle transitions, never startup database I/O
 	loopCtx   context.Context // claim loop
 	stopLoops context.CancelFunc
 	loops     sync.WaitGroup
@@ -192,14 +192,29 @@ func New(pool *pgxpool.Pool, cfg Config) (*Engine, error) {
 // after Shutdown it cannot be started again.
 func (e *Engine) Start(ctx context.Context) error {
 	e.lifecycle.Lock()
-	defer e.lifecycle.Unlock()
 	if e.shutting.Load() {
+		e.lifecycle.Unlock()
 		return errors.New("skein: Start after Shutdown")
 	}
 	if e.started.Swap(true) {
+		e.lifecycle.Unlock()
 		return errors.New("skein: Start called twice")
 	}
-	v, err := e.st.SchemaVersion(ctx)
+	e.lifecycle.Unlock()
+
+	// §6.8: shutdown cancels startup I/O without waiting for its lifecycle lock.
+	startCtx, cancelStart := context.WithCancel(ctx)
+	stopCancel := context.AfterFunc(e.loopCtx, cancelStart)
+	v, err := e.st.SchemaVersion(startCtx)
+	stopCancel()
+	cancelStart()
+
+	e.lifecycle.Lock()
+	defer e.lifecycle.Unlock()
+	if e.shutting.Load() {
+		e.started.Store(false)
+		return errors.New("skein: Start after Shutdown")
+	}
 	if err != nil {
 		e.started.Store(false)
 		return fmt.Errorf("skein: read schema version: %w", err)
@@ -256,7 +271,7 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
-	e.lifecycle.Lock() // a Start in progress finishes first
+	e.lifecycle.Lock() // serialize with loop startup, not the schema query
 	defer e.lifecycle.Unlock()
 	e.shutErr = e.shutdown(ctx)
 	close(e.shutDone)

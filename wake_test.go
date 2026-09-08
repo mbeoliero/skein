@@ -87,6 +87,7 @@ func TestRemoteTriggerStartsAtOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer rollbackTx(t, tx)
 	id, err = api.Jobs().TriggerTx(t.Context(), tx, "j", RawJSON("{}"))
 	if err != nil {
 		t.Fatalf("TriggerTx: %v", err)
@@ -264,7 +265,8 @@ func TestDueRowLeftBehindIsClaimedAtOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	execSQL(t, tx, "SELECT 1 FROM "+qualified(schema, "job_run")+" WHERE id = "+itoa(id)+" FOR UPDATE")
+	defer rollbackTx(t, tx)
+	execSql(t, tx, "SELECT 1 FROM "+qualified(schema, "job_run")+" WHERE id = "+itoa(id)+" FOR UPDATE")
 	waitFor(t, "the row to be due", func() bool {
 		n, err := worker.st.Now(t.Context())
 		return err == nil && n.After(due.Add(100*time.Millisecond))
@@ -365,7 +367,7 @@ func TestWakeTriggerRules(t *testing.T) {
 	}
 	t.Cleanup(l.Close)
 	jobRun, schedule := qualified(schema, "job_run"), qualified(schema, "schedule")
-	execSQL(t, pool, "INSERT INTO "+qualified(schema, "job")+" (name, executor_type, params, timeout, retry_policy) VALUES ('j', 'x', '{}', 60, '{\"max_attempts\":3}')")
+	execSql(t, pool, "INSERT INTO "+qualified(schema, "job")+" (name, executor_type, params, timeout, retry_policy) VALUES ('j', 'x', '{}', 60, '{\"max_attempts\":3}')")
 
 	collect := func(what string, want ...string) {
 		t.Helper()
@@ -383,21 +385,21 @@ func TestWakeTriggerRules(t *testing.T) {
 			t.Errorf("%s: notifications %q, want %q", what, got, want)
 		}
 	}
-	execSQL(t, pool, "INSERT INTO "+jobRun+" (job_name, executor_type, params, timeout, retry_policy, state) VALUES ('j','x','{}',60,'{}','pending'), ('j','x','{}',60,'{}','pending'), ('j','y','{}',60,'{}','pending')")
+	execSql(t, pool, "INSERT INTO "+jobRun+" (job_name, executor_type, params, timeout, retry_policy, state) VALUES ('j','x','{}',60,'{}','pending'), ('j','x','{}',60,'{}','pending'), ('j','y','{}',60,'{}','pending')")
 	collect("insert pending", "run:x", "run:y")
-	execSQL(t, pool, "UPDATE "+jobRun+" SET state = 'running', lease_token = gen_random_uuid(), lease_owner = 'me', lease_expires_at = now() + interval '1 minute', started_at = now()")
+	execSql(t, pool, "UPDATE "+jobRun+" SET state = 'running', lease_token = gen_random_uuid(), lease_owner = 'me', lease_expires_at = now() + interval '1 minute', started_at = now()")
 	collect("claim")
-	execSQL(t, pool, "UPDATE "+jobRun+" SET lease_expires_at = now() + interval '2 minutes'")
+	execSql(t, pool, "UPDATE "+jobRun+" SET lease_expires_at = now() + interval '2 minutes'")
 	collect("heartbeat")
-	execSQL(t, pool, "UPDATE "+jobRun+" SET state = 'pending', run_at = now() + interval '10 seconds', lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL WHERE executor_type = 'y'")
+	execSql(t, pool, "UPDATE "+jobRun+" SET state = 'pending', run_at = now() + interval '10 seconds', lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL WHERE executor_type = 'y'")
 	collect("retry with backoff", "run:y")
-	execSQL(t, pool, "INSERT INTO "+jobRun+" (job_name, executor_type, params, timeout, retry_policy, state) VALUES ('j', repeat('t', 7996), '{}', 60, '{}', 'pending')")
+	execSql(t, pool, "INSERT INTO "+jobRun+" (job_name, executor_type, params, timeout, retry_policy, state) VALUES ('j', repeat('t', 7996), '{}', 60, '{}', 'pending')")
 	collect("type too long for a payload", "")
-	execSQL(t, pool, "INSERT INTO "+schedule+" (name, job_name, cron, timezone, overlap, enabled, next_run_at) VALUES ('s', 'j', '"+yearly+"', 'UTC', 'skip', true, now())")
+	execSql(t, pool, "INSERT INTO "+schedule+" (name, job_name, cron, timezone, overlap, enabled, next_run_at) VALUES ('s', 'j', '"+yearly+"', 'UTC', 'skip', true, now())")
 	collect("put", "schedule")
-	execSQL(t, pool, "UPDATE "+schedule+" SET next_run_at = now() + interval '1 minute' WHERE name = 's'")
+	execSql(t, pool, "UPDATE "+schedule+" SET next_run_at = now() + interval '1 minute' WHERE name = 's'")
 	collect("advance")
-	execSQL(t, pool, "DELETE FROM "+schedule+" WHERE name = 's'")
+	execSql(t, pool, "DELETE FROM "+schedule+" WHERE name = 's'")
 	collect("delete", "schedule")
 }
 
@@ -407,16 +409,17 @@ func TestNextDueUsesClaimIndex(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
 	path := pgx.Identifier{schema}.Sanitize()
-	execSQL(t, pool, "SET LOCAL search_path = "+path+`;
+	execSql(t, pool, "SET LOCAL search_path = "+path+`;
 		INSERT INTO job_run (job_name, executor_type, params, timeout, retry_policy, state, run_at)
 		SELECT 'j', 'x', '{}', 60, '{"max_attempts":3}', 'pending', now() + (g || ' seconds')::interval FROM generate_series(1, 2000) g;
 		ANALYZE job_run;`)
+
 	tx, err := pool.Begin(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(context.Background())
-	execSQL(t, tx, "SET LOCAL search_path = "+path+"; SET LOCAL enable_seqscan = off")
+	execSql(t, tx, "SET LOCAL search_path = "+path+"; SET LOCAL enable_seqscan = off")
 	rows, err := tx.Query(t.Context(), "EXPLAIN "+store.NextPendingAt, []string{"x", "y"})
 	if err != nil {
 		t.Fatal(err)

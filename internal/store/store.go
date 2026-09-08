@@ -112,7 +112,7 @@ func (s *Store) inCallerTx(ctx context.Context, tx pgx.Tx, fn func(ctx context.C
 
 type Migration struct {
 	Version int
-	SQL     string
+	Sql     string
 }
 
 // Migrate creates the schema if needed and applies every migration newer than the
@@ -147,7 +147,7 @@ func (s *Store) Migrate(ctx context.Context, migrations []Migration) (err error)
 		if m.Version <= current {
 			continue
 		}
-		if _, err = tx.Exec(ctx, m.SQL); err != nil {
+		if _, err = tx.Exec(ctx, m.Sql); err != nil {
 			return fmt.Errorf("migration %d: %w", m.Version, err)
 		}
 		if err = s.q.RecordSchemaVersion(ctx, tx, int32(m.Version)); err != nil {
@@ -335,6 +335,7 @@ const (
 	Retry       // retryable failure with attempts left
 	Failed      // permanent failure or no attempts left
 	Interrupted // reclaimed with attempt >= max_attempts (§6.3 step 3)
+	Snoozed     // normal waiting: pending later, attempt/errors/output unchanged
 )
 
 type Settlement struct {
@@ -346,6 +347,7 @@ type Settlement struct {
 	Output        []byte        // Succeeded
 	Err           []byte        // one-element JSON array: Released, Retry, Failed
 	Backoff       time.Duration // Retry
+	Delay         time.Duration // Snoozed
 }
 
 type Settled struct {
@@ -384,6 +386,15 @@ func (s *Store) Settle(ctx context.Context, st Settlement) (res Settled, err err
 			state, res.ReleasedCount = row.State, int(row.ReleasedCount)
 		case Retry:
 			state, err = s.q.SettleRetry(ctx, tx, SettleRetryParams{Id: st.Id, Token: st.Token, Err: st.Err, Backoff: st.Backoff, WfCancelling: wfCancelling})
+		case Snoozed:
+			if st.Delay <= 0 {
+				return fmt.Errorf("store: snooze delay must be > 0, got %s", st.Delay)
+			}
+			// pgx truncates to microseconds; SQL rounds up without overflowing Duration.
+			state, err = s.q.SettleSnoozed(ctx, tx, SettleSnoozedParams{
+				Id: st.Id, Token: st.Token, Delay: st.Delay,
+				RoundUp: st.Delay%time.Microsecond != 0, WfCancelling: wfCancelling,
+			})
 		case Failed:
 			state, err = s.q.SettleFailed(ctx, tx, SettleFailedParams{Id: st.Id, Token: st.Token, Err: st.Err, WfCancelling: wfCancelling})
 		case Interrupted:

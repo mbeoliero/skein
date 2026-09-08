@@ -35,7 +35,7 @@ func testPool(t *testing.T) *pgxpool.Pool {
 // that every database test was skipped.
 func namedPool(t *testing.T, appName string) *pgxpool.Pool {
 	t.Helper()
-	dsn := testDSN()
+	dsn := testDsn()
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		t.Fatalf("pool: %v", err)
@@ -82,7 +82,11 @@ func freshSchema(t *testing.T) (*pgxpool.Pool, string) {
 		t.Fatalf("migrate: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := pool.Exec(ctx, "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE"); err != nil {
+			t.Errorf("drop schema %q: %v", schema, err)
+		}
 	})
 	return pool, schema
 }
@@ -299,6 +303,41 @@ func TestInvalidOutputFailsPermanently(t *testing.T) {
 		if run.Attempt != 1 || len(es) != 1 || es[0].Kind != "business" || !strings.HasPrefix(es[0].Message, want[name]) {
 			t.Errorf("%s: attempt %d errors %+v", name, run.Attempt, es)
 		}
+	}
+}
+
+func TestEmptyOutputSucceeds(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		out  RawJSON
+	}{{name: "nil"}, {name: "empty", out: RawJSON{}}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pool, schema := freshSchema(t)
+			e := startEngine(t, pool, fastConfig(schema), func(e *Engine) {
+				e.Register("empty", func(context.Context, *Request) (RawJSON, error) { return tc.out, nil })
+			})
+			declare(t, e, JobSpec{Name: "j", ExecutorType: "empty"})
+			id := trigger(t, e, "j", "")
+			var run *JobRun
+			waitFor(t, "empty output to settle", func() bool {
+				var err error
+				run, err = e.Runs().Get(t.Context(), id)
+				return err == nil && run.State.Terminal()
+			})
+			if run.State != StateSucceeded || run.Attempt != 0 || run.Output != nil || len(errorsOf(t, run)) != 0 {
+				t.Fatalf("empty output: state %s attempt %d output %q errors %s", run.State, run.Attempt, run.Output, run.Errors)
+			}
+			declare(t, e, JobSpec{Name: "next", ExecutorType: "empty"})
+			declareWorkflow(t, e, WorkflowSpec{Name: "w", Nodes: []Node{{Job: "j"}, {Job: "next", Deps: []string{"j"}}}})
+			wf := waitWorkflow(t, e, triggerWorkflow(t, e, "w", ""), WorkflowSucceeded)
+			for _, node := range wf.Nodes {
+				if node.Attempt != 0 || node.Output != nil || len(errorsOf(t, &node)) != 0 {
+					t.Fatalf("empty node output: %+v", node)
+				}
+			}
+		})
 	}
 }
 
@@ -524,7 +563,7 @@ func TestTriggerTxIgnoresTempTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(context.Background())
-	execSQL(t, tx, "CREATE TEMP TABLE job_run (LIKE "+qualified(schema, "job_run")+" INCLUDING ALL) ON COMMIT DROP")
+	execSql(t, tx, "CREATE TEMP TABLE job_run (LIKE "+qualified(schema, "job_run")+" INCLUDING ALL) ON COMMIT DROP")
 	id, err := e.Jobs().TriggerTx(t.Context(), tx, "j", nil)
 	if err != nil {
 		t.Fatal(err)

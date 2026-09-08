@@ -97,7 +97,7 @@ UPDATE job_run
 RETURNING state;
 
 -- name: SettleReleased :one
--- graceful shutdown: back to pending now, attempt unchanged, a released entry for the alert
+-- §6.5 / §6.8 graceful shutdown: back to pending now, attempt unchanged, a released entry for the alert
 UPDATE job_run
    SET state       = CASE WHEN cancel_requested OR @wf_cancelling::boolean THEN 'cancelled' ELSE 'pending' END,
        finished_at = CASE WHEN cancel_requested OR @wf_cancelling::boolean THEN now() END,
@@ -108,7 +108,7 @@ RETURNING state,
           (SELECT count(*) FROM jsonb_array_elements(errors) x WHERE x->>'kind' = 'released')::int AS released_count;
 
 -- name: SettleRetry :one
--- retryable failure with attempts left: pending again after backoff
+-- §6.5 retryable failure with attempts left: pending again after backoff
 UPDATE job_run
    SET state       = CASE WHEN cancel_requested OR @wf_cancelling::boolean THEN 'cancelled' ELSE 'pending' END,
        finished_at = CASE WHEN cancel_requested OR @wf_cancelling::boolean THEN now() END,
@@ -117,8 +117,21 @@ UPDATE job_run
  WHERE id = @id AND lease_token = @token::uuid AND state = 'running'
 RETURNING state;
 
+-- name: SettleSnoozed :one
+-- §6.5 / §12: normal waiting, no attempt/error/output change; cancellation still wins.
+-- Native interval input also handles PG 13; add the rounding remainder without Duration overflow.
+-- sqlc.arg avoids sqlc 1.31's @ rewrite bug around this interval CASE.
+UPDATE job_run
+   SET state       = CASE WHEN cancel_requested OR @wf_cancelling::boolean THEN 'cancelled' ELSE 'pending' END,
+       finished_at = CASE WHEN cancel_requested OR @wf_cancelling::boolean THEN now() END,
+       run_at = now() + sqlc.arg(delay)::interval
+              + CASE WHEN sqlc.arg(round_up)::boolean THEN interval '1 microsecond' ELSE interval '0' END,
+       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
+ WHERE id = @id AND lease_token = @token::uuid AND state = 'running'
+RETURNING state;
+
 -- name: SettleFailed :one
--- permanent failure or no attempts left
+-- §6.5 permanent failure or no attempts left
 UPDATE job_run
    SET state = CASE WHEN cancel_requested OR @wf_cancelling::boolean THEN 'cancelled' ELSE 'failed' END,
        attempt = attempt + 1, errors = errors || @err::jsonb, finished_at = now(),

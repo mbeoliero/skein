@@ -13,7 +13,7 @@ const CurrentSearchPath = `-- name: CurrentSearchPath :one
 SELECT current_setting('search_path')::text AS path
 `
 
-// TriggerTx restores the caller's search_path with this
+// §8 TriggerTx restores the caller's search_path with this
 func (q *Queries) CurrentSearchPath(ctx context.Context, db DBTX) (string, error) {
 	row := db.QueryRow(ctx, CurrentSearchPath)
 	var path string
@@ -35,7 +35,7 @@ const SchemaVersionTableExists = `-- name: SchemaVersionTableExists :one
 SELECT (to_regclass($1::text) IS NOT NULL)::boolean AS found
 `
 
-// Migrate bootstrap: before the first migration there is no schema_version table
+// §8 Migrate bootstrap: before the first migration there is no schema_version table
 func (q *Queries) SchemaVersionTableExists(ctx context.Context, db DBTX, qualifiedName string) (bool, error) {
 	row := db.QueryRow(ctx, SchemaVersionTableExists, qualifiedName)
 	var found bool
@@ -47,7 +47,7 @@ const SetSearchPath = `-- name: SetSearchPath :exec
 SELECT set_config('search_path', $1::text, true)
 `
 
-// Store.tx: transaction-local search_path (set_config(..., true) == SET LOCAL), nothing leaks to the host's pool;
+// §8 Store.tx: transaction-local search_path (set_config(..., true) == SET LOCAL), nothing leaks to the host's pool;
 // the value is <schema>, pg_temp so a session's temp table cannot shadow a library table
 func (q *Queries) SetSearchPath(ctx context.Context, db DBTX, path string) error {
 	_, err := db.Exec(ctx, SetSearchPath, path)

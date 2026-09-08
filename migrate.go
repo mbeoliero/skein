@@ -48,7 +48,7 @@ func loadMigrations() ([]store.Migration, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, store.Migration{Version: v, SQL: string(b)})
+		out = append(out, store.Migration{Version: v, Sql: string(b)})
 	}
 	slices.SortFunc(out, func(a, b store.Migration) int { return cmp.Compare(a.Version, b.Version) })
 	if len(out) == 0 || out[len(out)-1].Version != schemaVersion {

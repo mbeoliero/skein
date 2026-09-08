@@ -10,14 +10,14 @@ import (
 // RawJSON is a raw JSON document; design §8 writes it as json.RawMessage.
 type RawJSON = jsontext.Value
 
-// Executor runs one attempt. Delivery is at-least-once: anything with external side
+// Executor runs one invocation. Delivery is at-least-once: anything with external side
 // effects must deduplicate on req.IdempotencyKey.
 type Executor func(ctx context.Context, req *Request) (RawJSON, error)
 
 type Request struct {
 	RunId          int64
 	JobName        string
-	Attempt        int                // 1-based: this is the Attempt-th start of the run
+	Attempt        int                // failures/interruptions +1; releases and snoozes do not increment it
 	Params         RawJSON            // job.params merged with the caller's override
 	WorkflowRunId  *int64             // set for workflow nodes
 	Input          RawJSON            // workflow_run.input; nil for plain runs

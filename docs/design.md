@@ -1,8 +1,8 @@
 # Skein v5：表结构
 
-日期：2026-09-06。状态：**表结构已定稿**（§2 ~ §5），流程、故障恢复、接口、实施步骤按定稿表编写（§6 ~ §10）。M1 ~ M6 已实现，代码与本文一致。
+日期：2026-09-06。状态：**表结构已定稿**（§2 ~ §5），流程、故障恢复、接口、实施步骤按定稿表编写（§6 ~ §10）。M1 ~ M6 已实现；M7 真实负载与多实例验收见 §11，smoke 已实现，full / soak 待实现，验证记录见 docs/scenarios.md；M8 两节点外部任务与纯 Snooze 已实现并通过 PG 13 / 18 验收（§12）；§6 / §8 已同步。
 
-2026-09-06 评审修订：节点取消改由父行状态表达，不再对 running 节点写 `cancel_requested`（§6.5 / §6.6 / §7.3）；结算的非终态出口统一先看取消（§6.5）；Shutdown 不再拒绝 Trigger（§6.8）；定时触发用 DB 时钟（§6.2）；领取分支二重领时记 `interrupted`（§6.3）；`schedule` 的 FK 改 RESTRICT（§3）；列表索引与游标改用 `id`（§3 / §8）。2026-09-07：角色开关改名 `DisableWorker` / `DisableScheduler`，零值即启用（§1 / §8）；`ScheduleSpec.Enabled` 同理改为 `Disabled`（§8）；清理改用会话级 advisory lock，每步独立短事务（§6.10）。2026-09-07 评审修订二：清理的 DELETE 外层重判终态条件（§6.10 / §7.3）；fail-fast 先取消再读节点（§6.5）；普通实例取消改为一条 UPDATE（§6.6）；无下一触发点的计划被拒绝或禁用（§6.2）；本地心跳期限只由心跳刷新、`active` 按 lease_token 记、领取后检查有界并在进入 Executor 前看停机（§6.4 / §6.8）；配置取值范围与 `retry_policy` 范围校验、`MaxPayload` 语义、`Metrics` 并发契约、`exec_duration` 标签取落库状态（§8）。2026-09-07 评审修订三：停止领取与 Executor 登记共用 `inflight` 互斥锁，lease-loss 的移除与结果丢弃标记原子发布（§6.4 / §6.8）；未启动节点取消先以 `SKIP LOCKED` 锁定候选，被跳过的 pending 由领取后检查收敛，锁序证明以不等待候选行为依据（§6.3 / §6.5 / §6.6 / §7.3，同步 §2 / §5 概述）。2026-09-07 交付补充：README 使用入口、MIT 许可证（署名 Jaken）、Go 1.27 与 PG 13/18 的 GitHub Actions 矩阵；CI 验证数据库连接并禁止测试缓存（§8.2）。2026-09-07 源码组织补充：保持包边界与执行职责，README 增加阅读导航，里程碑测试文件改用行为名称（§8.3）。2026-09-07 评审修订四：search_path 显式列出 pg_temp（§8）；cron 拒绝内嵌时区前缀、`@every` 与 `Local` 时区（§6.1 / §8）；jsonb 拒绝的输出按不可重试失败（§6.5）；分支二重领计数封顶（§6.3）；清理批次跟随停止信号、解锁有界（§6.8 / §6.10）；GetRun 单语句读取、timeout 上界与 NaN jitter 校验（§8）；口径修正：§6.2 日与星期 OR 语义、§7 结算不重试、§8.1 HOT 告警按心跳口径、§9 M5 实测边界。2026-09-07 评审修订五：TriggerTx 恢复 search_path 用独立有界 ctx，恢复失败单独返回（§8）；停机第 6 步取消在途心跳（§6.8）；回滚、恢复、解锁共用 5s 收尾期限（§6.10）；`hot_update_ratio` 改为趋势口径（§8.1）。2026-09-07 评审修订六（精准触发）：领取与定时扫描改为事件驱动，轮询降为兜底并把默认周期放宽到 5s（§1 / §6 / §8）；`job_run` 与 `schedule` 加唤醒触发器，NOTIFY 只做提前唤醒（§3 / §6.11）；定时扫描睡到最近的 `next_run_at`，领取睡到最近的 `run_at`、槽位释放即再领（§6.2 / §6.3）；停机同时关闭监听连接（§6.8 / §6.9）；故障窗口与锁序补监听与触发器（§7.1 / §7.3 / §7.4）；新增 `listener_reconnect_total`（§8.1）；新增 M6 验收（§9）；LISTEN/NOTIFY 从 §10 移出。2026-09-07 评审修订七：errors 条目先规范化再落库、任何结算的 class 22 都按不可重试失败（§6.5）；到点读取含已到期行、`db_now` 取 `clock_timestamp()` 并扣本地耗时（§6.2 / §6.3 / §6.11）；后到的 Shutdown 调用等待完成或自己的 ctx（§6.8 / §8）；超长 `executor_type` 退化为广播唤醒（§3 / §6.11）；列表多读一行判断尾页（§8）；M6 验收改为 Executor 入口时刻 ≤ 300ms（§9）；口径修正：DB 时钟前跳才提前过期（§7.4）、收尾期限各自 5s（§6.10）。2026-09-08 评审修订八：去重撞键后查不到在途 run 则重跑 INSERT，最多 3 轮（§6.1 / §8）；名字 ≤ 255 字节（§8）；部分填写的重试策略按原样校验（§8）；领取的到点读取放到本轮末尾并扣除耗时（§6.3）；`Stats` 无注册类型时传空数组（§8）；日志的 instance 由 Logger 统一携带。
+2026-09-06 评审修订：节点取消改由父行状态表达，不再对 running 节点写 `cancel_requested`（§6.5 / §6.6 / §7.3）；结算的非终态出口统一先看取消（§6.5）；Shutdown 不再拒绝 Trigger（§6.8）；定时触发用 DB 时钟（§6.2）；领取分支二重领时记 `interrupted`（§6.3）；`schedule` 的 FK 改 RESTRICT（§3）；列表索引与游标改用 `id`（§3 / §8）。2026-09-07：角色开关改名 `DisableWorker` / `DisableScheduler`，零值即启用（§1 / §8）；`ScheduleSpec.Enabled` 同理改为 `Disabled`（§8）；清理改用会话级 advisory lock，每步独立短事务（§6.10）。2026-09-07 评审修订二：清理的 DELETE 外层重判终态条件（§6.10 / §7.3）；fail-fast 先取消再读节点（§6.5）；普通实例取消改为一条 UPDATE（§6.6）；无下一触发点的计划被拒绝或禁用（§6.2）；本地心跳期限只由心跳刷新、`active` 按 lease_token 记、领取后检查有界并在进入 Executor 前看停机（§6.4 / §6.8）；配置取值范围与 `retry_policy` 范围校验、`MaxPayload` 语义、`Metrics` 并发契约、`exec_duration` 标签取落库状态（§8）。2026-09-07 评审修订三：停止领取与 Executor 登记共用 `inflight` 互斥锁，lease-loss 的移除与结果丢弃标记原子发布（§6.4 / §6.8）；未启动节点取消先以 `SKIP LOCKED` 锁定候选，被跳过的 pending 由领取后检查收敛，锁序证明以不等待候选行为依据（§6.3 / §6.5 / §6.6 / §7.3，同步 §2 / §5 概述）。2026-09-07 交付补充：README 使用入口、MIT 许可证（署名 Jaken）、Go 1.27 与 PG 13/18 的 GitHub Actions 矩阵；CI 验证数据库连接并禁止测试缓存（§8.2）。2026-09-07 源码组织补充：保持包边界与执行职责，README 增加阅读导航，里程碑测试文件改用行为名称（§8.3）。2026-09-07 评审修订四：search_path 显式列出 pg_temp（§8）；cron 拒绝内嵌时区前缀、`@every` 与 `Local` 时区（§6.1 / §8）；jsonb 拒绝的输出按不可重试失败（§6.5）；分支二重领计数封顶（§6.3）；清理批次跟随停止信号、解锁有界（§6.8 / §6.10）；GetRun 单语句读取、timeout 上界与 NaN jitter 校验（§8）；口径修正：§6.2 日与星期 OR 语义、§7 结算不重试、§8.1 HOT 告警按心跳口径、§9 M5 实测边界。2026-09-07 评审修订五：TriggerTx 恢复 search_path 用独立有界 ctx，恢复失败单独返回（§8）；停机第 6 步取消在途心跳（§6.8）；回滚、恢复、解锁共用 5s 收尾期限（§6.10）；`hot_update_ratio` 改为趋势口径（§8.1）。2026-09-07 评审修订六（精准触发）：领取与定时扫描改为事件驱动，轮询降为兜底并把默认周期放宽到 5s（§1 / §6 / §8）；`job_run` 与 `schedule` 加唤醒触发器，NOTIFY 只做提前唤醒（§3 / §6.11）；定时扫描睡到最近的 `next_run_at`，领取睡到最近的 `run_at`、槽位释放即再领（§6.2 / §6.3）；停机同时关闭监听连接（§6.8 / §6.9）；故障窗口与锁序补监听与触发器（§7.1 / §7.3 / §7.4）；新增 `listener_reconnect_total`（§8.1）；新增 M6 验收（§9）；LISTEN/NOTIFY 从 §10 移出。2026-09-07 评审修订七：errors 条目先规范化再落库、任何结算的 class 22 都按不可重试失败（§6.5）；到点读取含已到期行、`db_now` 取 `clock_timestamp()` 并扣本地耗时（§6.2 / §6.3 / §6.11）；后到的 Shutdown 调用等待完成或自己的 ctx（§6.8 / §8）；超长 `executor_type` 退化为广播唤醒（§3 / §6.11）；列表多读一行判断尾页（§8）；M6 验收改为 Executor 入口时刻 ≤ 300ms（§9）；口径修正：DB 时钟前跳才提前过期（§7.4）、收尾期限各自 5s（§6.10）。2026-09-08 评审修订八：去重撞键后查不到在途 run 则重跑 INSERT，最多 3 轮（§6.1 / §8）；名字 ≤ 255 字节（§8）；部分填写的重试策略按原样校验（§8）；领取的到点读取放到本轮末尾并扣除耗时（§6.3）；`Stats` 无注册类型时传空数组（§8）；日志的 instance 由 Logger 统一携带。2026-09-08 验收设计补充：新增 M7 真实负载与多实例验收，明确混合任务、故障注入、逐次执行证据、计时口径、容量分档与通过条件（§9 / §11）；不改变 §3 DDL、§6 事务协议、§7.3 锁序或 §8 公共 API。2026-09-08 M7 smoke 实现口径补充：cron 精度以 scheduled_at 覆盖扫描耗时；使用 Go 原生 -artifacts 保存制品（§11）。2026-09-08 M7 smoke 交付：独立保存并核对预期 At / cron 拍次，增加坏证据负例及共享预算下的并发清理；更新运行入口，完整负载与 soak 仍待实现（§9 / §11）。2026-09-08 Snooze 方案确认：采用 submit → poll 两节点与纯 Snooze，task id 和固定 deadline 保存在 submit 的成功 output，不引入运行中 checkpoint、不改变 Resume 语义；补充 M8 待实施设计与验收（§9 / §10 / §12），开始实施前另行确认并同步 §6 / §8，§3 DDL 与 §7.3 锁序不变。2026-09-08 M8 实施确认：同步纯 Snooze 的结算、唤醒、Attempt 计数及指标标签（§4 / §5 / §6.5 / §6.11 / §8 / §12）；复用两节点的成功 output 与既有 Resume，DDL 与锁序不变。2026-09-08 M8 兼容性补充：Snooze 使用 pgx 原生 interval 参数，在 SQL 中补足最多 1µs；避免 PG 13 大微秒数字面量越界和 Go Duration 向上取整溢出（§6.5 / §12.2）。2026-09-08 M8 交付：纯 Snooze、两节点示例、崩溃 / 取消 / fence / 期限验收落地；PG 13.23 与 18.4 均通过 test-ci 和三轮 race，lint 通过，更新完成状态与验收映射（§9 / §12）。2026-09-08 全量审查修订：空输出统一写 SQL NULL（§6.5）；启动查库移出生命周期锁并随停机取消，停机后不得补启动循环（§6.8 / §8）；PG 13 性能基线缺失的 active_time 标为 N/A（§9），不改变 DDL 或锁序。2026-09-08 M7 Snooze 补充：原 smoke 批次不变，追加普通 Snooze、全槽位复用屏障与 submit → poll → verify 工作流，保存 pending 快照并独立核对等待期限（§11）；不改生产协议或 DDL。
 
 ---
 
@@ -242,7 +242,7 @@ CREATE TRIGGER schedule_wake AFTER INSERT OR UPDATE OF cron, timezone, enabled O
 | 列 | 读方 |
 |---|---|
 | `job_run.params / timeout / retry_policy` | 领取事务一条 `RETURNING` 交给 Worker。快照而非冗余：job 改了或删了，在途 run 的语义不变；run → job 因此不需要 FK |
-| `run_at` | 只对 pending 行有意义：延迟执行与重试退避的可领取时刻。领取分支一：`state = 'pending' AND run_at <= now()`，走 `idx_job_run_claim` |
+| `run_at` | 只对 pending 行有意义：延迟执行、重试退避与 Snooze 的可领取时刻。领取分支一：`state = 'pending' AND run_at <= now()`，走 `idx_job_run_claim` |
 | `lease_expires_at` | 只对 running 行有意义。领取分支二：`state = 'running' AND lease_expires_at <= now()`，走 `idx_job_run_running` 找到 running 行后在堆上过滤；僵尸回收就是这条分支。两支是两条独立语句，各自 `FOR UPDATE SKIP LOCKED`，第二支只在第一支没领满时执行（`FOR UPDATE` 不能作用于 `UNION`）。心跳只写它；它不在任何索引里，配合 `toast_tuple_target = 256` 与 `fillfactor = 70`，心跳是 HOT 更新，不写索引、死元组页内剪枝回收。续期封顶在 `started_at + timeout + CancelTimeout`，Executor 忽略 ctx 也占不住 |
 | `lease_token` | 每次领取新生成的随机 uuid，本行当前合法持有者的凭证。心跳、结算、释放全部 `WHERE lease_token = 我的`；0 行即租约已失。与选主无关，系统没有 leader |
 | `lease_owner` | 不进任何 WHERE，排障时回答"这条卡住的 run 在哪个实例手上" |
@@ -250,7 +250,7 @@ CREATE TRIGGER schedule_wake AFTER INSERT OR UPDATE OF cron, timezone, enabled O
 | `executor_type` 在两个领取索引里 | 实例只领自己注册过的类型，滚动发布时新类型不被旧实例领走 |
 | `dedup_key` 部分唯一索引 | 在途即占位、终态自动释放；`overlap = skip` 复用它，触发事务里 `ON CONFLICT DO NOTHING` 就是跳过。节点实例不带 dedup_key，去重在 workflow_run 上 |
 | `(schedule_name, scheduled_at)` 唯一 | 两实例同时扫到同一计划的兜底；正常靠 `FOR UPDATE SKIP LOCKED` 已互斥 |
-| `attempt` | 失败结算 +1、租约过期重领 +1、优雅释放不加；`attempt >= max_attempts` 即终止，崩溃循环也有上限 |
+| `attempt` | 失败结算 +1、租约过期重领 +1、优雅释放与 Snooze 不加；`attempt >= max_attempts` 即终止，崩溃循环也有上限 |
 | `errors` | 逐次"这次启动为什么没跑完"，`kind` 区分 business / timeout / interrupted / panic / upstream_failed / released；结算时 `errors = errors \|\| $1::jsonb` 追加；`interrupted` 条目在领取分支二重领时追加，崩溃过又成功的 run 也留痕。`released` 条目 ≥ `ReleaseAlertThreshold`（3）即告警：任务被滚动发布反复打断却永不失败，没有这条就永不报警（v2 FR-9.8） |
 | `started_at` | 当前这次跑了多久 |
 | `created_at / finished_at` | 展示、保留清理、终态 CHECK；列表排序与游标用 `id`，不用 `created_at`（并发插入下两者顺序可能不一致）。清理按终态分两个窗口（成功 7d、失败 30d），`(finished_at)` 单列索引对两个窗口都够用：7d 前的行几乎都是成功的，30d 前的行只剩失败的 |
@@ -280,7 +280,7 @@ CREATE TRIGGER schedule_wake AFTER INSERT OR UPDATE OF cron, timezone, enabled O
 | job 与 workflow 不做版本 | 实例创建时快照，等价于不可变版本；版本表只多出"查看定义历史"，需要审计时再加，run 行不用动 |
 | 上游失败 fail-fast | 任一节点最终失败 → 工作流 `cancelling`，可立即加锁的未开始节点 cancelled（errors 记 upstream_failed），跳过的领取由父状态检查收敛，在跑节点不写，持有者经心跳看到父行 cancelling 后自行结算为 cancelled，全部终态后 failed。与用户取消共用一条路径 |
 | 续跑在原 workflow_run 上 | 重置集合 = failed / cancelled 节点及其未成功后代；`attempt` 归零、清 started / finished / output，`errors` 继续追加；deps 全成功的回 pending，其余 blocked；成功节点不动；工作流回 running。回到在途会重新占去重键，撞上同键新 run 返回 ErrDuplicate |
-| 不做工作流级超时 | 节点各有 timeout 与 max_attempts，总时长已有界 |
+| 不做工作流级超时 | timeout 限制单次执行，max_attempts 限制真实失败 / 中断；不约束正常 Snooze 的总等待。外部任务通过 submit 的成功 output 保存固定 deadline，由 poll 检查（§12），不新增超时扫描 |
 | `retry_policy` 用 jsonb，只有 `max_attempts` 必填 | 按 job 调退避是少数需求，缺省走引擎公式 |
 | 快照列不折叠成 jsonb | 20 多列是这一行兼任队列项、事实、快照三个角色的结果；折叠只省 2 列 |
 | `cancel_requested` 用布尔，不用 `cancelling` 态 | job_run 有租约，取消只是"请求"；加状态会让在途集合多一个值，6 处谓词跟着改。有租约用布尔，无租约（workflow_run）用状态。布尔只给普通实例；节点的取消由父行状态表达，否则取消事务要批量写 running 节点，与心跳按不同顺序锁同一批行会死锁（§7.3） |
@@ -485,7 +485,8 @@ BEGIN
   outcome 分支（同一条 UPDATE 的 SET；lease_token / lease_owner / lease_expires_at 一律置 NULL）：
     succeeded              : state = 'succeeded', output = $out, finished_at = now()
     cancelled              : state = 'cancelled', finished_at = now()
-    以下四个出口先看取消命中：命中则 state = 'cancelled', finished_at = now()，其余 SET 照旧（errors 照常追加）；未命中：
+    以下五个出口先看取消命中：命中则 state = 'cancelled', finished_at = now()，各分支其余 SET 照旧；未命中：
+    snoozed（正常等待）    : state = 'pending', run_at = now() + delay   -- attempt / errors / output 不变
     released（优雅停机）    : state = 'pending', run_at = now(), errors = errors || $err(kind=released)   -- attempt 不变，留痕供告警
     failed 且可重试
       且 attempt + 1 < max_attempts
@@ -494,16 +495,18 @@ BEGIN
     failed 其他            : state = 'failed', attempt = attempt + 1, errors = errors || $err, finished_at = now()
     interrupted（§6.3 第 3 条）: state = 'failed', finished_at = now()   -- errors 分支二已追加，attempt 不加
 
-  succeeded 的 $out：Go 侧非空必须是合法 JSON，超过 MaxPayload 按不可重试失败；jsonb 仍拒绝的（反斜杠 u0000 转义、超出 numeric 的数字，SQLSTATE 22 类）
+  succeeded 的 $out：nil 与非 nil 的零长度文档都表示无输出，统一写 SQL NULL；Go 侧非空必须是合法 JSON，超过 MaxPayload 按不可重试失败；jsonb 仍拒绝的（反斜杠 u0000 转义、超出 numeric 的数字，SQLSTATE 22 类）
       由 Worker 改按不可重试失败再结算一次，errors 记数据库给出的原因。确定性的编码错误不留给重领，否则行会留在 running、过期后被重领、最后只剩 interrupted 记录。
   errors 条目的 message 是 Executor 唯一能控制的文本：落库前替换非法 UTF-8 与 NUL、截到 4KB，编码仍失败则记固定文案；
       任何 outcome 的结算撞到 22 类错误都走同一条"改按不可重试失败"的路，否则一个带 NUL 的 Permanent 错误会变成三次执行加一条 interrupted
   SQL 写法：state = CASE WHEN cancel_requested OR $wf_cancelling THEN 'cancelled' ELSE '<分支值>' END，finished_at 用同一个 CASE。
-  取消后恰好赶上重试 / 停机 / 重领的行因此不会回到 pending，也不会在取消中的工作流留下 failed 节点
+  取消后恰好赶上 Snooze / 重试 / 停机 / 重领的行因此不会回到 pending，也不会在取消中的工作流留下 failed 节点
 
   节点实例且 RETURNING 的 state 为终态 → propagate
 COMMIT
 ```
+
+`Snooze(delay)` 是控制错误而非失败：支持普通 `%w` 包装；取消、失租、停机、超时及显式 Permanent 不被它覆盖。delay > 0，按微秒向上取整；结算时使用 pgx 原生 interval 参数并在 SQL 补足最多 1µs，兼容 PG 13 且避免大时长浮点转换或 Go Duration 向上取整溢出。Snooze 返回的 output 不写库，无论是否非空；不写 errors，不走退避，等待期间不占槽位或持租约。完整契约见 §12。
 
 退避 `backoff(n) = min(max_sec, base_sec × 2^(n−1)) × U[0.8, 1.2)`，缺省 5s / 5min；结果落库，恢复时不重抽随机数。`Permanent(err)` 与输出超限直接 `failed`。`$err = [{"attempt": n, "at": now, "kind": ..., "message": ...}]`。
 
@@ -610,6 +613,8 @@ Shutdown(ctx):
   6. 停心跳，在途的心跳语句一并取消（inflight 已清空，没有要续的租约）；只关闭自有 goroutine，不关闭宿主连接池
 ```
 
+`Start` 在生命周期锁内登记启动中，随后释放锁再检查 `schema_version`；该查询同时受调用方 ctx 与停机信号控制。查询结束后重新持锁检查停机状态，只有尚未停机才能启动循环。启动失败允许重新 Start，但 Shutdown 后永远不允许；不能让启动查库的连接等待或行锁等待挡住首个 Shutdown，也不能在 Shutdown 返回后补启动循环。
+
 宿主负责信号与是否结束进程；库不调用 `os.Exit`、不接管信号。`Shutdown` 只执行一次：首个调用者执行上面的步骤，后到的调用者等待它完成或自己的 ctx 先到，返回它的结果或自己的 ctx 错误，不会卡在生命周期锁后面继承前者的预算（父 ctx 先触发后台 Shutdown、宿主随后带短预算再调用是常见场景）。`Start` 的父 ctx 取消等价于发起 Shutdown；续租与结算 SQL 用独立、有上限的收尾 ctx，避免父 ctx 一取消就同时取消所有收尾写入。pgx 事务显式 Commit / Rollback。整个 Shutdown 的上限是调用方 ctx 加第 1 步等待的一个在途领取或扫描事务（各自有 10s 上限，实际是毫秒）；清理批次与在途心跳不计入，前者跟随循环 ctx 取消（§6.10），后者由第 6 步取消。
 
 ### 6.9 重启恢复
@@ -652,7 +657,7 @@ SELECT count(*) FROM job_run WHERE state IN ('pending','running') AND workflow_r
 
 ### 6.11 唤醒与提前触发
 
-目标：cron 到点、`Trigger` 提交、节点激活、released 回队都在毫秒级被某个实例领到，且这个精度不依赖 `PollInterval`。手段是三类唤醒源加轮询兜底。状态仍只在 PG：进程内没有任务副本，内存里只有"下次该醒的时刻"这一个时间戳，它由 DB 时钟算出、过期无害。
+目标：cron 到点、`Trigger` 提交、节点激活、released 回队与 Snooze 到期都在毫秒级被某个实例领到，且这个精度不依赖 `PollInterval`。手段是三类唤醒源加轮询兜底。状态仍只在 PG：进程内没有任务副本，内存里只有"下次该醒的时刻"这一个时间戳，它由 DB 时钟算出、过期无害。
 
 | 唤醒源 | 领取循环 | 扫描循环 |
 |---|---|---|
@@ -661,7 +666,7 @@ SELECT count(*) FROM job_run WHERE state IN ('pending','running') AND workflow_r
 | 到点定时器 | 最早的 pending `run_at`，含已到期（§6.3） | 最近的 `next_run_at`（§6.2） |
 | 轮询兜底 | `jitter(PollInterval)` | 同左 |
 
-**通知由触发器发出**（§3）：`job_run` 上 `AFTER INSERT OR UPDATE OF state, run_at … WHEN (NEW.state = 'pending')`，`schedule` 上 `AFTER INSERT OR UPDATE OF cron, timezone, enabled OR DELETE`。频道名 = schema 名（`TG_TABLE_SCHEMA`，本身就是合法标识符，监听方 `LISTEN "<schema>"`），payload 是 `run:<executor_type>` 或 `schedule`；`pg_notify` 的 payload 必须小于 8000 字节，`executor_type` 超过 7000 字节时发空 payload，监听方按广播唤醒两个循环，提交永远不会因通知失败。选触发器而不是在每条语句后手写 `pg_notify`：产生 pending 行的事务有七处（提交 §6.1、定时 §6.2、推进激活 §6.5、released 与退避 §6.5、续跑 §6.7、`TriggerTx` 在调用方事务里），触发器把"可领取的行出现即通知"变成 schema 级不变量，与去重靠唯一索引是同一思路。退避重排的行 `run_at` 在未来也通知：别的实例要据此重算到点定时器，代价是一次空领取。心跳只写 `lease_expires_at`，不在 `OF` 列表里，触发器不评估；领取把 state 改成 running，WHEN 为假；同一事务里相同 payload 的通知 PG 只投递一次，500 节点的工作流提交按 executor_type 去重。`AdvanceSchedule` 只写 `next_run_at`，不通知，否则每次触发会让全部实例重扫一遍；`Put` 的 SET 总是列出 `cron, timezone, enabled`，`OF` 按列出而不是按值变化触发，所以每次 `Put` 都通知。
+**通知由触发器发出**（§3）：`job_run` 上 `AFTER INSERT OR UPDATE OF state, run_at … WHEN (NEW.state = 'pending')`，`schedule` 上 `AFTER INSERT OR UPDATE OF cron, timezone, enabled OR DELETE`。频道名 = schema 名（`TG_TABLE_SCHEMA`，本身就是合法标识符，监听方 `LISTEN "<schema>"`），payload 是 `run:<executor_type>` 或 `schedule`；`pg_notify` 的 payload 必须小于 8000 字节，`executor_type` 超过 7000 字节时发空 payload，监听方按广播唤醒两个循环，提交永远不会因通知失败。选触发器而不是在每条语句后手写 `pg_notify`：产生 pending 行的事务有八处（提交 §6.1、定时 §6.2、推进激活 §6.5、Snooze / released / 退避 §6.5、续跑 §6.7、`TriggerTx` 在调用方事务里），触发器把"可领取的行出现即通知"变成 schema 级不变量，与去重靠唯一索引是同一思路。退避与 Snooze 重排的行 `run_at` 在未来也通知：别的实例要据此重算到点定时器，代价是一次空领取。心跳只写 `lease_expires_at`，不在 `OF` 列表里，触发器不评估；领取把 state 改成 running，WHEN 为假；同一事务里相同 payload 的通知 PG 只投递一次，500 节点的工作流提交按 executor_type 去重。`AdvanceSchedule` 只写 `next_run_at`，不通知，否则每次触发会让全部实例重扫一遍；`Put` 的 SET 总是列出 `cron, timezone, enabled`，`OF` 按列出而不是按值变化触发，所以每次 `Put` 都通知。
 
 **监听**：每个运行了领取或扫描的实例一条专用连接，从池里 `Acquire` 后 `Hijack`，`LISTEN "<schema>"`，成功后立即唤醒本实例的领取与扫描各一次（补上连接建立前错过的通知），然后阻塞在 `WaitForNotification`。任何错误：关闭连接、`listener_reconnect_total` +1、等 `jitter(PollInterval)` 后重连；断开期间靠轮询。监听连接不开事务、不持锁、不参与 §7.3。停机第 1 步随循环停止并在收尾期限内关闭（§6.8）。`DisableWorker` 且 `DisableScheduler` 的实例不监听；只关一个的实例只处理对应的 payload。
 
@@ -750,7 +755,7 @@ type Executor func(ctx context.Context, req *Request) (json.RawMessage, error)
 type Request struct {
     RunId          int64
     JobName        string
-    Attempt        int                        // 本次是第几次启动（attempt + 1）
+    Attempt        int                        // 失败 / 中断计数 +1；Snooze 与优雅释放不增加，不是调用次数
     Params         json.RawMessage            // job.params ⊕ 调用方覆盖；代码里 json.RawMessage 即 RawJSON = jsontext.Value
     WorkflowRunId  *int64                     // 节点实例非空
     Input          json.RawMessage            // workflow_run.input；普通实例为 nil
@@ -792,6 +797,7 @@ func (e *Engine) Workflows().CancelRun(ctx, id) error
 func (e *Engine) Workflows().Resume(ctx, id) error
 
 func Permanent(err error) error                                                   // 标记不可重试
+func Snooze(delay time.Duration) error                                            // 正常等待后再次执行，delay > 0，不消耗 attempt、不保存 output（§12）
 var ErrNotFound, ErrDuplicate, ErrReferenced, ErrNotDrained, ErrNotResumable error
 ```
 
@@ -810,9 +816,9 @@ var ErrNotFound, ErrDuplicate, ErrReferenced, ErrNotDrained, ErrNotResumable err
 | `MaintenanceInterval` | 1h | |
 | `MaxNodes` / `MaxPayload` | 500 / 256KB | 定义与提交时校验。`MaxPayload` 限制的是每个输入文档（params 模板、Trigger 覆盖、工作流 input）和输出，各自单独校验；落库的 params 是模板与覆盖合并后的结果，最多 2 倍。输出超限按不可重试失败 |
 
-名字（job / workflow / schedule / `executor_type`）非空且 ≤ 255 字节：它们进 dedup key、errors 条目（`<job> failed`）与 NOTIFY payload，源头限长让这三处都有界。`New` 填默认值后校验每个字段的取值范围：所有周期、退避、宽限、保留时长必须 > 0，`Concurrency` / `MaxNodes` / `MaxPayload` / `ReleaseAlertThreshold` ≥ 1，`LeaseTTL > HeartbeatInterval`，`BackoffMax ≥ BackoffBase`，`RetentionFailed ≥ RetentionSucceeded`；`retry_policy`（`Declare` 与 `DefaultRetry` 同一规则）要求 `1 ≤ max_attempts ≤ 32767`（`attempt` 是 smallint），`base_sec` / `max_sec` 在 0 到 30 天之间，`0 ≤ jitter < 1`（NaN 同样拒绝）；`DefaultTimeout` 与 `JobSpec.Timeout` 在 1s 到 2³¹−1 秒之间（列是 integer 秒，更大的值转 int32 会回绕）。负周期会让 `time.NewTicker` 在后台 goroutine 里 panic，必须挡在 `New`。`Start` 与 `Shutdown` 互斥；`Shutdown` 之后不能再 `Start`。
+名字（job / workflow / schedule / `executor_type`）非空且 ≤ 255 字节：它们进 dedup key、errors 条目（`<job> failed`）与 NOTIFY payload，源头限长让这三处都有界。`New` 填默认值后校验每个字段的取值范围：所有周期、退避、宽限、保留时长必须 > 0，`Concurrency` / `MaxNodes` / `MaxPayload` / `ReleaseAlertThreshold` ≥ 1，`LeaseTTL > HeartbeatInterval`，`BackoffMax ≥ BackoffBase`，`RetentionFailed ≥ RetentionSucceeded`；`retry_policy`（`Declare` 与 `DefaultRetry` 同一规则）要求 `1 ≤ max_attempts ≤ 32767`（`attempt` 是 smallint），`base_sec` / `max_sec` 在 0 到 30 天之间，`0 ≤ jitter < 1`（NaN 同样拒绝）；`DefaultTimeout` 与 `JobSpec.Timeout` 在 1s 到 2³¹−1 秒之间（列是 integer 秒，更大的值转 int32 会回绕）。负周期会让 `time.NewTicker` 在后台 goroutine 里 panic，必须挡在 `New`。`Start` 的状态登记、循环启动与 `Shutdown` 在生命周期锁下串行；启动查库不持锁，随停机取消（§6.8）。`Shutdown` 之后不能再 `Start`。
 
-`Metrics` 会被执行 goroutine 与各循环并发调用，实现必须并发安全且不阻塞。`exec_duration` 的 `outcome` 标签取结算后落库的状态：取消命中把 retry / released 改成 cancelled 时标签也是 cancelled。
+`Metrics` 会被执行 goroutine 与各循环并发调用，实现必须并发安全且不阻塞。`exec_duration` 的 `outcome` 标签取结算后落库的状态：取消命中把 retry / released / snoozed 改成 cancelled 时标签也是 cancelled。
 
 连接预算：执行不占连接；监听从池里取一条并脱离池（`Hijack`），进程存续期间不归还。池大小由宿主决定，建议 ≥ 5 并为心跳与结算保留余量，避免领取 SQL 耗尽连接造成大面积误过期。运行账号不用超级用户；迁移由发布步骤显式串行执行。依赖只有 `pgx/v5`、`robfig/cron/v3` 与标准库。
 
@@ -827,7 +833,7 @@ var ErrNotFound, ErrDuplicate, ErrReferenced, ErrNotDrained, ErrNotResumable err
 | `pending_due` | `Stats()`：`state = 'pending' AND run_at <= now()` 计数 | 持续增长 = 执行力不足或无注册类型 |
 | `pending_oldest_age` | 最老到期 pending 的 `now() − run_at` | > 领取周期数倍 |
 | `claim_latency` | 领取时 `now() − run_at` | |
-| `exec_duration{executor_type, outcome}` | 结算时打点，outcome = succeeded / failed / cancelled / released | |
+| `exec_duration{executor_type, outcome}` | 结算时打点，outcome = succeeded / failed / cancelled / released / snoozed | |
 | `lease_lost_total` | 心跳或结算 fence 返回 0 行 | 持续非 0 = 租约参数偏紧或有慢 Executor |
 | `reclaim_total` | 领取分支二命中数 | 持续非 0 = 有实例反复崩溃或假死 |
 | `released_alert_total` | 结算 released 时该 run 条目数 ≥ `ReleaseAlertThreshold` | > 0 |
@@ -862,11 +868,14 @@ README 提供从公共入口、提交、执行、数据库事务到回归测试�
 | **M2 多实例可靠** | 僵尸重领、attempt 上限、优雅停机（released）、心跳失败本地期限、重启恢复、取消普通实例 | kill -9 A 后 B 在 ≤ 75s 内接管且 attempt +1；暂停 A 超 60s 再恢复，A 的旧 token 写不进任何行；第 `max_attempts` 次重领直接 failed；Shutdown 时不合作 Executor 返回 `ErrNotDrained` 且随后被他人重领 | 3 天 |
 | **M3 工作流** | Workflows.Declare 校验、Trigger 物化、propagate / finalize、fail-fast、取消、续跑 | 100 个并行前驱同时完成汇合只激活一次；空定义拒绝；一节点失败后其余节点全部终态且 run 为 failed；续跑只重跑失败链、成功节点 `started_at` 不变；四对事务（含心跳 vs fail-fast）并发 1000 轮无死锁 | 4 天 |
 | **M4 定时与交付** | Schedules.Put upsert、扫描事务、补一拍、overlap = skip、DST 用例、保留清理、Stats、嵌入示例 | 两实例同时扫描同一计划只创建 1 个 run；反复 Put 相同配置不推迟 `next_run_at`；跨 3 个周期停机再启动只补 1 拍；上一拍在途时本拍 skipped；清理不删在途工作流里的已完成节点 | 3 天 |
-
-| **M5 性能基线** | 3 实例、10 万条存量 job_run、长短任务混合、256KB 与 1KB payload 各一组（256KB 组是重复字符，压缩率极高，只是可压缩 payload 的基线） | 报告吞吐、触发 / 排队延迟 p50 / p95 / p99、心跳口径的 `n_tup_hot_upd` 比例、`idx_job_run_claim` 峰值与手动 VACUUM 后的死元组（B-tree 页只标记可重用，大小不回落；autovacuum 周期内的行为未测）、`pg_stat_database.active_time`（后端活跃时间，不是 CPU）与锁等待。不设 SLA，只留基线供后续对比。报告与解读见 `docs/baseline.md`，复跑用 `SKEIN_BENCH=1 go test -run TestPerformanceBaseline` | 1 天 |
+| **M5 性能基线** | 3 实例、10 万条存量 job_run、长短任务混合、256KB 与 1KB payload 各一组（256KB 组是重复字符，压缩率极高，只是可压缩 payload 的基线） | 报告吞吐、触发 / 排队延迟 p50 / p95 / p99、心跳口径的 `n_tup_hot_upd` 比例、`idx_job_run_claim` 峰值与手动 VACUUM 后的死元组（B-tree 页只标记可重用，大小不回落；autovacuum 周期内的行为未测）、`pg_stat_database.active_time`（后端活跃时间，不是 CPU；PG 13 无此列，标 N/A，其余测量照常）与锁等待。不设 SLA，只留基线供后续对比。报告与解读见 `docs/baseline.md`，复跑用 `SKEIN_BENCH=1 go test -run TestPerformanceBaseline` | 1 天 |
 | **M6 精准触发** | 唤醒触发器、监听连接、扫描与领取的到点定时器、槽位释放再领、`PollInterval` 默认 5s、`listener_reconnect_total` | 全部在 `PollInterval = 5s` 下、以 Executor 入口时刻（DB 时钟 `clock_timestamp()`）减 `run_at` 计：跨实例 `Trigger` 与 `TriggerTx` 提交、`At(now+700ms)`、退避重试、cron 到点、released 回队、被锁跳过后的到期行，各 ≤ 300ms（CI 断言，机器负载下的上限，不是精度分布）；精度分布由 `docs/baseline.md` 的 5s 轮询排队延迟 p50 / p99 记录；`pg_terminate_backend` 杀掉监听连接后仍在 `PollInterval` 内领到、重连后 `listener_reconnect_total` = 1 且恢复毫秒级；EXPLAIN 到点读取每类型一次 `idx_job_run_claim` 探测；心跳 HOT 比例不变；短任务吞吐不再被轮询封顶（对照 `docs/baseline.md` 的 42/s） | 2 天 |
+| **M7 真实负载与多实例验收（smoke 已实现）** | `TestScenarioAcceptance` 已实现 3 进程 smoke，两个 `TestScenarioVerifier*` 验证坏证据与退避核查；1 / 3 / 6 进程完整负载、故障恢复与稳态仍待实现（§11） | 提交清单与终态 / 副作用逐项对账；低负载不提前执行且启动延迟 ≤ 300ms；负载中的取消、重试、DAG、去重与旧租约 fence 正确；容量分档报告积压与排空，不将超载排队判成调度精度问题 | 首版约 2 天，运行预算见 §11.5 |
+| **M8 两节点外部任务与纯 Snooze（已完成）** | 新增 Snooze 控制结果，原 run 延迟回 pending；视频任务以 submit 成功 output 向 poll 传递 task id 与固定 deadline（§12），不改 DDL / output / Resume 契约 | Snooze 不消耗失败次数、不写 output；等待不占槽位；24h 延迟可持久化；重启、旧租约 fence、取消与工作流推进正确；Resume 保留已成功提交的外部任务与原 deadline | 1–2 天 |
 
-直线 17 个工作日；含故障回归与联调按 **3 周** 排。
+全量审查回归映射：M1 的 `TestEmptyOutputSucceeds` 覆盖普通任务与工作流节点的 nil / 非 nil 空输出；`TestDedupWhileWinnersFinish` 覆盖并发完成窗口，`TestDedupRoundsWhenWinnersFinish` 用真实事务的确定性交错覆盖 job / workflow 在一轮竞争后成功和三轮耗尽返回零 id。M2 的 `TestShutdownCancelsStart` 验证池耗尽时首个 Shutdown 不等待启动查库、查询随停机取消且不得补启动。
+
+M1 ~ M6 直线 17 个工作日；含故障回归与联调按 **3 周** 排。M7 单独交付，不因现有 M5 / M6 已通过而视为完成。M8 已确认实施，完成 §12 验收前不将功能标记为已交付。
 
 ---
 
@@ -878,9 +887,206 @@ README 提供从公共入口、提交、执行、数据库事务到回归测试�
 | 定义版本表 | 需要"查看定义历史"的审计需求：加 `job_version` / `workflow_version` 追加表，run 行不动 |
 | API 语法糖：工作流内联节点自动生成 `<workflow>.<job>` 的 job | 写工作流嫌声明 job 烦时加，存储模型不变 |
 | `on_upstream_failure = continue`、工作流级超时、动态工作流 | 真实需求出现时按节点列 / `deadline_at` / 激活键分别加 |
-| 异步执行器（Submit / Poll / Abort） | 外部长任务需求出现时加 `op` 列与 poll 路径 |
+| 专用异步执行器（Submit / Poll / Abort）、运行中 checkpoint | 当前视频场景采用两节点 + 纯 Snooze（§12），task id 放 submit 的成功 output；只有两节点无法表达业务阶段或必须由库管理外部 Abort 时，再评审专用接口与持久化字段 |
 | 僵尸重领的到点定时器 | 接管等待由 `LeaseTTL` 主导，多等一个 `PollInterval` 不值得每轮多读；需要时在领取轮次里对本进程类型的 running 行取 `min(lease_expires_at)`（走 `idx_job_run_running`，行少，列在堆上），不改索引、不碰心跳 HOT |
 | HTTP API / Web / 内置执行器 / OTel | 薄封装同一个 Engine 即可，不改协议 |
 | 分区表 | 去重唯一索引必须含分区键，当前不可行；量级到达时先拆去重槽位表再分区 |
 
-以上每一项都是纯追加，不改变 §6 的事务协议与 §7.3 的锁序。
+列出加回条件不等于授权实现；涉及 §3 / §6 / §7.3 的变更仍须单独确认。§12 的纯 Snooze 已单独确认实施，不承诺专用异步执行器或外部 Abort。
+
+---
+
+## 11. M7：真实负载与多实例验收
+
+状态：**smoke 已实现，full / soak 待实现，M7 未完成**。运行方式与实测见 `docs/scenarios.md`。这里的“真实”指真实 PostgreSQL、独立 OS 进程和可核对的业务副作用；执行器先用确定性的模拟业务，不把合成数据称为生产流量回放。取得实际业务的任务比例、耗时和 payload 分布后，再增加对应案例。
+
+### 11.1 边界与复用
+
+- 只增加测试与报告，不新增 CLI、服务、运行时依赖、公共 Config 字段或生产表；§3 / §6 / §7.3 不变。若验收发现需要改变协议的问题，先单独评审，不在压测实现中顺带修改。
+- 新用例集中在 `scenarios_test.go`，复用 `freshSchema`、子进程夹具、`percentiles` 和现有故障夹具；长批次等待使用 M7 的总预算，不套用快速单例测试的短等待期限；`helper_test.go` 增加 scenario 模式，以便从父进程控制就绪、暂停、退出和恢复。只创建实际需要的测试代码，不搭通用压测框架。
+- M5 的 `TestPerformanceBaseline` 与 `docs/baseline.md` 保持原场景，仍用于同参数纵向比较；M7 单独输出报告。M2 / M3 的确定性交错测试继续负责证明具体 fence / 锁序，M7 验证这些行为在混合负载下能否收敛，不以随机压力替代确定性证明。
+- 每个案例使用独立测试 schema、固定随机种子（首版为 1）与有限执行期限；只操作测试 DSN，所有测试 SQL 和审计表均属于 `_test.go` 夹具，退出时清理。没有独立测试 PG 则不运行，显式运行时数据库不可达必须失败。
+
+### 11.2 负载与场景
+
+完整混合批次包含 **10,000 次普通任务触发**，另加 **100 次四节点工作流触发**；父工作流、节点行和执行次数分别计数，重试 / Resume 不算新提交。smoke 按十分之一缩小批次，仍保留全部任务种类。
+
+| 普通任务 | 数量 | 预期行为 |
+|---|---|---|
+| 短任务 | 6,000 | 可核对输入 / 输出的 JSON 处理、摘要计算或模拟 I/O；主要耗时 5–20ms |
+| 长任务 | 1,500 | 1–3s，正常响应 ctx；其中长于 2s 的子集用于核对心跳续租 |
+| 重试任务 | 1,000 | 前两次失败、第三次成功；`max_attempts = 3`，检查每次退避后的 `run_at` |
+| 预期失败 | 1,000 | 500 条 Permanent、500 条超时后耗尽两次机会；各自失败种类及次数明确 |
+| 取消任务 | 500 | pending 与已进入执行器各半；用入口事件 / 夹具屏障确认取消时机，不能靠猜测 sleep |
+
+工作流分为 40 条成功菱形图、30 条成功链、20 条 fail-fast 图和 10 条失败后 Resume 的链；检查依赖输出、后继启动顺序及成功节点不被 Resume 重跑。这里的“100 次”不包含 Resume 调用。短任务中一部分延迟 700ms–3s，其余立即投递；cron 另设低负载案例，用 `dueAt` 设置近期的 `next_run_at`，不等待自然分钟边界。
+
+smoke 在原混合批次排空后，另加 **48 个普通 Snooze 任务**（各 Snooze 两次、每次 3s）与 **48 个槽位探针**；确认前者首次全部进入 pending 后，让探针在最早 Snooze 到期前同时进入并停在测试屏障，证明 3 × 16 个槽位均可复用，再开放屏障。另加一个 **submit → poll → verify** 三节点工作流：submit 成功输出经依赖传给 poll，poll Snooze 四次、每次 700ms，verify 是检查后继不得提前执行的测试节点。Snooze 的 max_attempts 固定为 1，调用始终为 Attempt 1、最终 attempt 0 / errors 空，不能用 Attempt 作为调用计数。两组共 100 次 Snooze 再启动；独立窗口沿用 0–300ms 精度阈值，不以这组小型等待 / 槽位竞争替代 full 的混合容量验收。
+
+每次 Snooze 保存请求时长、同次 claim 的 started_at，以及观察到的 pending / run_at 快照；快照须属于该次 claim，不能用下一次 pending 冒充。检查租约字段清空、attempt / errors 不变、Snooze 随带输出未写入，工作流仍 running、后继仍 blocked；下一次入口的 run_at 必须等于已观察到的到期点，且到期点落在「返回审计时刻 + 请求时长」至「结算观察时刻 + 请求时长」之间。每次 poll 的依赖摘要及 submit 的成功输出、执行次数、started_at 保持一致。制品及核查器负例覆盖缺失快照、错误时长 / 到期点、状态污染与不同的下一次 run_at。追加后总清单为 **1,642 个 job_run、11 个 workflow_run**；原 1,000 普通任务、10 个四节点工作流及五类精度批次均保持不变。
+
+payload 按固定种子生成合法 JSON，按完整编码后的字节数控制大小：90% 约 1KB、9% 约 32KB、1% 约 250KB，大文档使用低压缩率内容而非重复字符。报告实际大小和压缩特征；这组比例只是首版基准，不代表用户业务。
+
+| 场景 | 执行方式 | 核查重点 |
+|---|---|---|
+| 低负载精度 | 有空闲执行槽位时逐类投递；立即、TriggerTx、延迟、cron、重试各至少 100 个启动样本 | DB 时钟下不提前执行、启动延迟分布；TriggerTx 精度样本显式指定未来 At 并在到期前提交，长事务持有时间另计 |
+| 混合批次 | 相同数据分别交给 1 / 3 / 6 个进程，每进程 Concurrency = 16 | 每项提交收敛到预期状态；每进程执行槽位上限；短任务尾延迟与长任务竞争 |
+| 注册差异 | 3 个进程有重叠及不重叠的执行器集合；先留下一个无人注册的类型，再启动支持它的进程 | 不误执行未注册类型；Stats 报告该积压；加入可执行者后排空，不要求各进程领取均匀 |
+| 负载中故障 | 3 个进程持续投递，分别执行优雅退出并补新进程、杀死持租进程、暂停持租进程到接管后恢复、终止本案例的 LISTEN 后端 | 不丢已确认提交；允许租约语义内的重复执行；旧 token 不能结算；监听中断可退化为轮询再恢复 |
+| 持续投递与稳态 | 同配比定速投递、逐档加压，再以已验证的稳定速率运行 30 分钟 | 实际提交速率、积压斜率、排空耗时、心跳 / 连接 / 锁等待及资源趋势 |
+
+故障由“执行器已进入”“目标 token 已落库”“新持有者已接管”等事件驱动；暂停必须在有界清理中恢复，kill / 后端终止只针对本案例创建的进程或连接。故障后须先排空并完成对账，再开始下一种故障，避免把多种原因混成一个结果。首版不包含 PG 主从切换、磁盘故障或公网服务故障；这些不属于当前库的持久性保证。
+
+### 11.3 证据与计时口径
+
+测试保存两类证据：父进程的提交清单，以及独立于 worker 生命周期的审计 / 模拟业务结果。审计可使用测试 schema 内的小表，业务幂等键用唯一约束兜底；不得为审计改写 `job_run` 或新增生产 attempts 表。进程被 kill 后，这些证据仍须可读。
+
+1. **提交清单。** 保存案例、输入摘要、预期结果、返回 id 与错误、提交耗时；显式 At 与预期 cron 拍次从投递端独立记录，并检查实际 run_at / scheduled_at 一致，不能只用待验证的数据库字段自证准点。普通任务和工作流分别对账。`TriggerTx` 只有调用方提交确认后才算已确认提交；回滚不应产生可见 run。另设长事务案例，验证提交前不执行、提交后最终可执行；其 `run_at` 到入口的等待包含事务持有时间，不套用 300ms 精度断言。故障期间调用结果不确定的提交单独列出，用测试业务标识核对，不能当作从未提交或直接归入丢任务。
+2. **逐次执行。** 每次进入执行器生成独立 invocation 标识，记录 run id、Request.Attempt、instance、关联租约、输入摘要、进入 / 返回和业务结果；入口读出本次 `run_at` 与 DB 时钟。不能只读最终行推断前几次执行，`attempt` 在 released 时不增加、Resume 时归零，也不能单独充当执行记录主键。无法与同次租约对应的采样保留为未知，不用后来那次的 `run_at` 补算。
+3. **幂等副作用。** 用 `Request.IdempotencyKey` 写一份可核对的模拟业务结果，唯一键判重；包含“副作用已提交但执行器尚未返回时被 kill”的案例。重试可再次进入执行器，但同一业务键的效果不能重复；该保证来自测试业务的幂等实现，不宣称 Skein exactly-once。被取消或失败的任务可能已有副作用，不能一律要求其副作用数为零。
+4. **证据完整性。** 正常返回的调用必须有可归属记录，崩溃留下的未闭合调用由故障时间线及最终状态解释。审计失败使案例失败；不能把观测错误吞掉后输出“通过”。审计使用独立、有界的小连接池，不持有连接模拟业务耗时；报告其 SQL 数量 / 开销，所得性能是带审计的端到端数据，不冒充无观测开销的调度器极限。
+
+| 指标 | 定义 | 限制 |
+|---|---|---|
+| 提交耗时 | 同一进程单调时钟上的 API 调用耗时 | TriggerTx 另记 Commit 调用耗时，不把 TriggerTx 返回当成已提交 |
+| 到期后启动延迟 | 普通任务为执行器入口的 `clock_timestamp()` − 本次租约对应的 `run_at`；cron 另以 `scheduled_at` 衡量整段启动延迟 | 两项来自 DB 时钟；cron 不能仅用扫描后创建的 `run_at` 掩盖扫描晚点。负载中包含排队，不等同纯调度开销；重领单列，不拿旧 `run_at` 评价接管精度 |
+| 执行耗时 | 同一 invocation 内单调时钟的业务开始到返回前耗时 | 超时 / kill 的未完成调用单列，不用下一次执行或最终 `finished_at` 补齐 |
+| 结算确认延迟（观测上界） | 执行器返回前的 DB 审计采样，到观察者首次读到可归属结算结果的 DB 采样 | 包含审计、观察轮询及查询耗时，不是精确 commit 耗时；`finished_at` 是事务时间，也不能直接当作提交时刻。无法区分结算与重领的样本记缺测并报告数量 |
+
+按场景、任务类型、payload 档位分别输出样本数及 p50 / p95 / p99 / max；故障与无故障窗口分开。整体平均值不能掩盖短任务尾延迟；不足样本、未返回、缺测和提交端限速都必须出现在报告里。
+
+### 11.4 通过条件与容量边界
+
+以下正确性条件在低负载和超载下都成立；超载只允许排队变长，不允许静默丢失、错误结算或突破配置的执行槽位上限。
+
+| 检查 | 必过条件 |
+|---|---|
+| 对账与收敛 | 所有已确认提交均能按返回 id / 测试标识核对；停止投递并解除故障后，在案例排空期限内达到预期终态，不能只看 completed 总数或把未知提交丢弃 |
+| 任务与工作流语义 | 无故障任务的输出、失败种类和尝试次数符合清单；取消不变成成功；后继不先于必要前驱成功而执行；Resume 不重跑已成功节点；固定计划拍次不重复创建 |
+| 去重与副作用 | 在途同键互斥；赢家在 INSERT / lookup 之间完成时，允许新建，三轮耗尽允许 `(0, ErrDuplicate)` 并按新契约处理；副作用按业务键唯一，不把所有故障场景都断言为“只执行一次” |
+| 租约与并发 | 单进程存活执行器数 ≤ Concurrency；已失租但未返回的调用仍占槽位，也计入存活数，有效持租数另报。死进程的未闭合记录不能继续算存活槽位。重领遵循数据库租约到期，旧 token 的心跳 / 结算不能生效；暂停恢复的旧执行器不能覆盖新结果 |
+| 无故障窗口 | 不允许未计划的终态失败、死锁或陈旧租约写入；心跳失败 / lease lost / reclaim 必须记录并定位，不能仅因“压力大”就忽略，未解释的非预期恢复使该档不通过 |
+
+低负载精度沿用 M6 的 **0 ≤ 启动延迟 ≤ 300ms**，只在测试数据库可用、执行类型有空闲槽位且没有待执行积压的独立窗口判定；每次运行都报告分布和超限样本。300ms 是该验收环境的上限，不是生产 SLA，也不用于判断混合批次或超载场景。高负载机器上的超限记录为该次精度验收失败，保留环境信息后独立复跑；不能在实现中偷偷放宽阈值。
+
+接管另计：无额外排队且有健康可执行者时，从死亡 / 暂停后数据库保存的 `lease_expires_at` 到新执行器入口，允许 **1.2 × PollInterval + 2s** 的检测与查询预算；不得早于该到期时刻。故障发生到租约到期的等待单独记录。槽位不足时报告排队，但必须在解除负载后的排空期限内收敛，不能据此宣称满足上述接管预算。
+
+容量测量使用以下固定步骤，不预设所有机器都能达到的 tasks/s：
+
+1. 同配比、同进程数、同连接预算先跑有界批次，取排空吞吐 C 作为定档参考；C 不是已证明的稳态容量。普通触发与工作流触发的速率按逻辑提交计，另报节点行吞吐和实际 invocation 吞吐。
+2. 每档预热 30s、测量 120s，以 0.5C / 0.8C / 1.2C 固定速率投递，每档结束先排空。发生器按独立时间表发起请求，不等待任务完成再发下一批；提交并发有界，发不出的请求记发生器滞后 / 未发数量，不能悄悄降低目标速率。
+3. 当目标速率实际达到、正确性检查通过、后 60s 的未终态积压不呈持续增长且停止后按预算排空时，才将该档记为已验证的稳定速率；积压增长的档只报告超载表现。短窗口结论还需 30 分钟稳态确认，不宣称绝对容量上限或实例数线性扩容。
+4. 稳态采用已通过的最高档；若没有稳定档则先判容量测试失败，不启动长跑。每秒采样积压、每类型最老等待、连接池等待 / 占用、心跳 / 重领 / 锁等待及进程内存；最大未终态预算初版为 20,000 个 job_run，触顶就停止投递并排空，报告“触顶中止”，不算稳态通过。保留自然 autovacuum 行为，不在测量中插入手工 VACUUM；30 分钟内未发生 autovacuum 就明确标注未覆盖该周期。
+
+初版负载配置固定并写入报告：PollInterval = 5s、HeartbeatInterval = 1s、LeaseTTL = 10s、CancelTimeout = 5s；smoke 的 ShutdownGrace = 5s、BackoffBase = 100ms、BackoffMax = 200ms、Jitter = 0.2，普通任务 timeout = 1min，超时案例 timeout = 1s；低负载计时与混合长任务不复用 `fastConfig` 的 400ms 租约。每 worker 执行池 MaxConns = 8、审计池 MaxConns = 2，提交 / 观察池预算另列，并计入 LISTEN 所占连接；开跑前核对总连接预算。连接配置属于宿主测试池，不新增 Engine Config 字段。任何配置变化都生成新一轮结果，不能混合不同参数的分位数。
+
+### 11.5 实施顺序与交付
+
+先实现 smoke 的提交清单、逐次审计和对账，再补完整批次 / 进程数对照，然后增加故障及持续投递 / 稳态。每步先用能明确失败的小案例验证核查器，例如故意重复一次业务效果或制造错误输出；核查器没有被验证前，不用“全部通过”作为结论。
+
+入口为 `TestScenarioAcceptance`。**smoke 已可运行，full / soak 以下仍是计划接口，当前调用会明确失败**：
+
+```sh
+# 3 进程，1,000 次普通任务 + 10 个工作流，并覆盖低负载精度
+mkdir -p /tmp/skein-m7-smoke
+SKEIN_TEST_REQUIRE_DB=1 SKEIN_SCENARIO=1 SKEIN_SCENARIO_PROFILE=smoke go test -count=1 -parallel=1 -run '^TestScenarioAcceptance$' -timeout 15m -artifacts -outputdir=/tmp/skein-m7-smoke
+
+# 待实现：1 / 3 / 6 进程完整批次、3 进程故障案例及定速分档
+SKEIN_TEST_REQUIRE_DB=1 SKEIN_SCENARIO=1 SKEIN_SCENARIO_PROFILE=full go test -count=1 -parallel=1 -run '^TestScenarioAcceptance$' -timeout 45m -artifacts -outputdir=/tmp/skein-m7-full
+
+# 待实现：3 进程，重新定档后运行 30 分钟稳态；总预算包含预热和排空
+SKEIN_TEST_REQUIRE_DB=1 SKEIN_SCENARIO=1 SKEIN_SCENARIO_PROFILE=soak go test -count=1 -parallel=1 -run '^TestScenarioAcceptance$' -timeout 60m -artifacts -outputdir=/tmp/skein-m7-soak
+```
+
+- `SKEIN_SCENARIO` 未设置时跳过；设置后使用现有 `SKEIN_TEST_DSN`，未知 profile 或不可达 DB 必须报错。M7 案例不调用 `t.Parallel()`，也不与性能基线或普通全集同时测量，减少争抢机器导致的不可解释延迟；这不关闭 worker 内部或跨进程并发。
+- 每个等待、故障控制、投递和排空阶段都有显式 deadline，所有阶段共享 profile 总预算。单次排空最多 10 分钟，实际期限取阶段上限与总剩余时间中的较小者，不能把每段 10 分钟无条件累加。根据 `t.Deadline()` 至少提前 60s 停止负载，留给有界的 worker 停止、制品保存和 schema 清理；smoke 将 worker 并发停止、制品与宿主 Engine 收尾放在一个 45s 预算内，随后 schema 清理另限 5s。总预算不足时报告当前阶段及未执行项并失败，不让最外层 `go test -timeout` 强杀后才收尾。sample / 事件流写入制品，不无限堆在父进程内存里；清理失败也必须记录。
+- 制品放在 `t.ArtifactDir()`：运行清单、逐次事件和 Markdown 报告。显式运行必须加 Go 原生 `-artifacts -outputdir <目录>`，否则 ArtifactDir 会在测试结束后删除，不能保留证据；可用测试专用 `SKEIN_SCENARIO_OUT` 另外指定报告输出路径。报告包含 commit、种子、PG / Go / OS 版本、进程与连接预算、所有时长参数、目标 / 实际提交速率、预期 / 实际状态、缺测和失败证据，以及机器负载。不同 PG 版本缺少的统计字段标注 N/A，不跳过正确性用例；`active_time` 不是 CPU，混合负载也不套用 M5 受控场景的心跳 HOT 折算公式。
+- 首版在独立测试环境验证 PG 13 与 18；性能数字按版本、机器分别保存。普通 CI 仍执行现有检查，M7 显式运行，不把 30 分钟长跑塞进每次提交。实现后 README 增加运行入口，代表性结果与边界写入 `docs/scenarios.md`，不修改 M5 历史基线。只有 smoke、full 与稳态的必过条件及核查器负例都取得证据，才将 M7 标记为完成。
+
+---
+
+## 12. M8：两节点外部任务与纯 Snooze
+
+状态：**已实现，PG 13 / 18 验收通过**（2026-09-08）。§6 / §8 已同步；新增验收、lint、完整数据库回归与三轮 race 均通过，记录见 §12.5。只复用现有队列和工作流，不修改 §3 DDL、§7.3 锁序、output 的成功结果含义或 Resume 的重置规则。
+
+### 12.1 两节点与持久化
+
+视频生成任务用宿主声明的两个普通 job 组成工作流；submit / poll 是业务角色，不是新的 Executor 接口或内置执行器：
+
+```text
+submit：提交外部任务 → succeeded，output = {task_id, deadline}
+    ↓ Request.Deps[submit 的 job_name]
+poll：查询一次 → 未完成则 Snooze；完成则 succeeded，output = 最终视频结果
+```
+
+- submit 成功结算后，task id 与固定 deadline 已在 PG；poll 每次领取都通过现有 `Request.Deps` 重新读取，进程重启不丢失。task id 是“提交动作”的成功结果，不是运行中 checkpoint。
+- poll 在多次 Snooze 期间仍未成功，自己的 output 不写入中间状态，后继仍 blocked，父工作流仍 running。成功后才保存最终结果并推进后继。
+- Resume 保持 §6.7：成功的 submit 不动；失败 / 取消的 poll 重置后继续读取同一个 task id 和 deadline。查询节点自身的 output 仍按原规则清空。要重新生成视频应重新 Trigger，不能把 Resume 当成重新提交。
+- 纯 Snooze 同样适用于普通 job_run；两节点是本视频场景的建模选择，不是使用 Snooze 的强制条件。
+
+### 12.2 纯 Snooze 接口
+
+新增公共函数，保留现有 Executor 返回类型与 Request 字段：
+
+```go
+func Snooze(delay time.Duration) error
+```
+
+Executor 通过 `return nil, Snooze(delay)` 表示“本次检查正常结束，稍后再调用我”，不是执行失败。规则：
+
+1. delay 必须 > 0；非正值返回 Permanent 参数错误，不新增公共 sentinel。转为数据库 interval 时按微秒精度向上取整，不能因截断或溢出变为零 / 负延迟。使用现有 pgx 原生 interval 参数传递截断后的微秒值，余数非零时在 SQL 补 1µs：不拼接总微秒数文本（PG 13 存在输入字段范围限制），也不在 Go 中构造可能溢出的向上取整 Duration。支持 24h，但 24h 不是框架的单次延迟上限。
+2. 返回内部类型的控制错误，Worker 用 `errors.AsType` 识别，支持普通 `%w` 包装。失租、取消、停机与超时仍按现有规则优先处理；被显式 `Permanent` 包装的错误不按 Snooze 重排。
+3. Snooze 不保存 Executor 返回的 output，即便非空也不写入；只有 succeeded 才走现有输出校验与写入。无需为 Request 增加 Output / Checkpoint，也不提供更新运行中 output 的接口。
+4. 不增加或清零 attempt，不追加 errors，不走指数退避、不增加 released 告警。真实业务失败、超时、panic 与租约过期仍按原规则计数；`Request.Attempt` 是失败 / 中断计数 +1，不是查询次数或 Executor 总调用次数。
+5. delay 由 Executor 每轮决定；框架不额外加抖动，不新增 Snooze 周期、次数上限或总期限的 Config。两节点的每次外部请求仍受各自 JobSpec.Timeout 限制。
+
+### 12.3 结算、唤醒与恢复
+
+新增内部结算 outcome `Snoozed`，不新增 RunState。仍由 `Store.Settle` 打开事务：节点先锁父 workflow_run，再以 `id + lease_token + state = running` 校验持有者；0 行依旧是 ErrLeaseLost，不能重试陈旧写入。未命中取消时，在同一条 UPDATE 中完成：
+
+| 字段 | Snooze 的写入 |
+|---|---|
+| state / run_at | pending / `now() + delay`，now 为数据库事务时间 |
+| lease_token / lease_owner / lease_expires_at | 全部 NULL |
+| finished_at | NULL |
+| attempt / errors | 不变 |
+| params / output | 不变 |
+
+- 与 Retry / Released 一样，UPDATE 内先应用 `cancel_requested OR wf_cancelling`：取消命中则 cancelled 并设置 finished_at，不能因 Snooze 回到 pending。节点仅在实际落库状态为终态时 propagate；取消与 fail-fast 继续使用原锁序与 SKIP LOCKED 路径。
+- 结算后沿用 worker 的退出流程释放槽位。等待期间这个 run 没有 Executor 或租约，不为它续心跳；数据库仍保留同一行、同一 RunId 与去重占位。再次领取才生成新 token。
+- 原有 pending 唤醒触发器、槽位释放唤醒、NextPendingAt 与轮询兜底全部复用；不加 timer 表、扫描循环或每个任务一个常驻 goroutine。run_at 是可领取时刻，不保证到点必有空闲槽位；延迟起点是结算事务时间，不是提交完成后的本地时刻。
+- Snooze 已提交后，重启只需正常领取到期 pending。结算遇到数据库错误则保持 §6.5 的故障路径：留下 running 等租约过期重领，后续可能增加 interrupted 与 attempt；不能把“成功 Snooze 不计失败”扩大为“故障也不计失败”。
+- `exec_duration` 复用现有指标，实际回 pending 的 Snooze 标为 `outcome=snoozed`，取消命中则为 cancelled；不误标 failed / released，不增加独立计数器或 errors 条目。
+
+### 12.4 24h 与外部副作用边界
+
+1. **24h 是业务等待期限，不是单次执行 timeout。** submit / poll 每次只做一个有界外部请求；不把等待写成占住 worker 的 24h 循环。固定 deadline 由业务确定并随 submit 的成功 output 保存，可来自已持久化的业务输入或外部任务的稳定创建时间；提交重试找回同一任务时也不能重新取“本轮时间 +24h”。
+2. poll 每轮按同一个可信时间基准检查 deadline，将本次请求与下次 Snooze 限制在剩余预算内；超期按 Permanent 业务失败处理。Resume 不延长 deadline。Skein 不新增工作流级 deadline 或超时扫描；所有 Worker 或 PG 不可用时，无法保证在第 24h 准点终结，只能恢复执行后检查超期。
+3. 无 deadline 的 Executor 可以一直 Snooze。§5 不再以 timeout 与 max_attempts 推导工作流总时长有界：它们约束单次执行和真实失败次数，不约束正常 Snooze 的总等待。
+4. 外部提交成功但 submit 尚未成功落库时仍可能崩溃。业务必须用 `Request.IdempotencyKey` 配合供应商幂等提交或按稳定业务键找回任务；两节点不提供 exactly-once，也不靠进程内缓存 task id。
+5. 取消保持现有框架语义，只停止本地执行 / 后续查询，不自动终止供应商任务。外部 Abort 属于宿主业务，本里程碑不新增 Submit / Poll / Abort 协议。
+
+### 12.5 验收与交付
+
+复用真实 PG、现有子进程和确定性交错夹具；不访问真实视频供应商、不实际等待 24h。下表各项用聚焦测试或子测试验收，普通测试随现有 CI 的 PG 13 / 18 矩阵执行：
+
+| 验收 | 必过条件 | 覆盖测试 |
+|---|---|---|
+| 纯 Snooze 语义 | MaxAttempts=1 时仍能多次 Snooze 后成功；RunId、attempt、errors 与输入快照保持不变，中途 output 为空；无输出暂存。覆盖非法 / 极小 / 大时长、包装错误、Permanent 与 ctx 原因的优先级，以及 snoozed / cancelled 指标标签 | `TestSnoozePreservesRun`、`TestSnoozeInvalidAndPermanent`、`TestSnoozeContextWins`、`TestExecDurationLabelFollowsSettledState` |
+| 到点与槽位 | slowPoll 下，以 DB 入口时刻减 run_at 验证不提前且延迟 ≤ 300ms；Concurrency=1 时，snoozing run 不阻塞另一个立即任务；验证 24h 延迟准确落库，再用夹具推进 run_at 验证可再次领取，不用真实 sleep 等一天 | `TestSnoozeDurationPersistence`、`TestSnoozeReleasesSlotAndWakesOnTime` |
+| 重启与 fence | Snooze 已提交后结束原进程，由另一个进程继续同一 run；旧 token 的 Snooze 被拒绝；结算失败与过期重领仍保留既有 attempt / interrupted 规则，不把丢失的结算当成成功 | `TestSnoozeSurvivesProcessExit`、`TestStaleTokenCannotWrite`、`TestSnoozeFailedSettlementReclaimed` |
+| 取消与并发 | pending 的普通 run / 工作流可取消；正在 Snooze 结算时取消命中不能重新排队；将 Snoozed 加入已有取消重排与工作流锁序回归，不改变候选冲突时跳过并由领取收敛的规则 | `TestSnoozePendingCanBeCancelled`、`TestCancelSeesRunReleasedMeanwhile`、`TestSettleCancelHit`、`TestRaceSnoozeVsWorkflowCancellation` |
+| 两节点与期限 | submit 成功落库后，poll 多次 Snooze 不推进后继；重试 / 重启 / Resume 读取同一 task id 与原 deadline，submit 不重跑；只有 poll 成功才输出最终结果；用已过期 deadline 夹具验证超期失败，提交崩溃窗口由幂等模拟供应商验证 | `TestSnoozeWorkflowFixedDeadline`、`TestSnoozeWorkflowSubmitCrash` |
+
+实现集中在 `errors.go`、`settle.go`、`internal/store/store.go` 与 `internal/store/queries/job_run.sql`，随后 `make sqlc`；复用现有 worker / claim / heartbeat 路径，不修改领取返回列、迁移或 schemaVersion。测试补入现有行为套件或必要的聚焦测试，README 与可运行示例展示两节点用法，不加入供应商依赖。
+
+§4 / §5 的 attempt 与总期限说明、§6.5 的 Snoozed 分支、§6.11 的唤醒来源说明、§8 的函数 / Attempt 契约与指标标签，以及 §9 完成状态已同步。测试分布于 `snooze_test.go`、`reliability_test.go` 和 `race_test.go`；`example_test.go` 的 `ExampleSnooze` 提供可编译宿主示例。
+
+2026-09-08 本地验收（Go 1.27.0，darwin/arm64）：
+
+| PostgreSQL | `make test-ci` | `SKEIN_TEST_REQUIRE_DB=1 make race` |
+|---|---|---|
+| 13.23（临时 Docker，已清理） | 通过，25.757s | 通过，`-race -count=3`，83.368s |
+| 18.4（Homebrew） | 通过，18.622s | 通过，`-race -count=3`，61.674s |
+
+`make lint`（sqlc diff、gofmt、go vet）与 `git diff --check` 通过。PG 13 实测曾暴露大微秒数字面量越界，改为原生 interval 参数后，包含 24h 和最大 Duration 的精度测试均通过；未新增迁移或依赖。本次未运行 M7 显式负载或重测 M5 性能基线。

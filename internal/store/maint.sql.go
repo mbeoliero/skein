@@ -30,7 +30,7 @@ type DeleteOldJobRunsParams struct {
 // the statement snapshot, and a row locked by a concurrent transaction is re-checked on its
 // new version only against the outer WHERE (EvalPlanQual). With id IN (...) alone, a
 // workflow_run that Resume just moved back to running would be deleted with all its nodes.
-// plain runs only: nodes go with their workflow_run (FK cascade), never on their own
+// §6.10 plain runs only: nodes go with their workflow_run (FK cascade), never on their own
 func (q *Queries) DeleteOldJobRuns(ctx context.Context, db DBTX, arg DeleteOldJobRunsParams) (int64, error) {
 	result, err := db.Exec(ctx, DeleteOldJobRuns, arg.States, arg.Age, arg.Lim)
 	if err != nil {

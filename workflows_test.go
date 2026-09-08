@@ -320,7 +320,7 @@ func TestCancellationSkipsClaimInProgress(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer tx.Rollback(context.Background())
-			execSQL(t, tx, "SET LOCAL search_path TO "+schema)
+			execSql(t, tx, "SET LOCAL search_path TO "+schema)
 			rows, err := store.New().ClaimPending(t.Context(), tx, store.ClaimPendingParams{
 				ExecutorTypes: []string{"y"}, Lim: 1, Owner: "claim", LeaseTtl: time.Minute,
 			})

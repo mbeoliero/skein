@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -23,12 +24,19 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func testDSN() string {
+func testDsn() string {
 	return cmp.Or(os.Getenv("SKEIN_TEST_DSN"), "postgres:///postgres?host=/tmp")
 }
 
 func helperMain() {
-	pool, err := pgxpool.New(context.Background(), testDSN())
+	if os.Getenv("SKEIN_HELPER_MODE") == "scenario" {
+		if err := scenarioWorkerMain(); err != nil {
+			fmt.Fprintln(os.Stderr, "helper scenario:", err)
+			os.Exit(2)
+		}
+		return
+	}
+	pool, err := pgxpool.New(context.Background(), testDsn())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "helper pool:", err)
 		os.Exit(2)
@@ -43,6 +51,17 @@ func helperMain() {
 		os.Exit(2)
 	}
 	e.Register("crash", func(ctx context.Context, req *Request) (RawJSON, error) { select {} })
+	if os.Getenv("SKEIN_HELPER_MODE") == "snooze" {
+		e.Register("snooze", func(ctx context.Context, req *Request) (RawJSON, error) {
+			return nil, Snooze(24 * time.Hour)
+		})
+		e.Register("submit-crash", func(ctx context.Context, req *Request) (RawJSON, error) {
+			if _, err := fakeVideoSubmit(ctx, pool, cfg.Schema, req.IdempotencyKey); err != nil {
+				return nil, err
+			}
+			select {} // parent kills us after the provider side effect, before settle
+		})
+	}
 	registerBenchExecutors(e)
 	if err := e.Start(context.Background()); err != nil {
 		fmt.Fprintln(os.Stderr, "helper start:", err)
@@ -57,8 +76,13 @@ func helperMain() {
 // at cleanup. A helper that exits before ready fails the test.
 func startHelper(t *testing.T, schema string, env ...string) *exec.Cmd {
 	t.Helper()
+	return startHelperContext(t, t.Context(), schema, env...)
+}
+
+func startHelperContext(t *testing.T, ctx context.Context, schema string, env ...string) *exec.Cmd {
+	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^$")
-	cmd.Env = append(os.Environ(), "SKEIN_HELPER=1", "SKEIN_HELPER_SCHEMA="+schema, "SKEIN_TEST_DSN="+testDSN())
+	cmd.Env = append(os.Environ(), "SKEIN_HELPER=1", "SKEIN_HELPER_SCHEMA="+schema, "SKEIN_TEST_DSN="+testDsn())
 	cmd.Env = append(cmd.Env, env...)
 	cmd.Stderr = os.Stderr
 	out, err := cmd.StdoutPipe()
@@ -69,11 +93,28 @@ func startHelper(t *testing.T, schema string, env ...string) *exec.Cmd {
 		t.Fatalf("start helper: %v", err)
 	}
 	t.Cleanup(func() {
+		_ = out.Close()
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 	})
-	if line, err := bufio.NewReader(out).ReadString('\n'); err != nil || line != "ready\n" {
-		t.Fatalf("helper did not become ready: %q %v", line, err)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	type readyResult struct {
+		line string
+		err  error
+	}
+	ready := make(chan readyResult, 1)
+	go func() {
+		line, err := bufio.NewReader(out).ReadString('\n')
+		ready <- readyResult{line: line, err: err}
+	}()
+	select {
+	case result := <-ready:
+		if result.err != nil || result.line != "ready\n" {
+			t.Fatalf("helper did not become ready: %q %v", result.line, result.err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("helper did not become ready: %v", ctx.Err())
 	}
 	return cmd
 }

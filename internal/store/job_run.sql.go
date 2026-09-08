@@ -440,7 +440,7 @@ type SettleFailedParams struct {
 	Token        uuid.UUID
 }
 
-// permanent failure or no attempts left
+// §6.5 permanent failure or no attempts left
 func (q *Queries) SettleFailed(ctx context.Context, db DBTX, arg SettleFailedParams) (string, error) {
 	row := db.QueryRow(ctx, SettleFailed,
 		arg.WfCancelling,
@@ -499,7 +499,7 @@ type SettleReleasedRow struct {
 	ReleasedCount int32
 }
 
-// graceful shutdown: back to pending now, attempt unchanged, a released entry for the alert
+// §6.5 / §6.8 graceful shutdown: back to pending now, attempt unchanged, a released entry for the alert
 func (q *Queries) SettleReleased(ctx context.Context, db DBTX, arg SettleReleasedParams) (SettleReleasedRow, error) {
 	row := db.QueryRow(ctx, SettleReleased,
 		arg.WfCancelling,
@@ -530,12 +530,47 @@ type SettleRetryParams struct {
 	Token        uuid.UUID
 }
 
-// retryable failure with attempts left: pending again after backoff
+// §6.5 retryable failure with attempts left: pending again after backoff
 func (q *Queries) SettleRetry(ctx context.Context, db DBTX, arg SettleRetryParams) (string, error) {
 	row := db.QueryRow(ctx, SettleRetry,
 		arg.WfCancelling,
 		arg.Backoff,
 		arg.Err,
+		arg.Id,
+		arg.Token,
+	)
+	var state string
+	err := row.Scan(&state)
+	return state, err
+}
+
+const SettleSnoozed = `-- name: SettleSnoozed :one
+UPDATE job_run
+   SET state       = CASE WHEN cancel_requested OR $1::boolean THEN 'cancelled' ELSE 'pending' END,
+       finished_at = CASE WHEN cancel_requested OR $1::boolean THEN now() END,
+       run_at = now() + $2::interval
+              + CASE WHEN $3::boolean THEN interval '1 microsecond' ELSE interval '0' END,
+       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
+ WHERE id = $4 AND lease_token = $5::uuid AND state = 'running'
+RETURNING state
+`
+
+type SettleSnoozedParams struct {
+	WfCancelling bool
+	Delay        time.Duration
+	RoundUp      bool
+	Id           int64
+	Token        uuid.UUID
+}
+
+// §6.5 / §12: normal waiting, no attempt/error/output change; cancellation still wins.
+// Native interval input also handles PG 13; add the rounding remainder without Duration overflow.
+// sqlc.arg avoids sqlc 1.31's @ rewrite bug around this interval CASE.
+func (q *Queries) SettleSnoozed(ctx context.Context, db DBTX, arg SettleSnoozedParams) (string, error) {
+	row := db.QueryRow(ctx, SettleSnoozed,
+		arg.WfCancelling,
+		arg.Delay,
+		arg.RoundUp,
 		arg.Id,
 		arg.Token,
 	)

@@ -58,6 +58,7 @@ func (e *Engine) settleResult(log *slog.Logger, c store.Claimed, policy RetryPol
 	st := settlementFor(c, 0)
 	entry := errEntry{Attempt: attempt, At: time.Now().UTC(), Kind: "business"}
 	retryable := true
+	snooze, _ := errors.AsType[*snoozeError](err)
 	switch {
 	case errors.Is(cause, errCancelRequested):
 		st.Outcome = store.Cancelled
@@ -68,12 +69,17 @@ func (e *Engine) settleResult(log *slog.Logger, c store.Claimed, policy RetryPol
 		entry.Message = "output is not valid JSON"
 		retryable = false
 	case err == nil:
-		st.Outcome, st.Output = store.Succeeded, out
+		st.Outcome = store.Succeeded
+		if len(out) > 0 {
+			st.Output = out
+		}
 	case errors.Is(cause, errShuttingDown):
 		st.Outcome = store.Released
 		entry.Kind, entry.Message = "released", "shutdown"
 	case errors.Is(cause, errTimeout):
 		entry.Kind, entry.Message = "timeout", err.Error()
+	case snooze != nil && !isPermanent(err):
+		st.Outcome, st.Delay = store.Snoozed, snooze.delay
 	default:
 		if p, ok := errors.AsType[*panicError](err); ok {
 			entry.Kind, entry.Message = "panic", p.Error()
@@ -85,7 +91,7 @@ func (e *Engine) settleResult(log *slog.Logger, c store.Claimed, policy RetryPol
 	}
 	log = log.With("duration", took)
 	switch st.Outcome {
-	case store.Succeeded, store.Cancelled:
+	case store.Succeeded, store.Cancelled, store.Snoozed:
 	case store.Released:
 		st.Err = encodeErr(entry)
 	default: // a failed attempt: retry with backoff while attempts remain, else terminal
@@ -112,18 +118,19 @@ func (e *Engine) settleResult(log *slog.Logger, c store.Claimed, policy RetryPol
 	}
 }
 
-// outcomeLabel is the exec_duration outcome label, succeeded / failed / cancelled /
-// released, from the state the row actually took: the cancel-hit CASE in settle may
-// have turned a retry or a release into cancelled. pending is a retry (a failed
-// attempt) or a release.
+// The cancel-hit CASE may turn a retry, release or snooze into cancelled.
 func outcomeLabel(o store.Outcome, state string) string {
 	if state != "pending" {
 		return state
 	}
-	if o == store.Released {
+	switch o {
+	case store.Released:
 		return "released"
+	case store.Snoozed:
+		return "snoozed"
+	default:
+		return "failed"
 	}
-	return "failed"
 }
 
 // backoff for the n-th failed attempt: min(max, base × 2^(n−1)) × U[1−j, 1+j).

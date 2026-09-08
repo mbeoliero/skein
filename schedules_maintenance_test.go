@@ -195,13 +195,13 @@ func TestShutdownInterruptsMaintenance(t *testing.T) {
 	declare(t, e, JobSpec{Name: "j", ExecutorType: "x"})
 	id := trigger(t, e, "j", "")
 	jr := qualified(schema, "job_run")
-	execSQL(t, pool, "UPDATE "+jr+" SET state = 'succeeded', finished_at = now() - interval '1 hour' WHERE id = "+itoa(id))
+	execSql(t, pool, "UPDATE "+jr+" SET state = 'succeeded', finished_at = now() - interval '1 hour' WHERE id = "+itoa(id))
 	tx, err := pool.Begin(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(context.Background())
-	execSQL(t, tx, "SELECT id FROM "+jr+" WHERE id = "+itoa(id)+" FOR UPDATE")
+	execSql(t, tx, "SELECT id FROM "+jr+" WHERE id = "+itoa(id)+" FOR UPDATE")
 	waitBlocked(t, pool, "maint-shutdown")
 
 	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
@@ -365,7 +365,7 @@ func TestRetentionKeepsNodesOfLiveWorkflows(t *testing.T) {
 	declareWorkflow(t, e, WorkflowSpec{Name: "w", Nodes: []Node{{Job: "a"}, {Job: "b", Deps: []string{"a"}}}})
 
 	finish := func(id int64, state string, age time.Duration) {
-		execSQL(t, pool, "UPDATE "+qualified(schema, "job_run")+" SET state = '"+state+"', finished_at = now() - interval '"+age.String()+"', lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL WHERE id = "+itoa(id))
+		execSql(t, pool, "UPDATE "+qualified(schema, "job_run")+" SET state = '"+state+"', finished_at = now() - interval '"+age.String()+"', lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL WHERE id = "+itoa(id))
 	}
 	oldOK := trigger(t, e, "j", "")
 	finish(oldOK, "succeeded", 8*24*time.Hour)
@@ -384,7 +384,7 @@ func TestRetentionKeepsNodesOfLiveWorkflows(t *testing.T) {
 	for _, n := range doneRun.Nodes {
 		finish(n.Id, "succeeded", 8*24*time.Hour)
 	}
-	execSQL(t, pool, "UPDATE "+qualified(schema, "workflow_run")+" SET state = 'succeeded', finished_at = now() - interval '8 days' WHERE id = "+itoa(done))
+	execSql(t, pool, "UPDATE "+qualified(schema, "workflow_run")+" SET state = 'succeeded', finished_at = now() - interval '8 days' WHERE id = "+itoa(done))
 
 	maintain(t, e)
 
@@ -423,8 +423,8 @@ func TestRetentionSkipsResumedWorkflow(t *testing.T) {
 	id := triggerWorkflow(t, e, "w", "")
 	run, _ := e.Workflows().GetRun(t.Context(), id)
 	jr, wr := qualified(schema, "job_run"), qualified(schema, "workflow_run")
-	execSQL(t, pool, "UPDATE "+jr+" SET state = 'failed', finished_at = now() - interval '31 days' WHERE id = "+itoa(nodeOf(t, run, "a").Id))
-	execSQL(t, pool, "UPDATE "+wr+" SET state = 'failed', finished_at = now() - interval '31 days' WHERE id = "+itoa(id))
+	execSql(t, pool, "UPDATE "+jr+" SET state = 'failed', finished_at = now() - interval '31 days' WHERE id = "+itoa(nodeOf(t, run, "a").Id))
+	execSql(t, pool, "UPDATE "+wr+" SET state = 'failed', finished_at = now() - interval '31 days' WHERE id = "+itoa(id))
 
 	// Resume's first statement, held while retention runs (§6.7)
 	tx, err := pool.Begin(t.Context())
@@ -432,7 +432,7 @@ func TestRetentionSkipsResumedWorkflow(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(context.Background())
-	execSQL(t, tx, "SELECT id FROM "+wr+" WHERE id = "+itoa(id)+" FOR UPDATE")
+	execSql(t, tx, "SELECT id FROM "+wr+" WHERE id = "+itoa(id)+" FOR UPDATE")
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -442,8 +442,8 @@ func TestRetentionSkipsResumedWorkflow(t *testing.T) {
 	}()
 	waitBlocked(t, pool, schema)
 	// the rest of Resume, then commit: the workflow is running again
-	execSQL(t, tx, "UPDATE "+jr+" SET state = 'pending', attempt = 0, run_at = now(), started_at = NULL, finished_at = NULL, output = NULL WHERE workflow_run_id = "+itoa(id))
-	execSQL(t, tx, "UPDATE "+wr+" SET state = 'running', finished_at = NULL WHERE id = "+itoa(id))
+	execSql(t, tx, "UPDATE "+jr+" SET state = 'pending', attempt = 0, run_at = now(), started_at = NULL, finished_at = NULL, output = NULL WHERE workflow_run_id = "+itoa(id))
+	execSql(t, tx, "UPDATE "+wr+" SET state = 'running', finished_at = NULL WHERE id = "+itoa(id))
 	if err := tx.Commit(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +470,7 @@ func TestScanDisablesScheduleWithoutNextFireTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	// the rule turns bad behind Put's back and the beat is due
-	execSQL(t, pool, "UPDATE "+qualified(schema, "schedule")+" SET cron = '0 0 31 2 *', next_run_at = now() - interval '1 minute' WHERE name = 's'")
+	execSql(t, pool, "UPDATE "+qualified(schema, "schedule")+" SET cron = '0 0 31 2 *', next_run_at = now() - interval '1 minute' WHERE name = 's'")
 	e.scanOnce()
 	row, err := store.Open(pool, schema).GetSchedule(t.Context(), "s")
 	if err != nil || row.Enabled {

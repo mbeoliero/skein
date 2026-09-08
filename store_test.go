@@ -43,6 +43,92 @@ func (c *cancelAfterTx) QueryRow(ctx context.Context, sql string, args ...any) p
 	return row
 }
 
+type queryThenTx struct {
+	pgx.Tx
+	then func(string)
+}
+
+func (tx *queryThenTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return rowThen{Row: tx.Tx.QueryRow(ctx, sql, args...), then: func() { tx.then(sql) }}
+}
+
+func TestDedupRoundsWhenWinnersFinish(t *testing.T) {
+	t.Parallel()
+	for _, kind := range []string{"job", "workflow"} {
+		for _, ends := range []int{1, 3} {
+			t.Run(kind+"/"+itoa(int64(ends)), func(t *testing.T) {
+				t.Parallel()
+				pool, schema := freshSchema(t)
+				e := startEngine(t, pool, submitOnly(schema), nil)
+				declare(t, e, JobSpec{Name: "j", ExecutorType: "x"})
+				create := func() (int64, error) { return e.Jobs().Trigger(t.Context(), "j", nil, DedupKey("k")) }
+				cancel := func(id int64) error { return e.Runs().Cancel(t.Context(), id) }
+				triggerTx := func(tx pgx.Tx) (int64, error) {
+					return e.Jobs().TriggerTx(t.Context(), tx, "j", nil, DedupKey("k"))
+				}
+				if kind == "workflow" {
+					if err := e.Workflows().Declare(t.Context(), WorkflowSpec{Name: "w", Nodes: []Node{{Job: "j"}}}); err != nil {
+						t.Fatal(err)
+					}
+					create = func() (int64, error) { return e.Workflows().Trigger(t.Context(), "w", nil, DedupKey("k")) }
+					cancel = func(id int64) error { return e.Workflows().CancelRun(t.Context(), id) }
+					triggerTx = func(tx pgx.Tx) (int64, error) {
+						return e.Workflows().TriggerTx(t.Context(), tx, "w", nil, DedupKey("k"))
+					}
+				}
+				winner, err := create()
+				if err != nil {
+					t.Fatal(err)
+				}
+				tx, err := pool.Begin(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer rollbackTx(t, tx)
+				inserts, lookups := 0, 0
+				wrapped := &queryThenTx{Tx: tx, then: func(sql string) {
+					switch sql {
+					case store.TriggerJob, store.TriggerWorkflow:
+						inserts++
+						if inserts <= ends {
+							if err := cancel(winner); err != nil {
+								t.Fatal(err)
+							}
+						}
+					case store.FindInflightRun, store.FindInflightWorkflowRun:
+						lookups++
+						if lookups < ends {
+							winner, err = create()
+							if err != nil {
+								t.Fatal(err)
+							}
+						}
+					}
+				}}
+				id, err := triggerTx(wrapped)
+				if inserts != min(ends+1, 3) || lookups != ends {
+					t.Fatalf("inserts %d lookups %d after %d finished winners", inserts, lookups, ends)
+				}
+				if ends == 3 {
+					if id != 0 || !errors.Is(err, ErrDuplicate) {
+						t.Fatalf("exhausted rounds: id %d err %v", id, err)
+					}
+				} else if err != nil || id == 0 || id == winner {
+					t.Fatalf("freed key: id %d err %v, old winner %d", id, err, winner)
+				}
+				if err := tx.Commit(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				if ends == 3 {
+					if id, err := create(); err != nil || id == 0 {
+						t.Fatalf("retry after exhausted rounds: id %d err %v", id, err)
+					}
+				}
+			})
+		}
+	}
+}
+
 // TriggerTx restores the caller's search_path on a ctx of its own: with the caller's
 // ctx cancelled after the duplicate lookup, pgx would not send the restore at all and
 // the caller's transaction would carry on inside the library's schema.
@@ -89,7 +175,7 @@ func TestClaimUsesPartialIndexes(t *testing.T) {
 	e := startEngine(t, pool, fastConfig(schema), nil)
 	declare(t, e, JobSpec{Name: "j", ExecutorType: "x"})
 	path := pgx.Identifier{schema}.Sanitize()
-	execSQL(t, pool, "SET LOCAL search_path = "+path+`;
+	execSql(t, pool, "SET LOCAL search_path = "+path+`;
 		INSERT INTO job_run (job_name, executor_type, params, timeout, retry_policy, state, run_at)
 		SELECT 'j', 'x', '{}', 60, '{"max_attempts":3}', 'pending', now() - (g || ' seconds')::interval FROM generate_series(1, 2000) g;
 		INSERT INTO job_run (job_name, executor_type, params, timeout, retry_policy, state, run_at,
@@ -103,7 +189,7 @@ func TestClaimUsesPartialIndexes(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer tx.Rollback(context.Background())
-		execSQL(t, tx, "SET LOCAL search_path = "+path+"; SET LOCAL enable_seqscan = off")
+		execSql(t, tx, "SET LOCAL search_path = "+path+"; SET LOCAL enable_seqscan = off")
 		rows, err := tx.Query(t.Context(), "EXPLAIN "+sql, "me", time.Minute, []string{"x"}, int32(16))
 		if err != nil {
 			t.Fatal(err)
@@ -160,7 +246,16 @@ func TestHeartbeatIsHot(t *testing.T) {
 	}
 }
 
-func execSQL(t *testing.T, db interface {
+func rollbackTx(t *testing.T, tx pgx.Tx) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
+	defer cancel()
+	if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+		t.Errorf("rollback: %v", err)
+	}
+}
+
+func execSql(t *testing.T, db interface {
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 }, sql string) {
 	t.Helper()

@@ -14,7 +14,7 @@ SELECT pg_advisory_unlock(hashtext('skein:maint'));
 -- workflow_run that Resume just moved back to running would be deleted with all its nodes.
 
 -- name: DeleteOldJobRuns :execrows
--- plain runs only: nodes go with their workflow_run (FK cascade), never on their own
+-- §6.10 plain runs only: nodes go with their workflow_run (FK cascade), never on their own
 DELETE FROM job_run r WHERE r.id IN (
     SELECT id FROM job_run
      WHERE state = ANY(@states::text[]) AND finished_at < now() - @age::interval AND workflow_run_id IS NULL

@@ -43,5 +43,5 @@ UPDATE schedule SET next_run_at = @next_run_at WHERE name = @name;
 UPDATE schedule SET enabled = false, updated_at = now() WHERE name = @name;
 
 -- name: DbNow :one
--- Schedules.Put computes next_run_at from the database clock
+-- §6.2 Schedules.Put computes next_run_at from the database clock
 SELECT now()::timestamptz AS now;

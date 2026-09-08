@@ -6,6 +6,8 @@
 
 机器：Apple Silicon 笔记本，PostgreSQL 18.4（Homebrew，本机 socket），Go 1.27，测试与数据库同机。
 
+兼容性：基线入口也支持 PG 13；该版本没有 `pg_stat_database.active_time`，报告标记 N/A，不填零，其余测量照常。以下历史 PG 18 数据保持原样。
+
 计数口径：心跳次数 = `job_run` 总更新 − 2 × 启动次数（每次启动一条 claim、一条 settle，两者都改索引列，永不 HOT；启动次数 = Σ(attempt + 1)）；HOT 比例 = HOT 更新 / 心跳次数。`pg_stat_user_tables` 的快照在等过空闲后端的 10 s 刷新超时、再连续 3 s 不变之后才取。同日 10:27 / 10:28 的两次运行用执行时长估算心跳数、且快照取早了，HOT 一行不自洽（9696 − 9280 = 416 条非 claim/settle 更新却报 663 HOT），已由下面同参数的重跑替代。
 
 ## Baseline 2026-09-07 15:53

@@ -1,6 +1,10 @@
 package skein
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"time"
+)
 
 var (
 	ErrNotFound     = errors.New("skein: not found")
@@ -35,3 +39,16 @@ func isPermanent(err error) bool {
 	_, ok := errors.AsType[*permanentError](err)
 	return ok
 }
+
+// Snooze requeues the same run after delay without consuming an attempt or saving
+// output. Delay must be positive; invalid delays are permanent failures.
+func Snooze(delay time.Duration) error {
+	if delay <= 0 {
+		return Permanent(fmt.Errorf("skein: snooze delay must be > 0, got %s", delay))
+	}
+	return &snoozeError{delay: delay}
+}
+
+type snoozeError struct{ delay time.Duration }
+
+func (e *snoozeError) Error() string { return "skein: snooze for " + e.delay.String() }
