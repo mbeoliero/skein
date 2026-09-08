@@ -2,7 +2,7 @@
 
 日期：2026-09-06。状态：**表结构已定稿**（§2 ~ §5），流程、故障恢复、接口、实施步骤按定稿表编写（§6 ~ §10）。M1 ~ M6 已实现；M7 真实负载与多实例验收见 §11，smoke 已实现，full / soak 待实现，验证记录见 docs/scenarios.md；M8 两节点外部任务与纯 Snooze 已实现并通过 PG 13 / 18 验收（§12）；§6 / §8 已同步。
 
-2026-09-06 评审修订：节点取消改由父行状态表达，不再对 running 节点写 `cancel_requested`（§6.5 / §6.6 / §7.3）；结算的非终态出口统一先看取消（§6.5）；Shutdown 不再拒绝 Trigger（§6.8）；定时触发用 DB 时钟（§6.2）；领取分支二重领时记 `interrupted`（§6.3）；`schedule` 的 FK 改 RESTRICT（§3）；列表索引与游标改用 `id`（§3 / §8）。2026-09-07：角色开关改名 `DisableWorker` / `DisableScheduler`，零值即启用（§1 / §8）；`ScheduleSpec.Enabled` 同理改为 `Disabled`（§8）；清理改用会话级 advisory lock，每步独立短事务（§6.10）。2026-09-07 评审修订二：清理的 DELETE 外层重判终态条件（§6.10 / §7.3）；fail-fast 先取消再读节点（§6.5）；普通实例取消改为一条 UPDATE（§6.6）；无下一触发点的计划被拒绝或禁用（§6.2）；本地心跳期限只由心跳刷新、`active` 按 lease_token 记、领取后检查有界并在进入 Executor 前看停机（§6.4 / §6.8）；配置取值范围与 `retry_policy` 范围校验、`MaxPayload` 语义、`Metrics` 并发契约、`exec_duration` 标签取落库状态（§8）。2026-09-07 评审修订三：停止领取与 Executor 登记共用 `inflight` 互斥锁，lease-loss 的移除与结果丢弃标记原子发布（§6.4 / §6.8）；未启动节点取消先以 `SKIP LOCKED` 锁定候选，被跳过的 pending 由领取后检查收敛，锁序证明以不等待候选行为依据（§6.3 / §6.5 / §6.6 / §7.3，同步 §2 / §5 概述）。2026-09-07 交付补充：README 使用入口、MIT 许可证（署名 Jaken）、Go 1.27 与 PG 13/18 的 GitHub Actions 矩阵；CI 验证数据库连接并禁止测试缓存（§8.2）。2026-09-07 源码组织补充：保持包边界与执行职责，README 增加阅读导航，里程碑测试文件改用行为名称（§8.3）。2026-09-07 评审修订四：search_path 显式列出 pg_temp（§8）；cron 拒绝内嵌时区前缀、`@every` 与 `Local` 时区（§6.1 / §8）；jsonb 拒绝的输出按不可重试失败（§6.5）；分支二重领计数封顶（§6.3）；清理批次跟随停止信号、解锁有界（§6.8 / §6.10）；GetRun 单语句读取、timeout 上界与 NaN jitter 校验（§8）；口径修正：§6.2 日与星期 OR 语义、§7 结算不重试、§8.1 HOT 告警按心跳口径、§9 M5 实测边界。2026-09-07 评审修订五：TriggerTx 恢复 search_path 用独立有界 ctx，恢复失败单独返回（§8）；停机第 6 步取消在途心跳（§6.8）；回滚、恢复、解锁共用 5s 收尾期限（§6.10）；`hot_update_ratio` 改为趋势口径（§8.1）。2026-09-07 评审修订六（精准触发）：领取与定时扫描改为事件驱动，轮询降为兜底并把默认周期放宽到 5s（§1 / §6 / §8）；`job_run` 与 `schedule` 加唤醒触发器，NOTIFY 只做提前唤醒（§3 / §6.11）；定时扫描睡到最近的 `next_run_at`，领取睡到最近的 `run_at`、槽位释放即再领（§6.2 / §6.3）；停机同时关闭监听连接（§6.8 / §6.9）；故障窗口与锁序补监听与触发器（§7.1 / §7.3 / §7.4）；新增 `listener_reconnect_total`（§8.1）；新增 M6 验收（§9）；LISTEN/NOTIFY 从 §10 移出。2026-09-07 评审修订七：errors 条目先规范化再落库、任何结算的 class 22 都按不可重试失败（§6.5）；到点读取含已到期行、`db_now` 取 `clock_timestamp()` 并扣本地耗时（§6.2 / §6.3 / §6.11）；后到的 Shutdown 调用等待完成或自己的 ctx（§6.8 / §8）；超长 `executor_type` 退化为广播唤醒（§3 / §6.11）；列表多读一行判断尾页（§8）；M6 验收改为 Executor 入口时刻 ≤ 300ms（§9）；口径修正：DB 时钟前跳才提前过期（§7.4）、收尾期限各自 5s（§6.10）。2026-09-08 评审修订八：去重撞键后查不到在途 run 则重跑 INSERT，最多 3 轮（§6.1 / §8）；名字 ≤ 255 字节（§8）；部分填写的重试策略按原样校验（§8）；领取的到点读取放到本轮末尾并扣除耗时（§6.3）；`Stats` 无注册类型时传空数组（§8）；日志的 instance 由 Logger 统一携带。2026-09-08 验收设计补充：新增 M7 真实负载与多实例验收，明确混合任务、故障注入、逐次执行证据、计时口径、容量分档与通过条件（§9 / §11）；不改变 §3 DDL、§6 事务协议、§7.3 锁序或 §8 公共 API。2026-09-08 M7 smoke 实现口径补充：cron 精度以 scheduled_at 覆盖扫描耗时；使用 Go 原生 -artifacts 保存制品（§11）。2026-09-08 M7 smoke 交付：独立保存并核对预期 At / cron 拍次，增加坏证据负例及共享预算下的并发清理；更新运行入口，完整负载与 soak 仍待实现（§9 / §11）。2026-09-08 Snooze 方案确认：采用 submit → poll 两节点与纯 Snooze，task id 和固定 deadline 保存在 submit 的成功 output，不引入运行中 checkpoint、不改变 Resume 语义；补充 M8 待实施设计与验收（§9 / §10 / §12），开始实施前另行确认并同步 §6 / §8，§3 DDL 与 §7.3 锁序不变。2026-09-08 M8 实施确认：同步纯 Snooze 的结算、唤醒、Attempt 计数及指标标签（§4 / §5 / §6.5 / §6.11 / §8 / §12）；复用两节点的成功 output 与既有 Resume，DDL 与锁序不变。2026-09-08 M8 兼容性补充：Snooze 使用 pgx 原生 interval 参数，在 SQL 中补足最多 1µs；避免 PG 13 大微秒数字面量越界和 Go Duration 向上取整溢出（§6.5 / §12.2）。2026-09-08 M8 交付：纯 Snooze、两节点示例、崩溃 / 取消 / fence / 期限验收落地；PG 13.23 与 18.4 均通过 test-ci 和三轮 race，lint 通过，更新完成状态与验收映射（§9 / §12）。2026-09-08 全量审查修订：空输出统一写 SQL NULL（§6.5）；启动查库移出生命周期锁并随停机取消，停机后不得补启动循环（§6.8 / §8）；PG 13 性能基线缺失的 active_time 标为 N/A（§9），不改变 DDL 或锁序。2026-09-08 M7 Snooze 补充：原 smoke 批次不变，追加普通 Snooze、全槽位复用屏障与 submit → poll → verify 工作流，保存 pending 快照并独立核对等待期限（§11）；不改生产协议或 DDL。
+2026-09-06 评审修订：节点取消改由父行状态表达，不再对 running 节点写 `cancel_requested`（§6.5 / §6.6 / §7.3）；结算的非终态出口统一先看取消（§6.5）；Shutdown 不再拒绝 Trigger（§6.8）；定时触发用 DB 时钟（§6.2）；领取分支二重领时记 `interrupted`（§6.3）；`schedule` 的 FK 改 RESTRICT（§3）；列表索引与游标改用 `id`（§3 / §8）。2026-09-07：角色开关改名 `DisableWorker` / `DisableScheduler`，零值即启用（§1 / §8）；`ScheduleSpec.Enabled` 同理改为 `Disabled`（§8）；清理改用会话级 advisory lock，每步独立短事务（§6.10）。2026-09-07 评审修订二：清理的 DELETE 外层重判终态条件（§6.10 / §7.3）；fail-fast 先取消再读节点（§6.5）；普通实例取消改为一条 UPDATE（§6.6）；无下一触发点的计划被拒绝或禁用（§6.2）；本地心跳期限只由心跳刷新、`active` 按 lease_token 记、领取后检查有界并在进入 Executor 前看停机（§6.4 / §6.8）；配置取值范围与 `retry_policy` 范围校验、`MaxPayload` 语义、`Metrics` 并发契约、`exec_duration` 标签取落库状态（§8）。2026-09-07 评审修订三：停止领取与 Executor 登记共用 `inflight` 互斥锁，lease-loss 的移除与结果丢弃标记原子发布（§6.4 / §6.8）；未启动节点取消先以 `SKIP LOCKED` 锁定候选，被跳过的 pending 由领取后检查收敛，锁序证明以不等待候选行为依据（§6.3 / §6.5 / §6.6 / §7.3，同步 §2 / §5 概述）。2026-09-07 交付补充：README 使用入口、MIT 许可证（署名 Jaken）、Go 1.27 与 PG 13/18 的 GitHub Actions 矩阵；CI 验证数据库连接并禁止测试缓存（§8.2）。2026-09-07 源码组织补充：保持包边界与执行职责，README 增加阅读导航，里程碑测试文件改用行为名称（§8.3）。2026-09-07 评审修订四：search_path 显式列出 pg_temp（§8）；cron 拒绝内嵌时区前缀、`@every` 与 `Local` 时区（§6.1 / §8）；jsonb 拒绝的输出按不可重试失败（§6.5）；分支二重领计数封顶（§6.3）；清理批次跟随停止信号、解锁有界（§6.8 / §6.10）；GetRun 单语句读取、timeout 上界与 NaN jitter 校验（§8）；口径修正：§6.2 日与星期 OR 语义、§7 结算不重试、§8.1 HOT 告警按心跳口径、§9 M5 实测边界。2026-09-07 评审修订五：TriggerTx 恢复 search_path 用独立有界 ctx，恢复失败单独返回（§8）；停机第 6 步取消在途心跳（§6.8）；回滚、恢复、解锁共用 5s 收尾期限（§6.10）；`hot_update_ratio` 改为趋势口径（§8.1）。2026-09-07 评审修订六（精准触发）：领取与定时扫描改为事件驱动，轮询降为兜底并把默认周期放宽到 5s（§1 / §6 / §8）；`job_run` 与 `schedule` 加唤醒触发器，NOTIFY 只做提前唤醒（§3 / §6.11）；定时扫描睡到最近的 `next_run_at`，领取睡到最近的 `run_at`、槽位释放即再领（§6.2 / §6.3）；停机同时关闭监听连接（§6.8 / §6.9）；故障窗口与锁序补监听与触发器（§7.1 / §7.3 / §7.4）；新增 `listener_reconnect_total`（§8.1）；新增 M6 验收（§9）；LISTEN/NOTIFY 从 §10 移出。2026-09-07 评审修订七：errors 条目先规范化再落库、任何结算的 class 22 都按不可重试失败（§6.5）；到点读取含已到期行、`db_now` 取 `clock_timestamp()` 并扣本地耗时（§6.2 / §6.3 / §6.11）；后到的 Shutdown 调用等待完成或自己的 ctx（§6.8 / §8）；超长 `executor_type` 退化为广播唤醒（§3 / §6.11）；列表多读一行判断尾页（§8）；M6 验收改为 Executor 入口时刻 ≤ 300ms（§9）；口径修正：DB 时钟前跳才提前过期（§7.4）、收尾期限各自 5s（§6.10）。2026-09-08 评审修订八：去重撞键后查不到在途 run 则重跑 INSERT，最多 3 轮（§6.1 / §8）；名字 ≤ 255 字节（§8）；部分填写的重试策略按原样校验（§8）；领取的到点读取放到本轮末尾并扣除耗时（§6.3）；`Stats` 无注册类型时传空数组（§8）；日志的 instance 由 Logger 统一携带。2026-09-08 验收设计补充：新增 M7 真实负载与多实例验收，明确混合任务、故障注入、逐次执行证据、计时口径、容量分档与通过条件（§9 / §11）；不改变 §3 DDL、§6 事务协议、§7.3 锁序或 §8 公共 API。2026-09-08 M7 smoke 实现口径补充：cron 精度以 scheduled_at 覆盖扫描耗时；使用 Go 原生 -artifacts 保存制品（§11）。2026-09-08 M7 smoke 交付：独立保存并核对预期 At / cron 拍次，增加坏证据负例及共享预算下的并发清理；更新运行入口，完整负载与 soak 仍待实现（§9 / §11）。2026-09-08 Snooze 方案确认：采用 submit → poll 两节点与纯 Snooze，task id 和固定 deadline 保存在 submit 的成功 output，不引入运行中 checkpoint、不改变 Resume 语义；补充 M8 待实施设计与验收（§9 / §10 / §12），开始实施前另行确认并同步 §6 / §8，§3 DDL 与 §7.3 锁序不变。2026-09-08 M8 实施确认：同步纯 Snooze 的结算、唤醒、Attempt 计数及指标标签（§4 / §5 / §6.5 / §6.11 / §8 / §12）；复用两节点的成功 output 与既有 Resume，DDL 与锁序不变。2026-09-08 M8 兼容性补充：Snooze 使用 pgx 原生 interval 参数，在 SQL 中补足最多 1µs；避免 PG 13 大微秒数字面量越界和 Go Duration 向上取整溢出（§6.5 / §12.2）。2026-09-08 M8 交付：纯 Snooze、两节点示例、崩溃 / 取消 / fence / 期限验收落地；PG 13.23 与 18.4 均通过 test-ci 和三轮 race，lint 通过，更新完成状态与验收映射（§9 / §12）。2026-09-08 全量审查修订：空输出统一写 SQL NULL（§6.5）；启动查库移出生命周期锁并随停机取消，停机后不得补启动循环（§6.8 / §8）；PG 13 性能基线缺失的 active_time 标为 N/A（§9），不改变 DDL 或锁序。2026-09-08 M7 Snooze 补充：原 smoke 批次不变，追加普通 Snooze、全槽位复用屏障与 submit → poll → verify 工作流，保存 pending 快照并独立核对等待期限（§11）；不改生产协议或 DDL。2026-09-08 执行器取消与普通续跑确认：新增 Cancel(err) 与 Runs.Resume，保留取消原因并使节点取消收敛为整流取消；普通终态实例以同一 id 重置重试预算（§6.5 / §6.7 / §8 / §13），不改 DDL、锁序或依赖。
 
 ---
 
@@ -484,7 +484,7 @@ BEGIN
       -- cancel_requested 是本行的列，在同一条 UPDATE 里读；w.state 在父行锁下读。只有普通实例的 cancel_requested 会为真
   outcome 分支（同一条 UPDATE 的 SET；lease_token / lease_owner / lease_expires_at 一律置 NULL）：
     succeeded              : state = 'succeeded', output = $out, finished_at = now()
-    cancelled              : state = 'cancelled', finished_at = now()
+    cancelled              : state = 'cancelled', finished_at = now(), errors = errors || COALESCE($err, '[]')   -- 可选取消原因，attempt 不变
     以下五个出口先看取消命中：命中则 state = 'cancelled', finished_at = now()，各分支其余 SET 照旧；未命中：
     snoozed（正常等待）    : state = 'pending', run_at = now() + delay   -- attempt / errors / output 不变
     released（优雅停机）    : state = 'pending', run_at = now(), errors = errors || $err(kind=released)   -- attempt 不变，留痕供告警
@@ -506,6 +506,8 @@ BEGIN
 COMMIT
 ```
 
+`Cancel(err)` 将本实例结算为 cancelled，追加经过 encodeErr 规范化的原因（kind=cancelled），忽略 output，不增加 attempt；节点取消通过 propagate 取消整个工作流。支持 `%w` 包装，nil 返回 nil；取消请求、失租、停机、超时及显式 Permanent 优先于 Cancel，Cancel 优先于 Snooze（§13）。
+
 `Snooze(delay)` 是控制错误而非失败：支持普通 `%w` 包装；取消、失租、停机、超时及显式 Permanent 不被它覆盖。delay > 0，按微秒向上取整；结算时使用 pgx 原生 interval 参数并在 SQL 补足最多 1µs，兼容 PG 13 且避免大时长浮点转换或 Go Duration 向上取整溢出。Snooze 返回的 output 不写库，无论是否非空；不写 errors，不走退避，等待期间不占槽位或持租约。完整契约见 §12。
 
 退避 `backoff(n) = min(max_sec, base_sec × 2^(n−1)) × U[0.8, 1.2)`，缺省 5s / 5min；结果落库，恢复时不重抽随机数。`Permanent(err)` 与输出超限直接 `failed`。`$err = [{"attempt": n, "at": now, "kind": ..., "message": ...}]`。
@@ -513,14 +515,14 @@ COMMIT
 **propagate**（同一事务、持 `workflow_run` 行锁）：
 
 ```
-若本节点 = 'failed' 且 w.state = 'running'：                                  -- fail-fast，先写后读
+若本节点 IN ('failed', 'cancelled') 且 w.state = 'running'：                                  -- fail-fast，先写后读
     UPDATE workflow_run SET state = 'cancelling' WHERE id = $wf
     WITH picked AS (
         SELECT id FROM job_run
          WHERE workflow_run_id = $wf AND state IN ('blocked','pending')
            FOR UPDATE SKIP LOCKED)
     UPDATE job_run r SET state = 'cancelled', finished_at = now(),
-           errors = r.errors || '[{"kind":"upstream_failed", ...}]'
+           errors = r.errors || '[{"kind":"upstream_failed 或 upstream_cancelled", ...}]'  -- 随本节点终态
       FROM picked WHERE r.id = picked.id AND r.state IN ('blocked','pending')
     在跑节点不写：持有者在下一次心跳看到 wf_cancelling；崩溃后的重领方在领取后读父行看到 cancelling
     正被领取的行不等待：下面的读可能仍见 pending 或已见 running，两者都保留为非终态；它经领取后检查或心跳取消
@@ -597,6 +599,8 @@ BEGIN
       -- dedup_key 非空时重新占去重键；撞上同键在途 run 触发唯一索引错误 23505 → ErrDuplicate
 COMMIT
 ```
+
+`Runs.Resume(id)` 只允许普通 failed / cancelled 实例：自有事务条件 UPDATE，WHERE id=$id AND workflow_run_id IS NULL AND state IN ('failed','cancelled')，写 pending、attempt=0、run_at=now()，清空 lease_token / lease_owner / lease_expires_at / started_at / finished_at / output，cancel_requested=false；保留 errors、快照、id 与 dedup_key。零行后无锁查询分类为 ErrNotFound、节点错误（须 Workflows.Resume）或 ErrNotResumable；并发调用不能重置已 pending/running 实例。23505 回滚为 ErrDuplicate。成功后本地唤醒领取器，已有 NOTIFY 触发器唤醒其它实例（§13）。
 
 整体重跑不是续跑：再 `Trigger` 一次，得到新的 workflow_run。
 
@@ -791,12 +795,14 @@ func (e *Engine) Workflows().TriggerTx(ctx, tx pgx.Tx, name, input, ...TriggerOp
 func (e *Engine) Runs().Get(ctx, id) (*JobRun, error)
 func (e *Engine) Runs().List(ctx, RunFilter, cursor) (page, next cursor, error)   // 按 job_name / state 过滤，按 id DESC 排序，游标 = 上页最后一个 id，走 idx_job_run_job
 func (e *Engine) Runs().Cancel(ctx, id) error
+func (e *Engine) Runs().Resume(ctx, id) error                                    // 普通 failed/cancelled 实例，同 id 重置预算；节点须整流续跑
 func (e *Engine) Workflows().GetRun(ctx, id) (*WorkflowRun, error)                // 含全部节点；父行与节点来自同一条语句的快照，不会读到"failed 父行 + pending 节点"
 func (e *Engine) Workflows().ListRuns(ctx, WorkflowRunFilter, cursor) (page, next cursor, error)
 func (e *Engine) Workflows().CancelRun(ctx, id) error
 func (e *Engine) Workflows().Resume(ctx, id) error
 
 func Permanent(err error) error                                                   // 标记不可重试
+func Cancel(err error) error                                                      // 取消本实例及所属工作流，保留原因；nil → nil
 func Snooze(delay time.Duration) error                                            // 正常等待后再次执行，delay > 0，不消耗 attempt、不保存 output（§12）
 var ErrNotFound, ErrDuplicate, ErrReferenced, ErrNotDrained, ErrNotResumable error
 ```
@@ -1090,3 +1096,15 @@ Executor 通过 `return nil, Snooze(delay)` 表示“本次检查正常结束，
 | 18.4（Homebrew） | 通过，18.622s | 通过，`-race -count=3`，61.674s |
 
 `make lint`（sqlc diff、gofmt、go vet）与 `git diff --check` 通过。PG 13 实测曾暴露大微秒数字面量越界，改为原生 interval 参数后，包含 24h 和最大 Duration 的精度测试均通过；未新增迁移或依赖。本次未运行 M7 显式负载或重测 M5 性能基线。
+
+## 13. 执行器取消与普通实例手工续跑
+
+已批准先更新设计再实现；不修改 §3 DDL、§7.3 锁序或依赖。
+
+- `Cancel(err)` 为可包装的控制错误，nil → nil。有效信号忽略返回 output，以 cancelled 结算并追加 kind=cancelled、当前执行序号和规范化原因；attempt 不增加。上下文取消请求、失租、停机、超时及显式 Permanent 优先，Cancel 优先于 Snooze。未提供原因的既有取消调用不新增 errors。
+- 节点 cancelled 与 failed 同样先将 running 父行改为 cancelling，再复用 SKIP LOCKED 取消未启动节点；原因分别为 upstream_cancelled / upstream_failed。在跑兄弟由心跳取消，成功节点及其 output 不变。最终状态仍 failed 优先，否则 cancelling → cancelled。整流 Resume 保留成功 output，重跑 failed/cancelled 节点。
+- `Runs.Resume(ctx,id)` 仅支持普通 failed/cancelled run（含耗尽自动重试预算），不允许单节点续跑。条件 UPDATE 与分类查询在同一自有事务中；id、快照、历史、去重键及幂等键不变，清理执行现场并重置 attempt=0，立即 pending。非法 id 拒绝；不存在为 ErrNotFound，非可续跑态为 ErrNotResumable，节点错误指向 Workflows.Resume。
+- 重新占用原去重键冲突时完整回滚并返回 ErrDuplicate；并发 Resume 只有一次状态转换，后者不能重置活跃 run。成功本地唤醒，跨实例复用现有 NOTIFY。
+- 验收：包装与非法字符原因、output/attempt/优先级/fence；工作流后代与在跑兄弟取消、成功 output 保留续跑；普通耗尽预算后的同 id/历史/快照与新预算；非法态、缺失、节点、去重回滚、并发 Resume 及慢轮询唤醒。执行 lint、test-ci 和可行的 race 检查，不提交 git。
+
+实现与验收集中于 `cancel_resume_test.go`：`TestExecutorCancelPrecedence`、`TestExecutorCancelFence`、`TestExecutorCancelWorkflowResume`、`TestRunResumeBudgetAndWake`、`TestRunResumeValidationDedupAndConcurrent`。2026-09-08 本地 lint 与 test-ci 通过；默认并发三轮 race 在既有 FanIn / EmptyOutput 测试出现租约超时失败，相关测试与新增测试单独三轮 race 通过，全套 `-race -count=3 -parallel=4` 通过。未修改 DDL、锁序、依赖，未重测 M5 或 M7。

@@ -391,6 +391,23 @@ func (q *Queries) NextPendingAt(ctx context.Context, db DBTX, executorTypes []st
 	return items, nil
 }
 
+const ResumeRun = `-- name: ResumeRun :execrows
+UPDATE job_run
+   SET state = 'pending', attempt = 0, run_at = now(),
+       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL,
+       started_at = NULL, finished_at = NULL, output = NULL, cancel_requested = false
+ WHERE id = $1 AND workflow_run_id IS NULL AND state IN ('failed', 'cancelled')
+`
+
+// §6.7 / §13: ordinary terminal runs only; recheck state after a concurrent resume.
+func (q *Queries) ResumeRun(ctx context.Context, db DBTX, id int64) (int64, error) {
+	result, err := db.Exec(ctx, ResumeRun, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const RunIsNode = `-- name: RunIsNode :one
 SELECT (workflow_run_id IS NOT NULL)::boolean AS is_node FROM job_run WHERE id = $1
 `
@@ -406,19 +423,21 @@ func (q *Queries) RunIsNode(ctx context.Context, db DBTX, id int64) (bool, error
 const SettleCancelled = `-- name: SettleCancelled :one
 UPDATE job_run
    SET state = 'cancelled', finished_at = now(),
+       errors = errors || COALESCE($1::jsonb, '[]'::jsonb),
        lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
- WHERE id = $1 AND lease_token = $2::uuid AND state = 'running'
+ WHERE id = $2 AND lease_token = $3::uuid AND state = 'running'
 RETURNING state
 `
 
 type SettleCancelledParams struct {
+	Err   []byte
 	Id    int64
 	Token uuid.UUID
 }
 
 // §6.5 cancelled exit, same fence
 func (q *Queries) SettleCancelled(ctx context.Context, db DBTX, arg SettleCancelledParams) (string, error) {
-	row := db.QueryRow(ctx, SettleCancelled, arg.Id, arg.Token)
+	row := db.QueryRow(ctx, SettleCancelled, arg.Err, arg.Id, arg.Token)
 	var state string
 	err := row.Scan(&state)
 	return state, err

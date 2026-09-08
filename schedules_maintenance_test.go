@@ -230,7 +230,7 @@ func TestTwoInstancesFireOnce(t *testing.T) {
 	pool, schema := freshSchema(t)
 	ok := func(ctx context.Context, req *Request) (RawJSON, error) { return nil, nil }
 	a := startEngine(t, pool, fastConfig(schema), func(e *Engine) { e.Register("x", ok) })
-	startEngine(t, pool, fastConfig(schema), func(e *Engine) { e.Register("x", ok) })
+	b := startEngine(t, pool, fastConfig(schema), func(e *Engine) { e.Register("x", ok) })
 	declare(t, a, JobSpec{Name: "j", ExecutorType: "x"})
 	if err := a.Schedules().Put(t.Context(), ScheduleSpec{Name: "s", Job: "j", Cron: yearly}); err != nil {
 		t.Fatal(err)
@@ -240,7 +240,11 @@ func TestTwoInstancesFireOnce(t *testing.T) {
 		due := time.Now().Add(-time.Duration(beat) * time.Hour).Truncate(time.Second)
 		dueAt(t, pool, schema, "s", due)
 		waitFor(t, "beat to fire", func() bool { return len(scheduledRuns(t, a, "s")) >= beat })
-		time.Sleep(3 * a.cfg.PollInterval) // both instances get to scan again
+		for _, engine := range []*Engine{a, b} {
+			if _, err := engine.st.ScanDue(t.Context(), nextRun); err != nil {
+				t.Fatal(err)
+			}
+		}
 		runs := scheduledRuns(t, a, "s")
 		if len(runs) != beat {
 			t.Fatalf("beat %d: %d runs", beat, len(runs))
@@ -270,7 +274,9 @@ func TestCatchUpOneBeat(t *testing.T) {
 	missed := time.Now().AddDate(-3, 0, 0).Truncate(time.Second) // three periods behind
 	dueAt(t, pool, schema, "s", missed)
 	waitFor(t, "catch-up beat", func() bool { return len(scheduledRuns(t, e, "s")) >= 1 })
-	time.Sleep(3 * e.cfg.PollInterval)
+	if _, err := e.st.ScanDue(t.Context(), nextRun); err != nil {
+		t.Fatal(err)
+	}
 	runs := scheduledRuns(t, e, "s")
 	if len(runs) != 1 || !runs[0].ScheduledAt.Equal(missed) {
 		t.Fatalf("runs %d scheduled_at %v want %v", len(runs), runs[0].ScheduledAt, missed)

@@ -68,6 +68,21 @@ func (r *Runs) Get(ctx context.Context, id int64) (*JobRun, error) {
 	return jobRunFromStore(row), nil
 }
 
+// Resume gives a failed or cancelled ordinary run a fresh retry budget with the same identity.
+func (r *Runs) Resume(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return fmt.Errorf("skein: run id must be positive")
+	}
+	err := r.e.st.ResumeRun(ctx, id)
+	if errors.Is(err, store.ErrNode) {
+		return fmt.Errorf("skein: run %d is a workflow node; resume its workflow run", id)
+	}
+	if err == nil {
+		r.e.wakeClaimer()
+	}
+	return mapErr(err, strconv.FormatInt(id, 10))
+}
+
 type RunFilter struct {
 	JobName string
 	State   RunState

@@ -92,6 +92,16 @@ func run(ctx context.Context) error {
 2. **数据库和连接池由宿主管理。**`Migrate` 创建 schema 与表，不创建数据库；`Start` 只校验版本。自定义 `Config.Schema` 时，迁移须使用同一名称；连接池建议至少 5 个连接：监听独占 1 条，其余留给领取、心跳与结算。
 3. **Executor 应响应 ctx 取消。**`Shutdown` 不关闭连接池；应先处理它的返回值，再关闭宿主资源。`ErrNotDrained` 表示仍有执行器未退出，其租约将由其他兼容实例回收。
 
+### 执行器取消与手工续跑
+
+Executor 返回 `nil, skein.Cancel(err)` 会取消本 run；节点会取消整个工作流，成功节点及其 output 保留。在跑兄弟通过心跳收到取消。原因保存在 run.Errors（kind=cancelled），不消耗 attempt，返回的 output 被忽略。支持 `%w` 包装，`Cancel(nil)` 返回 nil；上下文取消 / 停机 / 超时、失租及显式 `Permanent` 优先于 Cancel，Cancel 优先于 Snooze。
+
+```go
+return nil, skein.Cancel(fmt.Errorf("external task stopped: %w", err))
+```
+
+普通任务耗尽自动重试或取消后，调用 `e.Runs().Resume(ctx, runId)`：同一 id、输入快照、历史和幂等键，重置重试预算并立即排队。仅 failed/cancelled 可续跑；其它状态返回 `ErrNotResumable`，去重键已被新 run 占用返回 `ErrDuplicate`，不改变旧 run。工作流节点不能单独续跑，使用 `e.Workflows().Resume(ctx, workflowRunId)`。
+
 ### 外部长任务：两节点 + Snooze
 
 视频生成等“先提交、再查询”的任务使用一个两节点工作流：
@@ -177,6 +187,7 @@ SKEIN_TEST_REQUIRE_DB=1 SKEIN_SCENARIO=1 SKEIN_SCENARIO_PROFILE=smoke \
 | [schedules_maintenance_test.go](schedules_maintenance_test.go) | 定时、DST、补一拍、保留清理、Stats 与列表（M4） |
 | [wake_test.go](wake_test.go) | 跨实例即时触发、延迟与退避到点、cron 到点、槽位释放再领、监听重连、触发器规则（M6） |
 | [scenarios_test.go](scenarios_test.go) | 三进程混合负载、Snooze / 槽位复用、独立精度探针及审计核查器负例（M7 smoke，显式运行） |
+| [cancel_resume_test.go](cancel_resume_test.go) | 执行器取消、原因与优先级、整流取消续跑、普通同 id 重试预算与并发去重（§13） |
 | [snooze_test.go](snooze_test.go) | 纯 Snooze、时长边界、到点与槽位、两节点输出传递与固定期限（M8） |
 | [worker_test.go](worker_test.go)、[race_test.go](race_test.go) | 执行准入、失租与完成的交错，以及事务锁序回归 |
 | [skein_test.go](skein_test.go)、[store_test.go](store_test.go) | 基础任务、共享数据库夹具、领取索引与心跳 HOT 比例 |

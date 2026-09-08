@@ -237,12 +237,12 @@ func terminal(state string) bool {
 // propagate runs inside settle, under the parent's row lock, after node reached the
 // terminal state newState.
 func (s *Store) propagate(ctx context.Context, tx pgx.Tx, wf int64, dag Dag, wfState, node, newState string) error {
-	if newState == "failed" && wfState == "running" { // fail-fast, written before the nodes are read
+	if (newState == "failed" || newState == "cancelled") && wfState == "running" { // fail-fast, written before the nodes are read
 		if _, err := s.q.MarkWorkflowCancelling(ctx, tx, wf); err != nil {
 			return err
 		}
 		wfState = "cancelling"
-		entry, _ := json.Marshal([]map[string]any{{"attempt": 0, "at": time.Now().UTC(), "kind": "upstream_failed", "message": node + " failed"}})
+		entry, _ := json.Marshal([]map[string]any{{"attempt": 0, "at": time.Now().UTC(), "kind": "upstream_" + newState, "message": node + " " + newState}})
 		if _, err := s.q.CancelUnstartedNodes(ctx, tx, CancelUnstartedNodesParams{WorkflowRunId: wf, Err: entry}); err != nil {
 			return err
 		}
@@ -345,7 +345,7 @@ func (s *Store) CancelWorkflow(ctx context.Context, id int64) error {
 
 // ───────────── resume (§6.7) ─────────────
 
-var ErrNotResumable = errors.New("store: workflow run is not failed or cancelled")
+var ErrNotResumable = errors.New("store: run is not failed or cancelled")
 
 // Resume re-queues the failed / cancelled nodes of a failed / cancelled workflow_run;
 // succeeded nodes keep their output. A terminal run has only terminal nodes (finalize

@@ -345,7 +345,7 @@ type Settlement struct {
 	JobName       string
 	Outcome       Outcome
 	Output        []byte        // Succeeded
-	Err           []byte        // one-element JSON array: Released, Retry, Failed
+	Err           []byte        // one-element JSON array: Released, Retry, Failed; optional for Cancelled
 	Backoff       time.Duration // Retry
 	Delay         time.Duration // Snoozed
 }
@@ -379,7 +379,7 @@ func (s *Store) Settle(ctx context.Context, st Settlement) (res Settled, err err
 		case Succeeded:
 			state, err = s.q.SettleSucceeded(ctx, tx, SettleSucceededParams{Id: st.Id, Token: st.Token, Output: st.Output})
 		case Cancelled:
-			state, err = s.q.SettleCancelled(ctx, tx, SettleCancelledParams{Id: st.Id, Token: st.Token})
+			state, err = s.q.SettleCancelled(ctx, tx, SettleCancelledParams{Id: st.Id, Token: st.Token, Err: st.Err})
 		case Released:
 			var row SettleReleasedRow
 			row, err = s.q.SettleReleased(ctx, tx, SettleReleasedParams{Id: st.Id, Token: st.Token, Err: st.Err, WfCancelling: wfCancelling})
@@ -444,7 +444,31 @@ func dataException(err error) (reason string, ok bool) {
 
 // ───────────── cancel (§6.6) ─────────────
 
-// ErrNode: the run is a workflow node; nodes are cancelled through their workflow.
+// ResumeRun never locks a workflow node; terminal state is rechecked by the UPDATE.
+func (s *Store) ResumeRun(ctx context.Context, id int64) error {
+	return s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		n, err := s.q.ResumeRun(ctx, tx, id)
+		if isPgCode(err, "23505") {
+			return ErrDuplicate
+		}
+		if err != nil || n > 0 {
+			return err
+		}
+		isNode, err := s.q.RunIsNode(ctx, tx, id)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			return ErrNotFound
+		case err != nil:
+			return err
+		case isNode:
+			return ErrNode
+		default:
+			return ErrNotResumable
+		}
+	})
+}
+
+// ErrNode: the run is a workflow node; cancel and resume go through its workflow.
 var ErrNode = errors.New("store: run is a workflow node")
 
 // CancelRun cancels a plain run: pending ends now, running is flagged for its holder,

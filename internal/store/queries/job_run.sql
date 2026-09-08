@@ -92,6 +92,7 @@ RETURNING state;
 -- §6.5 cancelled exit, same fence
 UPDATE job_run
    SET state = 'cancelled', finished_at = now(),
+       errors = errors || COALESCE(sqlc.narg(err)::jsonb, '[]'::jsonb),
        lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
  WHERE id = @id AND lease_token = @token::uuid AND state = 'running'
 RETURNING state;
@@ -159,6 +160,14 @@ UPDATE job_run
        cancel_requested = CASE WHEN state = 'running' THEN true ELSE cancel_requested END
  WHERE id = @id AND state IN ('pending', 'running') AND workflow_run_id IS NULL
 RETURNING state;
+
+-- name: ResumeRun :execrows
+-- §6.7 / §13: ordinary terminal runs only; recheck state after a concurrent resume.
+UPDATE job_run
+   SET state = 'pending', attempt = 0, run_at = now(),
+       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL,
+       started_at = NULL, finished_at = NULL, output = NULL, cancel_requested = false
+ WHERE id = @id AND workflow_run_id IS NULL AND state IN ('failed', 'cancelled');
 
 -- name: RunIsNode :one
 -- §6.6 Runs.Cancel: a node is cancelled through its parent (Workflows.CancelRun), never directly

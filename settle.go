@@ -20,7 +20,7 @@ const settleTimeout = 15 * time.Second
 type errEntry struct {
 	Attempt int       `json:"attempt"`
 	At      time.Time `json:"at"`
-	Kind    string    `json:"kind"` // business | timeout | interrupted | panic | upstream_failed | released
+	Kind    string    `json:"kind"` // business | timeout | interrupted | panic | upstream_failed | upstream_cancelled | cancelled | released
 	Message string    `json:"message"`
 }
 
@@ -59,6 +59,7 @@ func (e *Engine) settleResult(log *slog.Logger, c store.Claimed, policy RetryPol
 	entry := errEntry{Attempt: attempt, At: time.Now().UTC(), Kind: "business"}
 	retryable := true
 	snooze, _ := errors.AsType[*snoozeError](err)
+	cancelled, _ := errors.AsType[*cancelError](err)
 	switch {
 	case errors.Is(cause, errCancelRequested):
 		st.Outcome = store.Cancelled
@@ -78,6 +79,10 @@ func (e *Engine) settleResult(log *slog.Logger, c store.Claimed, policy RetryPol
 		entry.Kind, entry.Message = "released", "shutdown"
 	case errors.Is(cause, errTimeout):
 		entry.Kind, entry.Message = "timeout", err.Error()
+	case cancelled != nil && !isPermanent(err):
+		st.Outcome = store.Cancelled
+		entry.Kind, entry.Message = "cancelled", err.Error()
+		st.Err = encodeErr(entry)
 	case snooze != nil && !isPermanent(err):
 		st.Outcome, st.Delay = store.Snoozed, snooze.delay
 	default:

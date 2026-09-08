@@ -11,7 +11,7 @@ var (
 	ErrDuplicate    = errors.New("skein: an in-flight run already holds this dedup key")
 	ErrReferenced   = errors.New("skein: definition is referenced by a workflow node or schedule")
 	ErrNotDrained   = errors.New("skein: shutdown finished with executors still running")
-	ErrNotResumable = errors.New("skein: workflow run is not failed or cancelled")
+	ErrNotResumable = errors.New("skein: run is not failed or cancelled")
 )
 
 // Context causes; settle reads them back with context.Cause to pick the outcome (§6.5).
@@ -29,6 +29,19 @@ func Permanent(err error) error {
 	}
 	return &permanentError{err: err}
 }
+
+// Cancel ends this run and its workflow, preserving err as the cancellation reason.
+func Cancel(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &cancelError{err: err}
+}
+
+type cancelError struct{ err error }
+
+func (e *cancelError) Error() string { return e.err.Error() }
+func (e *cancelError) Unwrap() error { return e.err }
 
 type permanentError struct{ err error }
 
