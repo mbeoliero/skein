@@ -14,7 +14,7 @@ INSERT INTO workflow (name) VALUES ($1)
 ON CONFLICT (name) DO UPDATE SET updated_at = now()
 `
 
-// §6.1 Workflows.Declare: upsert the workflow row; nodes are replaced by the caller in the same transaction
+// §2.1 Workflows.Declare: upsert the workflow row; nodes are replaced by the caller in the same transaction
 func (q *Queries) DeclareWorkflow(ctx context.Context, db DBTX, name string) error {
 	_, err := db.Exec(ctx, DeclareWorkflow, name)
 	return err
@@ -24,7 +24,7 @@ const DeleteWorkflow = `-- name: DeleteWorkflow :execrows
 DELETE FROM workflow WHERE name = $1
 `
 
-// §8 Workflows.Delete: FK RESTRICT from schedule surfaces as 23503 → ErrReferenced; nodes cascade
+// §3.3 Workflows.Delete: FK RESTRICT from schedule surfaces as 23503 → ErrReferenced; nodes cascade
 func (q *Queries) DeleteWorkflow(ctx context.Context, db DBTX, name string) (int64, error) {
 	result, err := db.Exec(ctx, DeleteWorkflow, name)
 	if err != nil {
@@ -37,7 +37,7 @@ const DeleteWorkflowNodes = `-- name: DeleteWorkflowNodes :exec
 DELETE FROM workflow_node WHERE workflow_name = $1
 `
 
-// §6.1 Workflows.Declare: the node set is replaced, old rows first
+// §2.1 Workflows.Declare: the node set is replaced, old rows first
 func (q *Queries) DeleteWorkflowNodes(ctx context.Context, db DBTX, workflowName string) error {
 	_, err := db.Exec(ctx, DeleteWorkflowNodes, workflowName)
 	return err
@@ -47,7 +47,7 @@ const ExistingJobs = `-- name: ExistingJobs :many
 SELECT name FROM job WHERE name = ANY($1::text[])
 `
 
-// §6.1 Workflows.Declare validation: every node's job must be declared
+// §2.1 Workflows.Declare validation: every node's job must be declared
 func (q *Queries) ExistingJobs(ctx context.Context, db DBTX, names []string) ([]string, error) {
 	rows, err := db.Query(ctx, ExistingJobs, names)
 	if err != nil {
@@ -78,7 +78,7 @@ type InsertWorkflowNodeParams struct {
 	Deps         []string
 }
 
-// §6.1 Workflows.Declare: one row per node after the in-memory validation
+// §2.1 Workflows.Declare: one row per node after the in-memory validation
 func (q *Queries) InsertWorkflowNode(ctx context.Context, db DBTX, arg InsertWorkflowNodeParams) error {
 	_, err := db.Exec(ctx, InsertWorkflowNode, arg.WorkflowName, arg.JobName, arg.Deps)
 	return err
@@ -100,7 +100,7 @@ type WorkflowNodesRow struct {
 	RetryPolicy  []byte
 }
 
-// §6.1 step 1: the only read of definition tables in a workflow's life
+// §2.1: the only read of definition tables in a workflow's life
 func (q *Queries) WorkflowNodes(ctx context.Context, db DBTX, workflowName string) ([]WorkflowNodesRow, error) {
 	rows, err := db.Query(ctx, WorkflowNodes, workflowName)
 	if err != nil {

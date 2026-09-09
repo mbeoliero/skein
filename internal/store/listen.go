@@ -7,7 +7,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Listener is the one dedicated LISTEN connection of a process (§6.11). It is taken
+// Listener is the one dedicated LISTEN connection of a process (§2.7). It is taken
 // out of the pool for good: a pooled connection would be handed to other callers
 // between notifications, and the pool's health checks would race WaitForNotification.
 type Listener struct {

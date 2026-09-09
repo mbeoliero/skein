@@ -58,7 +58,7 @@ type Workflows struct{ e *Engine }
 
 func (e *Engine) Workflows() *Workflows { return &Workflows{e: e} }
 
-// Declare validates the graph (§6.1) and replaces the definition.
+// Declare validates the graph (§2.1) and replaces the definition.
 func (w *Workflows) Declare(ctx context.Context, spec WorkflowSpec) error {
 	if err := validName("workflow", spec.Name); err != nil {
 		return err
@@ -235,13 +235,20 @@ func (w *Workflows) ListRuns(ctx context.Context, f WorkflowRunFilter, cursor in
 }
 
 // CancelRun stops a workflow: unstarted nodes end now, running nodes are cancelled
-// through their heartbeat, and the last one to settle finalises the run (§6.6).
+// through their heartbeat, and the last one to settle finalises the run (§2.5).
 func (w *Workflows) CancelRun(ctx context.Context, id int64) error {
 	return mapErr(w.e.st.CancelWorkflow(ctx, id), strconv.FormatInt(id, 10))
 }
 
 // Resume re-runs the failed / cancelled nodes and their unsucceeded descendants of a
-// failed or cancelled workflow run; succeeded nodes keep their output (§6.7).
+// failed or cancelled workflow run; succeeded nodes keep their output (§2.5).
 func (w *Workflows) Resume(ctx context.Context, id int64) error {
-	return mapErr(w.e.st.Resume(ctx, id), strconv.FormatInt(id, 10))
+	if id <= 0 {
+		return fmt.Errorf("skein: workflow run id must be positive")
+	}
+	err := w.e.st.Resume(ctx, id)
+	if err == nil {
+		w.e.wakeClaimer()
+	}
+	return mapErr(err, strconv.FormatInt(id, 10))
 }

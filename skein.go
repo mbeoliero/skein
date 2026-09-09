@@ -9,9 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"os"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,14 +22,14 @@ import (
 
 const defaultSchema = "skein"
 
-// Config; zero values take the design §8 defaults.
+// Zero values use the defaults below; validation follows design §3.1.
 type Config struct {
 	Schema           string // one schema per application; default "skein"
-	DisableWorker    bool   // design §8 RunWorker = false: this process submits but never claims or executes
-	DisableScheduler bool   // design §8 RunScheduler = false: no schedule scan and no retention on this process
+	DisableWorker    bool   // no claiming or execution; the scheduler is independent (§1.1)
+	DisableScheduler bool   // no schedule scan or retention on this process (§1.1)
 
 	Concurrency       int           // execution slots in this process, not a cluster limit; default 16
-	PollInterval      time.Duration // backstop period of the claim and scan loops, ±20% jitter (§6.11); default 5s
+	PollInterval      time.Duration // backstop period of the claim and scan loops, ±20% jitter (§2.7); default 5s
 	HeartbeatInterval time.Duration // default 15s
 	LeaseTTL          time.Duration // default 60s = 4 × HeartbeatInterval; crash takeover waits about this long
 
@@ -134,15 +132,15 @@ type Engine struct {
 	owner   string // lease_owner: host:pid:rand, diagnostics only
 
 	executors map[string]Executor
-	types     []string // sorted executor types this process claims
+	types     atomic.Pointer[[]string] // sorted executor types, republished by Register; loops and Stats read the snapshot
 	started   atomic.Bool
 
-	wake      chan struct{} // local Trigger, slot release and NOTIFY nudge the claim loop (§6.11)
+	wake      chan struct{} // local Trigger, slot release and NOTIFY nudge the claim loop (§2.7)
 	wakeSched chan struct{} // local Put / Delete and NOTIFY nudge the schedule loop
 	slots     chan struct{} // Concurrency semaphore
 	inflight  inflightSet   // leases this process renews
 	active    sync.Map      // lease token → run id, one entry per executor goroutine still running
-	lastOK    time.Time     // start of the last successful heartbeat (§6.4 local deadline); written by the heartbeat goroutine only, so it keeps its monotonic reading
+	lastOK    time.Time     // start of the last successful heartbeat (§2.3 local deadline); written by the heartbeat goroutine only, so it keeps its monotonic reading
 
 	lifecycle sync.Mutex      // serializes lifecycle transitions, never startup database I/O
 	loopCtx   context.Context // claim loop
@@ -202,7 +200,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 	e.lifecycle.Unlock()
 
-	// §6.8: shutdown cancels startup I/O without waiting for its lifecycle lock.
+	// §2.6: shutdown cancels startup I/O without waiting for its lifecycle lock.
 	startCtx, cancelStart := context.WithCancel(ctx)
 	stopCancel := context.AfterFunc(e.loopCtx, cancelStart)
 	v, err := e.st.SchemaVersion(startCtx)
@@ -224,7 +222,6 @@ func (e *Engine) Start(ctx context.Context) error {
 		return fmt.Errorf("skein: schema version is %d, this build needs %d: run Migrate", v, schemaVersion)
 	}
 	if !e.cfg.DisableWorker {
-		e.types = e.registeredTypes()
 		e.lastOK = time.Now()
 		e.loops.Go(func() { e.claimLoop(e.loopCtx) })
 		e.hb.Go(func() { e.heartbeatLoop(e.hbCtx) })
@@ -240,15 +237,16 @@ func (e *Engine) Start(ctx context.Context) error {
 	return nil
 }
 
+// registeredTypes is the sorted snapshot Register published last. Never nil: pgx
+// sends a nil slice as NULL, and NOT x = ANY(NULL) is never true (Stats).
 func (e *Engine) registeredTypes() []string {
-	types := slices.Sorted(maps.Keys(e.executors))
-	if types == nil {
-		types = []string{} // pgx sends a nil slice as NULL, and NOT x = ANY(NULL) is never true (Stats)
+	if p := e.types.Load(); p != nil {
+		return *p
 	}
-	return types
+	return []string{}
 }
 
-// Shutdown drains this process (§6.8). The first caller runs it; a later caller waits
+// Shutdown drains this process (§2.6). The first caller runs it; a later caller waits
 // for that run or for its own ctx, whichever ends first, and returns the run's result
 // or its ctx error. It never blocks on the lifecycle mutex behind a Shutdown in
 // progress: the host's call with a short budget must not inherit the budget of the

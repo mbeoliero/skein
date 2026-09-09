@@ -30,7 +30,7 @@ type DeleteOldJobRunsParams struct {
 // the statement snapshot, and a row locked by a concurrent transaction is re-checked on its
 // new version only against the outer WHERE (EvalPlanQual). With id IN (...) alone, a
 // workflow_run that Resume just moved back to running would be deleted with all its nodes.
-// §6.10 plain runs only: nodes go with their workflow_run (FK cascade), never on their own
+// §2.8 plain runs only: nodes go with their workflow_run (FK cascade), never on their own
 func (q *Queries) DeleteOldJobRuns(ctx context.Context, db DBTX, arg DeleteOldJobRunsParams) (int64, error) {
 	result, err := db.Exec(ctx, DeleteOldJobRuns, arg.States, arg.Age, arg.Lim)
 	if err != nil {
@@ -53,7 +53,7 @@ type DeleteOldWorkflowRunsParams struct {
 	Lim    int32
 }
 
-// §6.10 retention for workflow runs; nodes go with the parent (ON DELETE CASCADE); outer WHERE re-checked as above
+// §2.8 retention for workflow runs; nodes go with the parent (ON DELETE CASCADE); outer WHERE re-checked as above
 func (q *Queries) DeleteOldWorkflowRuns(ctx context.Context, db DBTX, arg DeleteOldWorkflowRunsParams) (int64, error) {
 	result, err := db.Exec(ctx, DeleteOldWorkflowRuns, arg.States, arg.Age, arg.Lim)
 	if err != nil {
@@ -66,7 +66,7 @@ const MaintenanceUnlock = `-- name: MaintenanceUnlock :exec
 SELECT pg_advisory_unlock(hashtext('skein:maint'))
 `
 
-// §6.10: released on the same connection; a failed unlock closes that connection instead of pooling it
+// §2.8: released on the same connection; a failed unlock closes that connection instead of pooling it
 func (q *Queries) MaintenanceUnlock(ctx context.Context, db DBTX) error {
 	_, err := db.Exec(ctx, MaintenanceUnlock)
 	return err
@@ -77,7 +77,7 @@ SELECT count(*)::int AS n FROM job_run
  WHERE state IN ('pending', 'running') AND workflow_run_id IS NULL AND created_at < now() - $1::interval
 `
 
-// §6.10 stale-active check for plain runs; nodes are counted through their parent
+// §2.8 stale-active check for plain runs; nodes are counted through their parent
 func (q *Queries) StaleJobRuns(ctx context.Context, db DBTX, age time.Duration) (int32, error) {
 	row := db.QueryRow(ctx, StaleJobRuns, age)
 	var n int32
@@ -89,7 +89,7 @@ const StaleWorkflowRuns = `-- name: StaleWorkflowRuns :one
 SELECT count(*)::int AS n FROM workflow_run WHERE state IN ('running', 'cancelling') AND created_at < now() - $1::interval
 `
 
-// §6.10 stale-active check (stale_active_total): in flight longer than the failed-retention window
+// §2.8 stale-active check (stale_active_total): in flight longer than the failed-retention window
 func (q *Queries) StaleWorkflowRuns(ctx context.Context, db DBTX, age time.Duration) (int32, error) {
 	row := db.QueryRow(ctx, StaleWorkflowRuns, age)
 	var n int32
@@ -112,7 +112,7 @@ type StatsRow struct {
 	UnregisteredDue  int32
 }
 
-// §8 Engine.Stats: one statement over the in-flight rows (both partial indexes)
+// §3.3 Engine.Stats: one statement over the in-flight rows (both partial indexes)
 func (q *Queries) Stats(ctx context.Context, db DBTX, registered []string) (StatsRow, error) {
 	row := db.QueryRow(ctx, Stats, registered)
 	var i StatsRow
@@ -130,8 +130,8 @@ const TryMaintenanceLock = `-- name: TryMaintenanceLock :one
 SELECT pg_try_advisory_lock(hashtext('skein:maint'))::boolean AS locked
 `
 
-// §6.10 retention: one holder at a time (session advisory lock), each step its own transaction
-// §6.10: session-level advisory lock, one holder per database; the loser reports skipped
+// §2.8 retention: one holder at a time (session advisory lock), each step its own transaction
+// §2.8: session-level advisory lock, one holder per database; the loser reports skipped
 func (q *Queries) TryMaintenanceLock(ctx context.Context, db DBTX) (bool, error) {
 	row := db.QueryRow(ctx, TryMaintenanceLock)
 	var locked bool

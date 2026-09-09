@@ -199,6 +199,122 @@ func TestBlockedNodeContext(t *testing.T) {
 	}
 }
 
+func TestObservedCancellationAfterContextEnded(t *testing.T) {
+	for _, first := range []string{"timeout", "shutdown"} {
+		for _, kind := range []string{"plain", "workflow"} {
+			t.Run(first+"/"+kind, func(t *testing.T) {
+				t.Parallel()
+				pool, schema := freshSchema(t)
+				cfg := fastConfig(schema)
+				cfg.CancelTimeout = 5 * time.Second
+				cfg.HeartbeatInterval = time.Second
+				cfg.LeaseTTL = 10 * time.Second
+				e, err := New(pool, cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				entered := make(chan struct{})
+				ended := make(chan error, 1)
+				exit := make(chan struct{})
+				release := sync.OnceFunc(func() { close(exit) })
+				defer func() {
+					release()
+					if !waitGroup(t.Context(), &e.execs, 5*time.Second) {
+						t.Error("executor did not finish")
+					}
+				}()
+				e.Register("x", func(ctx context.Context, _ *Request) (RawJSON, error) {
+					close(entered)
+					<-ctx.Done()
+					ended <- context.Cause(ctx)
+					<-exit
+					return RawJSON(`"finished anyway"`), nil
+				})
+				declare(t, e, JobSpec{Name: "j", ExecutorType: "x", Timeout: time.Second})
+				var wfId int64
+				if kind == "workflow" {
+					declareWorkflow(t, e, WorkflowSpec{Name: "w", Nodes: []Node{{Job: "j"}}})
+					wfId = triggerWorkflow(t, e, "w", "")
+				} else {
+					trigger(t, e, "j", "")
+				}
+				c := claimAsDeadHolder(t, pool, schema, "x")
+				e.dispatch(c)
+				select {
+				case <-entered:
+				case <-time.After(5 * time.Second):
+					t.Fatal("executor did not enter")
+				}
+				want := errTimeout
+				if first == "shutdown" {
+					want = errShuttingDown
+					e.inflight.cancelAll(want)
+				}
+				select {
+				case got := <-ended:
+					if !errors.Is(got, want) {
+						t.Fatalf("first context cause: %v, want %v", got, want)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("executor context did not end")
+				}
+				if kind == "workflow" {
+					err = e.Workflows().CancelRun(t.Context(), wfId)
+				} else {
+					err = e.Runs().Cancel(t.Context(), c.Id)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Deliver the persisted request only after the first cause is fixed,
+				// and do not let the executor return until delivery is complete.
+				e.heartbeatOnce(t.Context())
+				release()
+				if !waitGroup(t.Context(), &e.execs, 5*time.Second) {
+					t.Fatal("executor did not settle")
+				}
+				run, err := e.Runs().Get(t.Context(), c.Id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if run.State != StateCancelled || len(run.Output) != 0 || run.Attempt != 0 || string(run.Errors) != "[]" {
+					t.Fatalf("observed cancellation lost: %+v", run)
+				}
+				if kind == "workflow" {
+					waitWorkflow(t, e, wfId, WorkflowCancelled)
+				}
+			})
+		}
+	}
+}
+
+func TestCancelledLoopsDoNotStartTransactions(t *testing.T) {
+	for _, name := range []string{"claim", "schedule"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			pool, schema := freshSchema(t)
+			e, err := New(pool, fastConfig(schema))
+			if err != nil {
+				t.Fatal(err)
+			}
+			types := []string{"x"}
+			e.types.Store(&types)
+			e.stopLoops()
+			e.wakeClaimer()
+			e.wakeScheduler()
+			before := pool.Stat().AcquireCount()
+			if name == "claim" {
+				e.claimLoop(e.loopCtx)
+			} else {
+				e.scheduleLoop(e.loopCtx)
+			}
+			if got := pool.Stat().AcquireCount() - before; got != 0 {
+				t.Fatalf("cancelled %s loop acquired %d connections", name, got)
+			}
+		})
+	}
+}
+
 func TestClaimDoesNotExtendHeartbeatDeadline(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
@@ -207,7 +323,6 @@ func TestClaimDoesNotExtendHeartbeatDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.Register("x", func(context.Context, *Request) (RawJSON, error) { return nil, nil })
-	e.types = e.registeredTypes()
 	declare(t, e, JobSpec{Name: "j", ExecutorType: "x"})
 	trigger(t, e, "j", "")
 	last := time.Now().Add(-time.Hour)

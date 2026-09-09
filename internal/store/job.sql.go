@@ -28,7 +28,7 @@ type DeclareJobParams struct {
 	RetryPolicy  []byte
 }
 
-// §6.1 Jobs.Declare: upsert by name
+// §2.1 Jobs.Declare: upsert by name
 func (q *Queries) DeclareJob(ctx context.Context, db DBTX, arg DeclareJobParams) error {
 	_, err := db.Exec(ctx, DeclareJob,
 		arg.Name,
@@ -44,7 +44,7 @@ const DeleteJob = `-- name: DeleteJob :execrows
 DELETE FROM job WHERE name = $1
 `
 
-// §8 Jobs.Delete: FK RESTRICT from workflow_node / schedule surfaces as 23503 → ErrReferenced
+// §3.3 Jobs.Delete: FK RESTRICT from workflow_node / schedule surfaces as 23503 → ErrReferenced
 func (q *Queries) DeleteJob(ctx context.Context, db DBTX, name string) (int64, error) {
 	result, err := db.Exec(ctx, DeleteJob, name)
 	if err != nil {
@@ -57,7 +57,7 @@ const JobExists = `-- name: JobExists :one
 SELECT EXISTS (SELECT 1 FROM job WHERE name = $1) AS found
 `
 
-// §6.1 Jobs.Trigger: zero rows from the INSERT is ErrNotFound when the job is missing, else a dedup conflict
+// §2.1 Jobs.Trigger: zero rows from the INSERT is ErrNotFound when the job is missing, else a dedup conflict
 func (q *Queries) JobExists(ctx context.Context, db DBTX, name string) (bool, error) {
 	row := db.QueryRow(ctx, JobExists, name)
 	var found bool

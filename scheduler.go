@@ -6,7 +6,7 @@ import (
 )
 
 func (e *Engine) scheduleLoop(ctx context.Context) {
-	for {
+	for ctx.Err() == nil {
 		wait := e.scanOnce()
 		select {
 		case <-ctx.Done():
@@ -17,14 +17,13 @@ func (e *Engine) scheduleLoop(ctx context.Context) {
 	}
 }
 
-// scanOnce is one §6.2 tick. Like a claim it runs on its own bounded ctx so a tick
+// scanOnce is one §2.1 tick. Like a claim it runs on its own bounded ctx so a tick
 // that already committed is always accounted for. It returns how long the loop waits
 // unless woken: until the nearest next_run_at, or nothing at all after a full batch.
 func (e *Engine) scanOnce() time.Duration {
 	ctx, cancel := context.WithTimeout(context.Background(), claimTimeout)
 	defer cancel()
 	sc, err := e.st.ScanDue(ctx, nextRun)
-	sampled := time.Now()
 	if err != nil {
 		e.log.Error("schedule scan failed", "err", err)
 		return jitter(e.cfg.PollInterval)
@@ -51,5 +50,5 @@ func (e *Engine) scanOnce() time.Duration {
 	if sc.Full {
 		return 0
 	}
-	return e.untilDue(sc.NextDue, sc.DbNow, sampled)
+	return e.untilDue(sc.Due)
 }

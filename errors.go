@@ -8,13 +8,13 @@ import (
 
 var (
 	ErrNotFound     = errors.New("skein: not found")
-	ErrDuplicate    = errors.New("skein: an in-flight run already holds this dedup key")
+	ErrDuplicate    = errors.New("skein: another run already holds this dedup key")
 	ErrReferenced   = errors.New("skein: definition is referenced by a workflow node or schedule")
 	ErrNotDrained   = errors.New("skein: shutdown finished with executors still running")
 	ErrNotResumable = errors.New("skein: run is not failed or cancelled")
 )
 
-// Context causes; settle reads them back with context.Cause to pick the outcome (§6.5).
+// Context causes; settle reads them back with context.Cause to pick the outcome (§2.4).
 var (
 	errTimeout         = errors.New("skein: executor timeout")
 	errCancelRequested = errors.New("skein: cancel requested")

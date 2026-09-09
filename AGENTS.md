@@ -1,105 +1,156 @@
-# skein v5
+# skein
 
-Go **1.27** job scheduler library on PostgreSQL **>= 13** (developed and tested on 18.4): one-off and delayed jobs, cron schedules, DAG workflows, retries, graceful shutdown, restart recovery.
-All state lives in the `skein` schema (configurable); the process keeps nothing that must survive a restart.
-One module (`github.com/mbeoliero/skein`), embedded in the host process (`skein.New` / `Register` / `Start` / `Shutdown`); several hosts share one database with no leader and no extra service.
+Go **1.27** job scheduler library on PostgreSQL **>= 13**. One module,
+`github.com/mbeoliero/skein`, embedded in the host process; multiple hosts share
+one database, with no leader or extra service.
 
-Design: `docs/design.md` is the source of truth. §3 is the DDL, §6 the transaction protocol, §7.3 the lock order, §8 the public API and config, §9 the milestones with their acceptance checks.
-If code and the design disagree, ask. Design changes go into `docs/design.md` first: edit the section, then append the date and section to the 评审修订 line under the title. Docs are written in Chinese; code, comments and this file in English.
+## Before making changes
 
-Milestones are §9. M1–M6 are done: M1 plain jobs, M2 multi-instance reliability, M3 workflows, M4 schedules / retention / Stats / listing, M5 the performance baseline in `docs/baseline.md`, M6 precise triggering (event-driven loops, §6.11). M7 real-workload and multi-instance acceptance is specified in §11: its smoke profile is implemented in `scenarios_test.go`, with commands and evidence in `docs/scenarios.md`; full / soak remain unimplemented and M7 is not complete. M8 pure Snooze (§12) is done, including the two-node external-task example and PG 13/18 acceptance. New work is a new design section first. Ask before starting each milestone, and before any change to §3 DDL, §6 protocol or §7.3 lock order; the user wants decisions asked first.
+- [docs/design.md](docs/design.md) is the design source of truth; implement ordinary
+  requirements within it. If code and design disagree, stop and ask.
+- Before changing the database schema, system architecture (including protocol and
+  lock order), or any part of `docs/design.md`, explain the necessity and impact and
+  obtain explicit approval. Also ask before starting each milestone.
+- Ask before adding dependencies or `internal/` packages; new packages need a real
+  second import boundary. No DI frameworks or future scaffolding; no CLI unless requested.
+  Runtime dependencies are pgx/v5 and robfig/cron/v3.
+- Leave `AGENTS.md` unchanged unless long-term development rules or workflows change.
+  Do not record individual requirements, implementation history or completion status.
+- After approval, update the relevant design section before implementation, following
+  the writing rules below. Docs are Chinese; code, comments and this file are English.
+
+Before editing, read the relevant design sections below and the existing
+implementation/tests.
+
+| Change                                            | Required reading                                                                                                         |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Public API, validation, configuration             | §3; for Cancel / Resume / Snooze also §2.4–§2.5 |
+| Worker, leases, startup or shutdown               | §2.2–§2.4, §2.6, §2.9: fencing, local lease loss, admission and drain ordering |
+| SQL, schema, cancellation or workflow propagation | §1.3, the affected §2 transaction, §2.9: zero-row meanings and lock-order proof |
+| Schedules, wakeups or retention                   | §2.1, §2.7–§2.8: database clock, lost notifications and concurrent Resume |
+| Acceptance or performance work                    | [README validation](README.md#验证判据); [scenarios](docs/scenarios.md) for M7, [baseline](docs/baseline.md) for M5 |
+
+### Design writing
+
+- **Minimum content:** explain architecture, required behavior and necessary rationale
+  as concisely as possible. Delete content adding none of these. Release status,
+  development operations, implementation records and editorial notes are not design.
+- **Visual first:** keep the architecture overview. Use diagrams for relationships,
+  states, sequences and lock interactions; short tables for comparisons. Text supplies
+  only missing constraints or reasons, not a retelling of the diagram. No paragraph-sized nodes.
+- **Local changes:** edit only the approved scope. No incidental rewrite, renumbering
+  or diagram removal. Add a section only for an independent new topic, not each task.
+- **One explanation:** explain each contract once; elsewhere add only local constraints
+  or a reference. Keep full DDL, API declarations and defaults in source; usage in README;
+  acceptance and evidence in existing validation docs or PR/CI records. Do not move
+  redundant prose into new docs or copy operational warnings into design.
+- **Preserve and verify:** retain conditions, transaction boundaries, fences, lock order,
+  failure windows and unresolved risks in their owning documents. Compare before/after,
+  render and visually inspect changed diagrams, and check references. Rendering alone
+  does not prove semantic correctness; report unverified checks.
 
 ## Commands
 
 ```text
-make test          go test ./... (needs a local PG; see Tests)
-make test-ci       go test -count=1 ./... with SKEIN_TEST_REQUIRE_DB=1: no cached results, an unreachable PG fails instead of skipping database tests
-make race          go test -race -count=3 ./...
-make lint          sqlc diff + gofmt -l + go vet
-make sqlc          sqlc generate (after editing internal/store/queries/*.sql or migrations/)
-make tidy
-make pg-start      brew services start postgresql@18 (local PG 18.4 on the /tmp socket)
+make test       go test ./...; may skip database tests and reuse cached results
+make test-ci    require a reachable database and run without caching
+make race       go test -race -count=3 ./...
+make lint       sqlc diff, gofmt check and go vet
+make sqlc       regenerate after changing queries or migrations
 ```
 
-GitHub Actions (`.github/workflows/ci.yml`) runs Go from `go.mod` against PostgreSQL 13 and 18, verifies the test DSN, then runs lint, test-ci and race with `SKEIN_TEST_REQUIRE_DB=1`. `README.md` is the user entry point; the project license is MIT (`LICENSE`).
+`SKEIN_TEST_DSN` defaults to `postgres:///postgres?host=/tmp`.
+Use `SKEIN_TEST_REQUIRE_DB=1 make race` to fail rather than skip if PG is unreachable.
+[CI](.github/workflows/ci.yml) requires PG 13/18 checks; cached/skipped tests are not
+acceptance evidence. Setup and source/test navigation: [README.md](README.md).
 
-Migrations run from host code: `skein.Migrate(ctx, pool, schema)`, explicit, never inside `Start`. There is no CLI and no `cmd/`; do not add one unless asked.
+## Safety and package boundaries
 
-## Layout
+### Storage and execution
 
-One library package, `skein`, at the module root, plus the store and the embedded migrations. Files follow the design sections so a reader can map code to §6:
+- Durable state and run snapshots live only in PostgreSQL; no hot-path definition joins.
+  Dedup uses partial unique indexes, not a separate slot table.
+- Recovery is expired-lease claim branch two; keep both indexed branches separate.
+  No startup reset, zombie sweeper, timeout scanner or separate workflow advancer.
+- Only settle leaves `running`. Heartbeat/settle require token **and** running-state
+  fences; `ErrLeaseLost` means roll back and discard, never retry or report (§2.9).
+- Executors hold no DB connection; the host owns the pool. At-least-once effects
+  require `Request.IdempotencyKey`. Migrate explicitly, never in `Start`; check schema version.
+- Imports: `skein` → `internal/store`, `migrations`, with no back-imports. Root code
+  calls `store.Store`, not `store.Queries`. Store owns transactions; generated types
+  stop at root mapping functions, never in the public API.
 
-```text
-skein.go        Engine, Config + defaults (§8), New / Start / Shutdown / Stats
-executor.go     Executor, Request, generic Register[P], IdempotencyKey
-errors.go       sentinels (§8), Permanent, Cancel and Snooze
-migrate.go      Migrate, schemaVersion, applies migrations.FS
-jobs.go workflows.go schedules.go runs.go   the Jobs() / Workflows() / Schedules() / Runs() APIs (§6.1, §6.6, §6.7)
-claim.go        the two claim statements, the post-claim checks, the next-due wait (§6.3)
-worker.go       execution pool, ctx deadline, panic recovery (§6.4)
-heartbeat.go    one statement per process for all leases, cancel signals, local deadline (§6.4)
-settle.go       settle, propagate, finalize (§6.5)
-scheduler.go    due scan, catch-up rule, cron via robfig/cron, the next-due wait (§6.2)
-listen.go       the LISTEN connection and payload routing to the loops' wake channels (§6.11)
-maint.go        retention and stale-active checks under the advisory lock (§6.10)
-migrations/     embed.go + NNNNN_name.sql; 00001_init.sql is design §3; also the schema sqlc compiles against
-internal/store/ the persistence layer: queries/<table>.sql (the only place SQL is written), the sqlc output *.sql.go + models.go (do not edit), and store.go with one Store method per §6 transaction
-sqlc.yaml, Makefile
-docs/           design
-```
+### Concurrency and lifecycle
 
-Import direction: `skein` → `internal/store`, `migrations`. `internal/store` imports nothing from this module. The root never touches `store.Queries`: loop files (`claim.go`, `worker.go`, `heartbeat.go`, `settle.go`, `scheduler.go`, `maint.go`, `listen.go`) and API files call `store.Store` methods only, and generated row types stop at the root's mapping functions (`jobRunFromStore`). Add other `internal/` packages only when a second import boundary actually exists; ask first. Do not pre-create empty files for later milestones.
+- Lock order: **`workflow_run → job_run`**. Claim and unstarted-node cancellation use
+  `FOR UPDATE SKIP LOCKED`; settle must not wait for additional cancellation candidates (§2.9).
+- Cancel running workflow nodes through parent state, never a batch UPDATE.
+  `cancel_requested` is plain-run only; preserve ordering and convergence in §2.4–§2.5.
+- Preserve atomic lease-loss/admission and separate lease/executor tracking (§2.3/§2.6).
+  Never wait for loops or executors under the tracking mutex.
+- Use DB time for DB comparisons; notifications are optional wakeups (§2.7).
+- Heartbeat/settle need independent bounded contexts. Follow shutdown/cleanup ordering
+  in §2.6/§2.8; no loops may start after shutdown.
 
-## Architecture
+## SQL changes
 
-1. State is in PostgreSQL only. `Start` checks `schema_version` and starts the loops; there is no startup reset of `running` rows. Startup database I/O runs outside `lifecycle` and is cancelled by shutdown; registration and loop startup are serialized with shutdown, and a query completing after shutdown must not start loops. Restart recovery is claim branch two; nothing else.
-2. `job_run` is the queue item, the lease and the record. `pending` rows wait on `run_at`, `running` rows expire on `lease_expires_at`; the two claim statements (§6.3) each use their own partial index, and the second runs only when the first did not fill the free slots. Do not add a zombie sweeper, a timeout scanner or a workflow advancer: reclaim is claim branch two, timeout is the ctx deadline plus the lease cap, advancement happens inside settle.
-   The claim and scan loops are event-driven (§6.11); `PollInterval` (default 5s) is only the backstop for a lost notification, a schedule changed elsewhere, and lease expiry. Wake sources: local events (`Trigger`, a scan that created runs, a freed slot → `wakeClaimer`; `Put` / `Delete` → `wakeScheduler`), NOTIFY from the two `notify_wake` triggers in `00001_init.sql` (channel = schema name, payload `run:<executor_type>` or `schedule`, routed by `listen.go`), and the next-due timer: after a round with room left the claimer reads `NextPendingAt` (one `idx_job_run_claim` probe per registered type), the scanner reads `NextScheduleAt` inside `ScanDue`, and both sleep `untilDue` = min(jittered poll, next − db_now) with a `wakeFloor` of 20ms. A full claim round does not read next-due (the slot release wakes it); a full scan batch rescans at once. Timers never compare the database clock with the local one. The listener is one hijacked pool connection per process that runs any loop; on any error it closes, counts `listener_reconnect_total`, waits a jittered poll and reconnects, and after every successful LISTEN it wakes both loops once. Notifications only shorten a wait: correctness never depends on one arriving.
-3. Heartbeat is one `UPDATE … FROM unnest` per process every `HeartbeatInterval`; it writes only `lease_expires_at`, capped at `started_at + timeout + CancelTimeout`, and its `RETURNING` carries `cancel_requested` and `wf_cancelling` back to the worker. Ids missing from the result mean the lease is gone: publish `dropped` and remove the lease under the same `inflight` mutex, then cancel that executor's ctx. Completion takes that mutex before inspecting `dropped`, so it cannot miss a lease-loss decision that won removal. The worker keeps two sets on purpose: `inflight` (leases it renews, matched by identity because a run id can already belong to a later attempt) and `active` (executor goroutines, keyed by lease token because an attempt that ignores cancellation and the next attempt this same process reclaimed share the run id); an executor that ignores cancellation leaves the first after `CancelTimeout` and the second only when it returns, which is what `Shutdown` reports as `ErrNotDrained`. Stopping the loops and checking shutdown plus registering an executor share the `inflight` mutex. Admission that loses to shutdown settles released; admission that wins is registered before shutdown can cancel its executors. Never wait for loops or executors while holding this mutex. `Shutdown` runs once: the first caller executes it, later callers wait on `shutDone` or their own ctx and never queue on `lifecycle` behind it. `heartbeatOnce` runs on `hbCtx`, bounded by `HeartbeatInterval`: only Shutdown step 6 cancels it, when `inflight` is already empty, so a heartbeat blocked on a row lock cannot hold `hb.Wait` past the host's budget.
-4. The lease token is the fence. Heartbeat and settle filter on `lease_token = $1 AND state = 'running'`; zero rows is `ErrLeaseLost`: roll back, drop the result, never retry, never report. `attempt` moves only here: reclaim adds 1 and appends an `interrupted` error, a failed settle adds 1, a graceful release or snooze keeps it, resume resets it to 0.
-5. Every §6 transaction is one `store.Store` method (`ClaimPending`, `ClaimExpired`, `Heartbeat`, `Settle`, `CancelRun`, `CancelWorkflow`, `Resume`, `ScanDue`, `PutSchedule`, `Retention`); a method opens, commits and rolls back its own transaction (`Store.tx`), and loops never compose SQL. `settle` (§6.5) is the only path out of `running`. `Snooze(delay)` requeues the same run at database `now() + delay` (positive, rounded up to microseconds), clears its lease, and preserves attempt, errors, params, output and dedup occupancy. Its returned output is ignored; context causes, explicit `Permanent`, cancellation and the lease fence still win. Workflow snoozes stay pending without propagating; external task ids and fixed business deadlines belong in a successful submit node's output (§12), not a new checkpoint field. A Succeeded output is checked in Go (non-empty must be valid JSON, within `MaxPayload`; nil and non-nil empty output both become SQL NULL); what jsonb still rejects (SQLSTATE class 22: a NUL escape, a number past numeric) comes back as `store.ErrInvalidOutput`, for any outcome, and the worker settles the same run again as failed with the database's reason. The errors entry goes through `encodeErr` first (invalid UTF-8 and NUL replaced, message capped at 4KB), so a permanent failure can always be recorded. A deterministic encode error never goes to reclaim. `ClaimExpired` caps `attempt` at 32767 (`LEAST`): a holder that dies at the cap must not overflow the smallint and fail the whole batch; the post-claim check settles it failed. It is one fenced UPDATE whose SET applies the cancel-hit CASE (`cancel_requested OR parent cancelling` → `cancelled`); for a node it runs after `SELECT … FROM workflow_run … FOR UPDATE`, and propagate and finalize happen in the same transaction. Propagate writes the fail-fast cancel for either failed or cancelled nodes before it reads the node states (unstarted siblings get upstream_failed or upstream_cancelled respectively): read first, a node claimed in between is counted as cancelled and the run finalised while it executes. `Runs.Cancel` is one UPDATE over both `pending` and `running` (§6.6): two statements, one per state, both match zero rows on a row that moves between them and would report success on a run left queued and unflagged. Retention's DELETEs repeat their conditions in the outer WHERE (§6.10): the subquery picks from the statement snapshot, and only the outer WHERE is re-checked on a row Resume just moved back to `running`. A conditional `UPDATE … WHERE state IN (…)` that touches zero rows means someone else already did it: return silently. §7.2 lists the only three meanings of zero rows; do not invent a fourth.
-6. Lock order is `workflow_run → job_run`, always. Claim and unstarted-node cancellation acquire candidates with `FOR UPDATE SKIP LOCKED`. A state predicate prevents an UPDATE, not necessarily a lock on a newly running tuple: PostgreSQL locks before rechecking it. A settle may wait for its own node, but never for additional cancellation candidates; heartbeat therefore cannot form the old x→z / z→x cycle. Skipped pending nodes cancel through the current or a later claim's parent check; claim rollback leaves them pending until an eligible worker claims them. Blocked nodes cannot be locked by another library transaction while cancellation holds the parent. Node cancellation is therefore expressed by the parent's `state = 'cancelling'` (seen through heartbeat `wf_cancelling` and the post-claim parent read), never by batch-writing running nodes. `cancel_requested` is for plain runs only.
-7. Run rows are snapshots. Execution, retry and backoff read `executor_type`, `params`, `timeout`, `retry_policy` from `job_run`; `workflow_run.dag` is the graph. The hot path never joins `job`, `workflow` or `workflow_node`. Dedup is the partial unique indexes plus target-less `ON CONFLICT DO NOTHING`; there is no slot table and no release step. A conflict whose in-flight run cannot be found any more (it finished between the INSERT and the lookup) repeats the INSERT, `dedupRounds` = 3 times, before answering `(0, ErrDuplicate)`. Names (job, workflow, schedule, executor type) are `validName`: non-empty, at most `maxNameLen` = 255 bytes, so dedup keys, `upstream_failed` messages and NOTIFY payloads stay bounded.
-8. Time comes from the database. Anything compared in SQL uses `now()`; the scheduler computes `next` from the `db_now` its scan returned (`Store.ScanDue` + `nextRun`, robfig/cron evaluated in the schedule's location); `Schedules.Put` selects `now()` first. `Timezone` is the only source of the location: `parseSchedule` rejects a `TZ=` / `CRON_TZ=` prefix (it would override it, and robfig panics on it without a space), `@every` (relative to the scan, not a grid) and the timezone `Local` (whichever host scans). The only local clock is the monotonic deadline for consecutive heartbeat failures, a `time.Time` moved by the heartbeat alone: a successful claim proves the database is reachable, not that the older leases were renewed. Retention (`Store.Maintain`) holds a session advisory lock on one dedicated connection and runs each step in its own short transaction: a long transaction would hold the xmin horizon back and defeat HOT pruning for the heartbeat. `maintainOnce` runs under the loop ctx, so Shutdown cancels the batch in flight instead of waiting for it (a claim or scan in flight is waited for, on its own 10s ctx); the unlock is bounded and a failed unlock closes the connection so the session lock cannot go back to the pool with it.
-9. Executors hold no connection. Claim, heartbeat and settle are millisecond transactions; `Concurrency` is slots, not connections, and the pool belongs to the host. Delivery is at-least-once; `Request.IdempotencyKey` (`run:<id>` / `wf:<wf_id>/<job_name>`) is the executor's contract, the library does not compensate.
-10. Errors are the §8 sentinels (`ErrNotFound`, `ErrDuplicate`, `ErrReferenced`, `ErrNotDrained`, `ErrNotResumable`) plus `ErrLeaseLost` internally; `Permanent(err)` marks non-retryable. `Cancel(err)` (§13) marks executor cancellation, preserves a sanitized `cancelled` reason without incrementing attempt, ignores output, and cancels the whole workflow via propagation when returned by a node. Context causes, lease fences and explicit Permanent win; Cancel precedes Snooze. `Runs.Resume` requeues only plain failed/cancelled runs with a fresh attempt budget and the same id, snapshot, history and dedup key; conditional UPDATE prevents concurrent reset of active runs, 23505 rolls back as ErrDuplicate, and success wakes the claimer. Nodes resume through Workflows.Resume only. Do not add sentinels or config fields the design does not have; every `Config` field must be read by code. A `RetryPolicy` takes the default only when it is the zero value; a partly filled one is validated as given.
+- Write named queries only in `internal/store/queries/` and DDL in `migrations/`.
+  Exceptions: dynamic `CREATE SCHEMA` in `Store.Migrate`, `LISTEN` in `Store.Listen`,
+  and test fixtures / EXPLAIN / pg_stat reads in `_test.go`. Each query's `-- name:`
+  line is followed by its design-section comment.
+- Use `Store.tx` for library transactions, including reads; caller-owned
+  transactions use `Store.inCallerTx`. Queries are unqualified. Set transaction-local
+  `search_path` to the quoted schema followed by `pg_temp`; never set it at pool or
+  connection scope. TriggerTx must restore the caller's path using a detached,
+  bounded context; restore failure must not be masked by `ErrDuplicate`.
+- Approved schema changes require a new `migrations/NNNNN_name.sql`, a
+  `schemaVersion` bump, updated design §1.2–§1.3 and regenerated sqlc output in the same
+  change. Migrations are embedded, versioned and advisory-locked; no down migrations
+  or migration CLI. Full DDL lives in migrations; design records the model and constraints.
+- Run `make sqlc` and include its output with query/migration changes. Never hand-edit
+  generated `internal/store/*.sql.go` or `models.go`. Keep SQL compatible with PG 13;
+  do not introduce `uuidv7()`, `MERGE` or `RETURNING old.*`.
+- Use `sqlc.yaml` for generator options and type mappings. Nullable values are
+  pointers; jsonb maps to `[]byte` internally and `RawJSON` at the public boundary.
+  Map `pgx.ErrNoRows` according to query semantics in store, then public errors via
+  `mapErr`; it is not uniformly `ErrNotFound`.
 
-## SQL
+sqlc 1.31 workarounds when editing queries:
 
-Every statement is a named query in `internal/store/queries/<table>.sql`, compiled by sqlc (`sqlc.yaml`: schema = `migrations/`, output `internal/store`, `pgx/v5`, `emit_methods_with_db_argument` so a `pgx.Tx` or the pool is passed per call, `emit_exported_queries` so tests can `EXPLAIN` the real text). Run `make sqlc` after editing a query or a migration and commit the output; `make lint` runs `sqlc diff`. Each query's `-- name:` line is followed by a comment naming the design section it implements. Generated types never appear in the public API; the root maps rows to `JobRun` / `WorkflowRun` / `Stats`. No SQL outside `internal/store/queries` and `migrations/`, with three exceptions: `CREATE SCHEMA` in `Store.Migrate` and `LISTEN` in `Store.Listen` (an identifier cannot be a parameter), and test fixtures, `EXPLAIN` and `pg_stat` reads in `_test.go`.
+- Multi-argument `unnest(a, b)` is unsupported by its catalog; use
+  `FROM (SELECT unnest(@ids::bigint[]) AS id, unnest(@tokens::uuid[]) AS token) v`.
+- When SQL guarantees a non-null UUID/timestamp, add `::uuid` / `::timestamptz` so
+  generated Go uses a value. Add `::boolean` / `::text` to expressions otherwise
+  inferred as `interface{}`. Do not repair generated types by hand.
 
-Schema handling: queries and migrations are unqualified. `Migrate` creates the configured schema, and every library transaction opens with `set_config('search_path', '<quoted schema>, pg_temp', true)` (the `SetSearchPath` query, transaction-local like `SET LOCAL`) through `Store.tx`, which reads also go through; nothing leaks to the host's other connections. `pg_temp` is listed last on purpose: a temporary schema that search_path does not name is searched before every schema it does, so a temp table called `job_run` in the host's session (TriggerTx, or left on a pooled connection) would otherwise take the library's writes. `TriggerTx` reads `current_setting('search_path')`, sets the local path, runs its statements and restores the old value before returning (`Store.inCallerTx`). The restore runs on `cleanupCtx` (detached from the caller's ctx, 5s; rollbacks and the maintenance unlock use the same): with the caller's ctx already cancelled pgx would not send it and the caller's transaction would go on inside the library's schema. A failed restore is returned alone, never masked by `ErrDuplicate`: the transaction cannot be trusted. Never `SET search_path` at connection or pool level.
+## Go changes
 
-sqlc 1.31 limits: multi-argument `unnest(a, b)` is unknown to its catalog, write `FROM (SELECT unnest(@ids::bigint[]) AS id, unnest(@tokens::uuid[]) AS token) v`. Nullable columns and parameters map to pointers (`*uuid.UUID`, `*time.Time`, `*int64`, `*string`); when a query guarantees the value (`lease_token` after `SET`, a fence `WHERE lease_token = @token`) add a `::uuid` / `::timestamptz` cast so the Go type is a value. Column `id` is renamed `Id` and `workflow_run_id` to `WorkflowRunId` (`sqlc.yaml` `rename`). `jsonb` is `[]byte` in generated code and becomes `RawJSON` at the root boundary. `:one` queries return `pgx.ErrNoRows` for "fence rejected" and "ON CONFLICT did nothing"; `store` maps those to `store.ErrLeaseLost` / `store.ErrDuplicate` and the root to its public sentinels (`mapErr`). A boolean or cast expression sqlc cannot type comes back as `interface{}`; add `::boolean` / `::text` until it does. Stay on PG 13 syntax: `gen_random_uuid()` is fine; `uuidv7()`, `MERGE`, `RETURNING old.*` are not. Settle and heartbeat use their own bounded ctx so a cancelled parent ctx cannot abort the write.
-
-Migrations are embedded SQL in `migrations/NNNNN_name.sql` (`migrations.FS`), applied in order by `Migrate` (`Store.Migrate`) under `pg_advisory_xact_lock` inside the configured schema, versions recorded in `schema_version`; no down migrations, no tool. `Start` refuses to run unless the applied version equals `schemaVersion`. `00001_init.sql` is design §3 without its `CREATE SCHEMA` / `SET search_path` lines (`Migrate` does those). A schema change = new migration file + bump `schemaVersion` + update design §3 + `make sqlc`, in the same change.
-
-## Go
-
-- `gofmt`. Tabs. Imports: stdlib, third party, this module.
 - Before writing Go, run the `use-modern-go` skill's `list` for the file and follow it.
-- Initialisms: `Id` / `Sql` / `Db` / `Dsn` / `Ttl`, not all-caps. Leave third-party and generated types alone.
-- Comments only when the code cannot say it: the design section a statement implements, a lock-order or fence rule, a deliberate deferral. No doc comments that restate the name.
-- Generics over `any` helper types. No DI frameworks. Runtime dependencies are `pgx/v5` and `robfig/cron/v3` only; sqlc is a build tool. Ask before adding a dependency.
-- JSON: `encoding/json/v2`; raw documents are `RawJSON` (= `jsontext.Value`), which is what design §8 means by `json.RawMessage`. Ids are `int64` from the identity columns; `lease_token` is stdlib `uuid.UUID`, generated by the database.
-- Log: `log/slog`. `e.log` is `Config.Logger.With("instance", owner)` from `New`, so never pass `instance` by hand; a run-scoped logger (`worker.go`) adds `run_id`, `job_name`, `attempt`. Metrics go through the `Config.Metrics` callback (§8.1: `Count` / `Gauge` / `Observe`, labels as key-value pairs, names listed in `metrics.go`), no metrics dependency; the gauges `pending_due`, `pending_oldest_age`, `unregistered_due` are `Stats()`, and `hot_update_ratio` is read from `pg_stat_user_tables` by the host.
+  Prefer stdlib and existing helpers; use generics rather than `any`-based helpers.
+- Imports: stdlib, third party, this module. Initialisms: `Id` / `Sql` / `Db` / `Dsn`
+  / `Ttl`; leave third-party and generated names unchanged.
+- Use `encoding/json/v2` and `RawJSON` (`jsontext.Value`), not legacy `json.RawMessage`.
+- Comments explain reasons, lock/fence rules or deferrals, not merely names or code.
+- No sentinels or Config fields outside the design; every Config field must be read.
+  Follow validation and control-result precedence in §3.1–§3.2.
 
-Use stdlib; replace old forms when you touch them:
+Use `log/slog` and existing loggers; `instance` is already attached by `New`.
+Metrics use `Config.Metrics`, names in `metrics.go` and semantics in §3.5, not a new dependency.
 
-- Errors: wrap `%w`; match with `errors.Is` / `errors.AsType[T]`.
-- Defaults: `cmp.Or`. `min` / `max` builtins. `for i := range n`. `new(value)` for pointers to literals.
-- `slices` / `maps` helpers (`slices.Sorted(maps.Keys(m))`), `strings.Cut*`.
-- `sync.OnceValue` / `OnceFunc`; `wg.Go`; typed atomics; `context.WithCancelCause` / `WithTimeoutCause` and `context.Cause` to tell timeout, cancel request, lease loss and shutdown apart.
-- Struct literals with embedded fields set promoted fields directly.
+## Tests and acceptance
 
-## Tests
+- Use stdlib `testing`, `t.Context()` and same-package `_test.go` files beside code.
+  Reuse existing fixtures; integration tests need real PG and isolated schemas.
+- Poll conditions, not fixed sleeps or cron boundaries. Measure wakeup executor entry
+  against `run_at` on the database clock, never host time against DB time.
+- Exercise real deterministic interleavings with row locks, not SQL-string assertions;
+  crashes need child processes. Cancellation must finish while claim is uncommitted;
+  check commit and rollback. Keep §2.9 races in `race_test.go` (1000 rounds, 100 under `-short`).
+- Use `t.Parallel()` with isolated schemas, except HOT, M5 and M7 measurements: run
+  these separately on a quiet database; worker processes may still run concurrently.
 
-- `_test.go` beside the code, same package, stdlib `testing`, `t.Context()`. Behavior suites are `reliability_test.go` (M2), `workflows_test.go` (M3), `schedules_maintenance_test.go` (M4), `wake_test.go` (M6), `cancel_resume_test.go` (§13), and `snooze_test.go` (M8, with crash/cancel coverage in the reliability and race suites); keep the milestone acceptance mapping in design §9. README has the source navigation defined in §8.3.
-- Tests are integration tests against a real PG: `SKEIN_TEST_DSN` (default `postgres:///postgres?host=/tmp`, the Homebrew socket); they skip when it is unreachable, unless `SKEIN_TEST_REQUIRE_DB` is set (`make test-ci`), then they fail. `freshSchema(t)` picks `skein_test_<random>`, runs `Migrate`, and drops the schema in cleanup, so tests run in parallel (`t.Parallel()`) without sharing state. `startEngine` registers, starts and shuts down at cleanup.
-- Shrink intervals with `fastConfig` (50 ms poll, 100 ms heartbeat, 400 ms lease, 1 s grace, 200 ms cancel timeout, 50 ms backoff); never sleep for a fixed time when `waitRun` / `waitFor` can poll. M6 tests use `slowPoll` (the same with a 5 s poll) so that only a wake source can explain a fast result, and measure the executor's entry on the database clock (`entryClock`) against `run_at`, never the host clock against the database's; `TestWakeTriggerRules` watches the triggers from a raw `store.Listen` connection. The HOT-ratio test spaces its heartbeats by a few ms and deliberately runs without `t.Parallel()`: HOT pruning needs the previous version to be older than every live snapshot, so it must measure a quiet database. The opt-in M5 baseline and planned M7 scenarios also run separately without `t.Parallel()`; worker processes still execute concurrently.
-- Each acceptance check in design §9 gets one focused test named after it. Concurrency rules (dedup, fence, reclaim, the §7.3 pairs including heartbeat vs fail-fast) get a test that exercises the race, not a unit test of the SQL string. The §7.3 pairs live in `race_test.go`, drive `store.Store` directly so both sides start together, and run 1000 rounds (100 under `-short`); a deadlock is SQLSTATE 40P01.
-- Schedule tests never wait for a cron boundary: `dueAt` moves `next_run_at` into the past (or a few hundred ms ahead, for the timer) and the scan fires it on the next wake or poll; `metricsRec` captures counters such as `schedule_skipped_total`.
-- The M5 baseline is `TestPerformanceBaseline` in `bench_test.go`, skipped unless `SKEIN_BENCH=1`; it starts three worker processes through the helper's bench mode (`SKEIN_HELPER_MODE=bench`) and appends a markdown report to `SKEIN_BENCH_OUT`. Re-run it after a change to claim, heartbeat or the storage parameters and add the numbers to `docs/baseline.md` with the same knobs.
-- Checks that need a crash run the second Engine in a child process: `TestMain` in `helper_test.go` turns the test binary into that process when `SKEIN_HELPER=1`, and `startHelper` launches and kills it. A second in-process Engine is enough when no crash is needed. A paused holder or a lease taken over is a raw-SQL fixture (`stealLease`, one statement so the holder cannot renew in between), never a sleep.
-- An interleaving inside another transaction (retention vs Resume, Cancel vs a settle) is deterministic, not rounds: the test holds the row `FOR UPDATE` in its own transaction, runs the operation under test on a pool with `application_name` set (`namedPool`), waits with `waitBlocked` until `pg_stat_activity` shows that backend waiting on a lock, changes the row, commits, then asserts. Cancellation vs claim tests instead require cancellation to finish while the claim remains uncommitted, then check both commit and rollback converge without running the executor. Retention in tests goes through `maintain`, which retries while another test holds the advisory lock (one per database, not per schema).
-- M1 asserts `EXPLAIN` uses `idx_job_run_claim` and `idx_job_run_running` for the two claim branches, and `n_tup_hot_upd / n_tup_upd > 0.95` for the heartbeat; if that ratio fails, fall back to the single-column `run_at` design named in §5, do not add storage parameters.
+Map each acceptance check in [README](README.md#验证判据) to a focused behavior test. Preserve claim-index
+EXPLAIN and heartbeat HOT > 95% checks; on HOT failure, follow the README fallback and
+approval process, not new storage parameters. After claim, heartbeat or storage-parameter
+changes, rerun M5 with the same knobs and record [baseline](docs/baseline.md) results.
+M5/M7 are opt-in; ordinary tests do not demonstrate their acceptance.

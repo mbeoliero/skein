@@ -21,7 +21,7 @@ func (e *Engine) heartbeatLoop(ctx context.Context) {
 }
 
 // heartbeatOnce renews every lease this process holds in one statement and brings
-// back cancel signals (§6.4). A lease the database no longer attributes to us is
+// back cancel signals (§2.3). A lease the database no longer attributes to us is
 // dropped: its ctx is cancelled and its result will not be reported. The statement is
 // bounded by HeartbeatInterval and derives from hbCtx, not the host's ctx: only
 // Shutdown step 6 cancels it, when inflight is already empty and nothing is left to
@@ -64,6 +64,7 @@ func (e *Engine) heartbeatOnce(ctx context.Context) {
 			continue
 		}
 		if r.CancelRequested || r.WfCancelling {
+			inf.cancelRequested.Store(true)
 			inf.cancel(errCancelRequested)
 		}
 	}

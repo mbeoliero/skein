@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -230,15 +232,15 @@ func TestDuplicateReturnsExistingId(t *testing.T) {
 
 	close(release)
 	waitRun(t, e, id, StateSucceeded)
-	// a terminal row frees the key
-	if next := trigger(t, e, "j", "", DedupKey("k")); next == id {
-		t.Fatalf("key still held after success")
+	// a terminal row keeps the key for the retention window (§2.1)
+	if again, err := e.Jobs().Trigger(t.Context(), "j", nil, DedupKey("k")); !errors.Is(err, ErrDuplicate) || again != id {
+		t.Fatalf("after success: id %d err %v, want %d ErrDuplicate", again, err, id)
 	}
 }
 
 // Concurrent Triggers with the same key: exactly one creates the run, every other
 // caller gets that id with ErrDuplicate (ON CONFLICT waits for the winner to commit,
-// and FindInflightRun reads a fresh snapshot).
+// and FindDedupRun reads a fresh snapshot).
 func TestConcurrentDedupCreatesOne(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
@@ -479,6 +481,80 @@ func TestDeclareRejectsPartialRetryAndLongNames(t *testing.T) {
 	}()
 }
 
+func TestRegisterSerializesLifecycle(t *testing.T) {
+	t.Parallel()
+	pool, schema := freshSchema(t)
+	e, err := New(pool, submitOnly(schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.lifecycle.Lock()
+	unlock := sync.OnceFunc(e.lifecycle.Unlock)
+	defer unlock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.Register("x", func(context.Context, *Request) (RawJSON, error) { return nil, nil })
+	}()
+	// Observe the actual mutex wait, not a scheduling delay before Register starts.
+	waitFor(t, "Register to wait on lifecycle", func() bool {
+		select {
+		case <-done:
+			t.Fatal("Register completed while lifecycle was locked")
+		default:
+		}
+		buf := make([]byte, 1<<20)
+		for _, stack := range strings.Split(string(buf[:runtime.Stack(buf, true)]), "\n\n") {
+			if strings.Contains(stack, "TestRegisterSerializesLifecycle.func") &&
+				strings.Contains(stack, "(*Engine).Register(") && strings.Contains(stack, "[sync.Mutex.Lock]") {
+				return true
+			}
+		}
+		return false
+	})
+	unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Register did not finish after lifecycle was unlocked")
+	}
+	if e.executors["x"] == nil {
+		t.Fatal("Register did not bind the executor")
+	}
+}
+
+func TestRegisterRejectsStartedOrShutdown(t *testing.T) {
+	t.Parallel()
+	for _, state := range []string{"started", "shutdown before start"} {
+		t.Run(state, func(t *testing.T) {
+			t.Parallel()
+			pool, schema := freshSchema(t)
+			e, err := New(pool, submitOnly(schema))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = e.Shutdown(context.Background()) })
+			if state == "started" {
+				err = e.Start(t.Context())
+			} else {
+				err = e.Shutdown(t.Context())
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if recover() == nil {
+					t.Error("Register accepted an executor after " + state)
+				}
+				if len(e.executors) != 0 {
+					t.Error("rejected registration mutated executors")
+				}
+			}()
+			e.Register("x", func(context.Context, *Request) (RawJSON, error) { return nil, nil })
+		})
+	}
+}
+
 // The typed Register must reject nil before wrapping it: the wrapper is never nil,
 // so the plain Register's check cannot see it and the panic would wait for a run.
 func TestTypedRegisterRejectsNil(t *testing.T) {
@@ -625,6 +701,81 @@ func TestTimeoutIsRetried(t *testing.T) {
 	es := errorsOf(t, run)
 	if run.Attempt != 2 || len(es) != 2 || es[0].Kind != "timeout" || es[1].Kind != "timeout" {
 		t.Fatalf("attempt %d errors %+v", run.Attempt, es)
+	}
+}
+
+// §1.3: first migrations racing on the same schema name all succeed. The advisory
+// lock has to cover CREATE SCHEMA: IF NOT EXISTS is not atomic on its own, and the
+// loser of that race would fail on the pg_namespace unique index.
+func TestConcurrentFirstMigrate(t *testing.T) {
+	t.Parallel()
+	pool := testPool(t)
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	schema := "skein_test_" + hex.EncodeToString(b[:])
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
+	})
+	errs := make([]error, 8)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Go(func() { errs[i] = Migrate(t.Context(), pool, schema) })
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("migrate %d: %v", i, err)
+		}
+	}
+	startEngine(t, pool, submitOnly(schema), nil) // Start proves the recorded version
+}
+
+// §3.3: Stats before Start may overlap with Register; it reads the published snapshot,
+// never the map being written. Meaningful under -race.
+func TestRegisterAndStatsConcurrentlyBeforeStart(t *testing.T) {
+	t.Parallel()
+	pool, schema := freshSchema(t)
+	e, err := New(pool, submitOnly(schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 16
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() {
+			e.Register("t"+itoa(int64(i)), func(context.Context, *Request) (RawJSON, error) { return nil, nil })
+		})
+		wg.Go(func() {
+			if _, err := e.Stats(t.Context()); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wg.Wait()
+	if got := e.registeredTypes(); len(got) != n || !slices.IsSorted(got) {
+		t.Fatalf("snapshot %v", got)
+	}
+}
+
+// §3.1: every input document is size-checked, the absent one included. MaxPayload 1
+// cannot hold the empty object, so a nil template or override is rejected like `{}`.
+func TestEmptyInputIsSizeChecked(t *testing.T) {
+	t.Parallel()
+	pool, schema := freshSchema(t)
+	cfg := submitOnly(schema)
+	cfg.MaxPayload = 1
+	tiny := startEngine(t, pool, cfg, nil)
+	if err := tiny.Jobs().Declare(t.Context(), JobSpec{Name: "j", ExecutorType: "x"}); err == nil {
+		t.Fatal("nil params template accepted under MaxPayload 1")
+	}
+	cfg.MaxPayload = 2
+	e := startEngine(t, pool, cfg, nil)
+	declare(t, e, JobSpec{Name: "j", ExecutorType: "x"})
+	trigger(t, e, "j", "")
+	if _, err := e.Jobs().Trigger(t.Context(), "j", RawJSON(`{"a":1}`)); err == nil {
+		t.Fatal("7-byte params accepted under MaxPayload 2")
 	}
 }
 

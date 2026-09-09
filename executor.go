@@ -5,9 +5,10 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"fmt"
+	"maps"
+	"slices"
 )
 
-// RawJSON is a raw JSON document; design §8 writes it as json.RawMessage.
 type RawJSON = jsontext.Value
 
 // Executor runs one invocation. Delivery is at-least-once: anything with external side
@@ -28,6 +29,8 @@ type Request struct {
 // Register binds an executor type to fn. It must run before Start; a duplicate
 // type panics, like http.Handle.
 func (e *Engine) Register(executorType string, fn Executor) {
+	e.lifecycle.Lock()
+	defer e.lifecycle.Unlock()
 	switch {
 	case fn == nil:
 		panic("skein: Register needs a function")
@@ -35,11 +38,17 @@ func (e *Engine) Register(executorType string, fn Executor) {
 		panic(validName("executor type", executorType).Error())
 	case e.started.Load():
 		panic("skein: Register after Start")
+	case e.shutting.Load():
+		panic("skein: Register after Shutdown")
 	}
 	if _, dup := e.executors[executorType]; dup {
 		panic(fmt.Sprintf("skein: executor %q registered twice", executorType))
 	}
 	e.executors[executorType] = fn
+	// Republish the sorted snapshot: Stats may run before Start, concurrently with
+	// Register, and must never walk the map while it is being written (§3.3).
+	types := slices.Sorted(maps.Keys(e.executors))
+	e.types.Store(&types)
 }
 
 // Register is the typed form: Params is decoded into P first; a decode failure is a

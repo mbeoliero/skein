@@ -19,7 +19,7 @@ type AdvanceScheduleParams struct {
 	Name      string
 }
 
-// §6.2: move the rule to its next fire time; does not touch updated_at and does not notify (§6.11)
+// §2.1: move the rule to its next fire time; does not touch updated_at and does not notify (§2.7)
 func (q *Queries) AdvanceSchedule(ctx context.Context, db DBTX, arg AdvanceScheduleParams) error {
 	_, err := db.Exec(ctx, AdvanceSchedule, arg.NextRunAt, arg.Name)
 	return err
@@ -29,7 +29,7 @@ const DbNow = `-- name: DbNow :one
 SELECT now()::timestamptz AS now
 `
 
-// §6.2 Schedules.Put computes next_run_at from the database clock
+// §2.1 Schedules.Put computes next_run_at from the database clock
 func (q *Queries) DbNow(ctx context.Context, db DBTX) (time.Time, error) {
 	row := db.QueryRow(ctx, DbNow)
 	var now time.Time
@@ -41,7 +41,7 @@ const DeleteSchedule = `-- name: DeleteSchedule :execrows
 DELETE FROM schedule WHERE name = $1
 `
 
-// §8 Schedules.Delete; zero rows = ErrNotFound; the schedule trigger notifies the scanners (§6.11)
+// §3.3 Schedules.Delete; zero rows = ErrNotFound; the schedule trigger notifies the scanners (§2.7)
 func (q *Queries) DeleteSchedule(ctx context.Context, db DBTX, name string) (int64, error) {
 	result, err := db.Exec(ctx, DeleteSchedule, name)
 	if err != nil {
@@ -54,7 +54,7 @@ const DisableSchedule = `-- name: DisableSchedule :exec
 UPDATE schedule SET enabled = false, updated_at = now() WHERE name = $1
 `
 
-// §6.2: the rule has no fire time within robfig's five-year horizon; a zero next_run_at would be due every tick
+// §2.1: the rule has no fire time within robfig's five-year horizon; a zero next_run_at would be due every tick
 func (q *Queries) DisableSchedule(ctx context.Context, db DBTX, name string) error {
 	_, err := db.Exec(ctx, DisableSchedule, name)
 	return err
@@ -79,7 +79,7 @@ type DueSchedulesRow struct {
 	DbNow        time.Time
 }
 
-// §6.2: due schedules, locked so two instances never fire the same one; db_now drives the next computation
+// §2.1: due schedules, locked so two instances never fire the same one; db_now drives the next computation
 func (q *Queries) DueSchedules(ctx context.Context, db DBTX, lim int32) ([]DueSchedulesRow, error) {
 	rows, err := db.Query(ctx, DueSchedules, lim)
 	if err != nil {
@@ -113,7 +113,7 @@ const GetSchedule = `-- name: GetSchedule :one
 SELECT name, job_name, workflow_name, cron, timezone, overlap, enabled, next_run_at, updated_at FROM schedule WHERE name = $1
 `
 
-// §8: read back one rule (tests and diagnostics)
+// §3.3: read back one rule (tests and diagnostics)
 func (q *Queries) GetSchedule(ctx context.Context, db DBTX, name string) (Schedule, error) {
 	row := db.QueryRow(ctx, GetSchedule, name)
 	var i Schedule
@@ -140,7 +140,7 @@ type NextScheduleAtRow struct {
 	DbNow   time.Time
 }
 
-// §6.2 / §6.11: the nearest fire time after this tick's advances, read in the same transaction; idx_schedule_due first entry.
+// §2.1 / §2.7: the nearest fire time after this tick's advances, read in the same transaction; idx_schedule_due first entry.
 // ErrNoRows = no enabled schedule. db_now is clock_timestamp(): now() is the transaction start, and the tick's own
 // work (up to 50 fires) would otherwise be waited for a second time
 func (q *Queries) NextScheduleAt(ctx context.Context, db DBTX) (NextScheduleAtRow, error) {
@@ -174,7 +174,7 @@ type PutScheduleParams struct {
 	NextRunAt    time.Time
 }
 
-// §6.2 Schedules.Put: upsert; next_run_at is recomputed only when the rule changed or the
+// §2.1 Schedules.Put: upsert; next_run_at is recomputed only when the rule changed or the
 // schedule went from disabled to enabled, so a rolling deploy does not keep postponing it
 func (q *Queries) PutSchedule(ctx context.Context, db DBTX, arg PutScheduleParams) error {
 	_, err := db.Exec(ctx, PutSchedule,

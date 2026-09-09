@@ -1,5 +1,5 @@
 // Package store is the persistence layer: the sqlc output in *.sql.go plus this file,
-// which holds one method per design §6 transaction. Nothing outside this package writes SQL.
+// which holds one method per design §2 transaction. Nothing outside this package writes SQL.
 package store
 
 import (
@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	// ErrLeaseLost: a fenced statement matched zero rows (§7.2). Roll back, drop, never retry.
+	// ErrLeaseLost: a fenced statement matched zero rows (§2.9). Roll back, drop, never retry.
 	ErrLeaseLost  = errors.New("store: lease lost")
 	ErrNotFound   = errors.New("store: not found")
 	ErrDuplicate  = errors.New("store: duplicate")
@@ -108,7 +108,7 @@ func (s *Store) inCallerTx(ctx context.Context, tx pgx.Tx, fn func(ctx context.C
 	return err
 }
 
-// ───────────── migrations (§6.9, §8) ─────────────
+// ───────────── migrations (§2.6, §1.3) ─────────────
 
 type Migration struct {
 	Version int
@@ -129,14 +129,17 @@ func (s *Store) Migrate(ctx context.Context, migrations []Migration) (err error)
 			_ = tx.Rollback(rctx)
 		}
 	}()
+	// The lock comes first so that it also serializes CREATE SCHEMA: IF NOT EXISTS is
+	// not atomic, and of two first migrations racing on the same name the loser would
+	// fail on the pg_namespace unique index (§1.3). The lock needs no search_path.
+	if err = s.q.MigrateLock(ctx, tx); err != nil {
+		return err
+	}
 	// The only SQL outside queries/: CREATE SCHEMA takes an identifier, not a parameter.
 	if _, err = tx.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+s.path); err != nil {
 		return err
 	}
 	if err = s.q.SetSearchPath(ctx, tx, s.searchPath); err != nil {
-		return err
-	}
-	if err = s.q.MigrateLock(ctx, tx); err != nil {
 		return err
 	}
 	current, err := s.schemaVersion(ctx, tx)
@@ -175,7 +178,7 @@ func (s *Store) schemaVersion(ctx context.Context, tx pgx.Tx) (int, error) {
 	return int(v), err
 }
 
-// ───────────── definitions (§6.1) ─────────────
+// ───────────── definitions (§2.1) ─────────────
 
 func (s *Store) DeclareJob(ctx context.Context, p DeclareJobParams) error {
 	return s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
@@ -199,11 +202,12 @@ func (s *Store) DeleteJob(ctx context.Context, name string) error {
 	})
 }
 
-// ───────────── submit (§6.1) ─────────────
+// ───────────── submit (§2.1) ─────────────
 
 // TriggerJob snapshots the job into a pending run. With tx == nil it uses its own
-// transaction; otherwise it runs inside the caller's. ErrDuplicate carries the id
-// of the in-flight run that holds the dedup key (0 if it finished meanwhile).
+// transaction; otherwise it runs inside the caller's. ErrDuplicate carries the id of
+// the run holding the dedup key: for a user key any run still in the retention
+// window, for an overlap=skip beat the in-flight one (0 if it vanished meanwhile).
 func (s *Store) TriggerJob(ctx context.Context, tx pgx.Tx, p TriggerJobParams) (id int64, err error) {
 	fn := func(ctx context.Context, tx pgx.Tx) error {
 		id, err = s.triggerJob(ctx, tx, p)
@@ -217,11 +221,22 @@ func (s *Store) TriggerJob(ctx context.Context, tx pgx.Tx, p TriggerJobParams) (
 	return id, err
 }
 
-// dedupRounds bounds the insert / lookup loop of a dedup conflict (§6.1): the run
-// holding the key can finish between the INSERT and the lookup, and then the key is
-// free again, so the INSERT is simply repeated. Three rounds cover a key that keeps
-// changing hands; after that ErrDuplicate carries id 0 and the caller retries.
+// dedupRounds bounds the insert / lookup loop of a dedup conflict (§2.1): the holder
+// can vanish between the INSERT and the lookup (a user key's run deleted by retention,
+// a skip beat that finished), and then the key is free again, so the INSERT is simply
+// repeated. Three rounds cover a key that keeps changing hands; after that
+// ErrDuplicate carries id 0 and the caller retries.
 const dedupRounds = 3
+
+// findDedupHolder looks up the run a conflicting INSERT collided with. The two
+// partial indexes are told apart by schedule_name (§1.3): only the scheduler writes
+// it, so a user key never matches a beat and the lookup mirrors the index it hit.
+func (s *Store) findDedupHolder(ctx context.Context, tx pgx.Tx, p TriggerJobParams) (int64, error) {
+	if p.ScheduleName == nil {
+		return s.q.FindDedupRun(ctx, tx, FindDedupRunParams{JobName: p.JobName, DedupKey: *p.DedupKey})
+	}
+	return s.q.FindInflightBeat(ctx, tx, FindInflightBeatParams{JobName: p.JobName, DedupKey: *p.DedupKey})
+}
 
 func (s *Store) triggerJob(ctx context.Context, tx pgx.Tx, p TriggerJobParams) (int64, error) {
 	for range dedupRounds {
@@ -242,7 +257,7 @@ func (s *Store) triggerJob(ctx context.Context, tx pgx.Tx, p TriggerJobParams) (
 		if p.DedupKey == nil {
 			return 0, ErrDuplicate // the (schedule_name, scheduled_at) index: that beat exists, nothing to look up
 		}
-		id, err = s.q.FindInflightRun(ctx, tx, FindInflightRunParams{JobName: p.JobName, DedupKey: *p.DedupKey})
+		id, err = s.findDedupHolder(ctx, tx, p)
 		if err == nil {
 			return id, ErrDuplicate
 		}
@@ -264,7 +279,7 @@ func (s *Store) GetJobRun(ctx context.Context, id int64) (r JobRun, err error) {
 	return r, err
 }
 
-// ───────────── claim (§6.3) ─────────────
+// ───────────── claim (§2.2) ─────────────
 
 // Claimed is what both claim branches hand to the worker.
 type Claimed ClaimPendingRow
@@ -293,25 +308,36 @@ func (s *Store) ClaimExpired(ctx context.Context, types []string, limit int, own
 	return out, err
 }
 
-// NextPendingAt is the nearest future run_at among types (§6.3 / §6.11): nil when
-// nothing is scheduled ahead. dbNow is the clock it was read against.
-func (s *Store) NextPendingAt(ctx context.Context, types []string) (next *time.Time, dbNow time.Time, err error) {
+// Due is the nearest future due time with the clocks it was read against (§2.7):
+// DbNow is clock_timestamp() from the same statement, Sampled the local clock when
+// that statement returned, taken inside the transaction so that the COMMIT round trip
+// is part of what the caller subtracts from its wait. Next is nil when nothing is ahead.
+type Due struct {
+	Next    *time.Time
+	DbNow   time.Time
+	Sampled time.Time
+}
+
+// NextPendingAt is the nearest future run_at among types (§2.2 / §2.7): Next is nil
+// when nothing is scheduled ahead.
+func (s *Store) NextPendingAt(ctx context.Context, types []string) (d Due, err error) {
 	err = s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		rows, err := s.q.NextPendingAt(ctx, tx, types)
+		d.Sampled = time.Now()
 		if err != nil {
 			return err
 		}
 		for _, r := range rows {
-			if next == nil || r.NextDue.Before(*next) {
-				next, dbNow = &r.NextDue, r.DbNow
+			if d.Next == nil || r.NextDue.Before(*d.Next) {
+				d.Next, d.DbNow = &r.NextDue, r.DbNow
 			}
 		}
 		return nil
 	})
-	return next, dbNow, err
+	return d, err
 }
 
-// ───────────── heartbeat (§6.4) ─────────────
+// ───────────── heartbeat (§2.3) ─────────────
 
 // Heartbeat renews every (id, token) pair in one statement; ids absent from the
 // result no longer belong to the caller.
@@ -323,7 +349,7 @@ func (s *Store) Heartbeat(ctx context.Context, ids []int64, tokens []uuid.UUID, 
 	return rows, err
 }
 
-// ───────────── settle (§6.5) ─────────────
+// ───────────── settle (§2.4) ─────────────
 
 type Outcome int
 
@@ -334,7 +360,7 @@ const (
 	Released    // graceful shutdown: pending again, attempt unchanged
 	Retry       // retryable failure with attempts left
 	Failed      // permanent failure or no attempts left
-	Interrupted // reclaimed with attempt >= max_attempts (§6.3 step 3)
+	Interrupted // reclaimed with attempt >= max_attempts (§2.2)
 	Snoozed     // normal waiting: pending later, attempt/errors/output unchanged
 )
 
@@ -357,7 +383,7 @@ type Settled struct {
 
 // Settle is the only path out of running. The fence is WHERE lease_token = $token AND
 // state = 'running'; zero rows is ErrLeaseLost and nothing is written. For a node the
-// parent row is locked first (lock order §7.3) and propagate runs in the same transaction.
+// parent row is locked first (lock order §2.9) and propagate runs in the same transaction.
 func (s *Store) Settle(ctx context.Context, st Settlement) (res Settled, err error) {
 	err = s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		var wfState string
@@ -442,7 +468,7 @@ func dataException(err error) (reason string, ok bool) {
 	return strings.TrimSpace(pgErr.Message + " " + pgErr.Detail), true
 }
 
-// ───────────── cancel (§6.6) ─────────────
+// ───────────── cancel (§2.5) ─────────────
 
 // ResumeRun never locks a workflow node; terminal state is rechecked by the UPDATE.
 func (s *Store) ResumeRun(ctx context.Context, id int64) error {

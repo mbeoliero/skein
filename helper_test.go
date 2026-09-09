@@ -14,8 +14,8 @@ import (
 )
 
 // The test binary doubles as the second OS process the design's multi-instance
-// checks need: with SKEIN_HELPER=1 it runs an engine whose executor never returns,
-// so the parent test can SIGKILL a live lease holder.
+// checks need: with SKEIN_HELPER=1 it runs an engine the parent can kill or pause
+// while it holds a real lease.
 func TestMain(m *testing.M) {
 	if os.Getenv("SKEIN_HELPER") == "1" {
 		helperMain()
@@ -45,12 +45,24 @@ func helperMain() {
 	if os.Getenv("SKEIN_HELPER_MODE") == "bench" {
 		cfg = benchWorkerConfig(os.Getenv("SKEIN_HELPER_SCHEMA"))
 	}
+	leaseMode := os.Getenv("SKEIN_HELPER_MODE") == "lease"
+	if leaseMode {
+		cfg = realLeaseConfig(cfg.Schema)
+	}
 	e, err := New(pool, cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "helper new:", err)
 		os.Exit(2)
 	}
-	e.Register("crash", func(ctx context.Context, req *Request) (RawJSON, error) { select {} })
+	executing := make(chan struct{})
+	e.Register("crash", func(ctx context.Context, req *Request) (RawJSON, error) {
+		if !leaseMode {
+			select {}
+		}
+		close(executing)
+		<-ctx.Done()
+		return RawJSON(`"stale"`), nil
+	})
 	if os.Getenv("SKEIN_HELPER_MODE") == "snooze" {
 		e.Register("snooze", func(ctx context.Context, req *Request) (RawJSON, error) {
 			return nil, Snooze(24 * time.Hour)
@@ -68,6 +80,25 @@ func helperMain() {
 		os.Exit(2)
 	}
 	fmt.Println("ready") // startHelper waits for this line: the engine is claiming
+	if leaseMode {
+		marker := os.Getenv("SKEIN_HELPER_MARKER")
+		report := func(state string) {
+			if err := os.WriteFile(marker, []byte(state), 0o600); err != nil {
+				fmt.Fprintln(os.Stderr, "helper marker:", err)
+				os.Exit(2)
+			}
+		}
+		<-executing
+		report("executing")
+		// A returned executor is not enough: wait until result handling has also
+		// completed before the parent checks that the new owner's row survived.
+		tick := time.NewTicker(20 * time.Millisecond)
+		defer tick.Stop()
+		for len(e.activeIds()) != 0 {
+			<-tick.C
+		}
+		report("drained")
+	}
 	select {}
 }
 

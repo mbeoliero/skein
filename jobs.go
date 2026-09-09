@@ -67,7 +67,7 @@ func validName(kind, name string) error {
 	return nil
 }
 
-// Declare upserts the definition by name (§6.1).
+// Declare upserts the definition by name (§2.1).
 func (j *Jobs) Declare(ctx context.Context, spec JobSpec) error {
 	if err := cmp.Or(validName("job", spec.Name), validName("executor type", spec.ExecutorType)); err != nil {
 		return err
@@ -122,8 +122,12 @@ type triggerOptions struct {
 // At delays the run: it becomes claimable at t.
 func At(t time.Time) TriggerOption { return func(o *triggerOptions) { o.at = &t } }
 
-// DedupKey deduplicates in-flight runs of the same job or workflow.
-// ErrDuplicate carries the existing id, or 0 after three contested rounds; retry on 0.
+// DedupKey makes Trigger idempotent within the retention window (§2.1): a later
+// Trigger of the same job or workflow with the same key returns the existing run's
+// id with ErrDuplicate, whatever its state, and ignores the new params. Retry a
+// finished run with Resume, not a new Trigger; the key is not an overlap guard, that
+// is a schedule's OverlapSkip. Id 0 with ErrDuplicate means the holder vanished
+// mid-call: retry.
 func DedupKey(k string) TriggerOption { return func(o *triggerOptions) { o.dedup = &k } }
 
 // Trigger creates one pending run of the job with params merged over the template.
@@ -157,10 +161,11 @@ func (j *Jobs) trigger(ctx context.Context, tx pgx.Tx, name string, params RawJS
 	return id, mapErr(err, name)
 }
 
-// objectPayload validates a params / input document: an object, within MaxPayload.
+// objectPayload validates a params / input document: an object within MaxPayload. An
+// absent document is the empty object and is checked like any other (§3.1).
 func (e *Engine) objectPayload(raw RawJSON) ([]byte, error) {
 	if len(raw) == 0 {
-		return []byte("{}"), nil
+		raw = RawJSON("{}")
 	}
 	if len(raw) > e.cfg.MaxPayload {
 		return nil, fmt.Errorf("%d bytes exceeds MaxPayload %d", len(raw), e.cfg.MaxPayload)

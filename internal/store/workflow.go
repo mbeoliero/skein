@@ -27,7 +27,7 @@ func parseDag(raw []byte) (Dag, error) {
 	return d, nil
 }
 
-// ───────────── definitions (§6.1) ─────────────
+// ───────────── definitions (§2.1) ─────────────
 
 // MissingJobs reports which of names have no job definition.
 func (s *Store) MissingJobs(ctx context.Context, names []string) (missing []string, err error) {
@@ -92,11 +92,11 @@ func (s *Store) DeleteWorkflow(ctx context.Context, name string) error {
 	})
 }
 
-// ───────────── submit (§6.1) ─────────────
+// ───────────── submit (§2.1) ─────────────
 
 // TriggerWorkflow snapshots the definition into a workflow_run plus one job_run per
 // node. With tx == nil it uses its own transaction. ErrDuplicate carries the id of the
-// in-flight run holding the dedup key (0 if it finished meanwhile).
+// run holding the dedup key, as TriggerJob describes (0 if it vanished meanwhile).
 func (s *Store) TriggerWorkflow(ctx context.Context, tx pgx.Tx, p TriggerWorkflowParams) (id int64, err error) {
 	fn := func(ctx context.Context, tx pgx.Tx) error {
 		id, err = s.triggerWorkflow(ctx, tx, p)
@@ -108,6 +108,15 @@ func (s *Store) TriggerWorkflow(ctx context.Context, tx pgx.Tx, p TriggerWorkflo
 		err = s.inCallerTx(ctx, tx, fn)
 	}
 	return id, err
+}
+
+// findWorkflowDedupHolder is findDedupHolder for workflow runs: schedule_name tells
+// the user-key index from the overlap=skip one (§1.3).
+func (s *Store) findWorkflowDedupHolder(ctx context.Context, tx pgx.Tx, p TriggerWorkflowParams) (int64, error) {
+	if p.ScheduleName == nil {
+		return s.q.FindDedupWorkflowRun(ctx, tx, FindDedupWorkflowRunParams{WorkflowName: p.WorkflowName, DedupKey: *p.DedupKey})
+	}
+	return s.q.FindInflightWorkflowBeat(ctx, tx, FindInflightWorkflowBeatParams{WorkflowName: p.WorkflowName, DedupKey: *p.DedupKey})
 }
 
 // triggerWorkflow fills p.Dag itself from the definition.
@@ -132,7 +141,7 @@ func (s *Store) triggerWorkflow(ctx context.Context, tx pgx.Tx, p TriggerWorkflo
 	}
 	var id int64
 	inserted := false
-	for range dedupRounds { // same loop as triggerJob (§6.1)
+	for range dedupRounds { // same loop as triggerJob (§2.1)
 		id, err = s.q.TriggerWorkflow(ctx, tx, p)
 		if err == nil {
 			inserted = true
@@ -144,7 +153,7 @@ func (s *Store) triggerWorkflow(ctx context.Context, tx pgx.Tx, p TriggerWorkflo
 		if p.DedupKey == nil {
 			return 0, ErrDuplicate
 		}
-		id, err = s.q.FindInflightWorkflowRun(ctx, tx, FindInflightWorkflowRunParams{WorkflowName: p.WorkflowName, DedupKey: *p.DedupKey})
+		id, err = s.findWorkflowDedupHolder(ctx, tx, p)
 		if err == nil {
 			return id, ErrDuplicate
 		}
@@ -190,7 +199,7 @@ func (s *Store) GetWorkflowRun(ctx context.Context, id int64) (w WorkflowRun, no
 	return w, nodes, err
 }
 
-// ───────────── claim, node side (§6.3 steps 2 and 4) ─────────────
+// ───────────── claim, node side (§2.2) ─────────────
 
 type NodeContext struct {
 	Cancelling bool // the parent is no longer running: settle cancelled, do not execute
@@ -228,7 +237,7 @@ func (s *Store) NodeContext(ctx context.Context, workflowRunId int64, jobName st
 	return nc, err
 }
 
-// ───────────── propagate and finalize (§6.5) ─────────────
+// ───────────── propagate and finalize (§2.4) ─────────────
 
 func terminal(state string) bool {
 	return state == "succeeded" || state == "failed" || state == "cancelled"
@@ -248,7 +257,7 @@ func (s *Store) propagate(ctx context.Context, tx pgx.Tx, wf int64, dag Dag, wfS
 		}
 	}
 	// Read after cancellation: a skipped claim may still show as pending. Neither
-	// pending nor running nodes can become terminal without this parent lock (§6.5).
+	// pending nor running nodes can become terminal without this parent lock (§2.4).
 	rows, err := s.q.NodeStates(ctx, tx, wf)
 	if err != nil {
 		return err
@@ -309,7 +318,7 @@ func finalState(states map[string]string, wfState string) (string, bool) {
 	return "succeeded", true
 }
 
-// ───────────── cancel (§6.6) ─────────────
+// ───────────── cancel (§2.5) ─────────────
 
 // CancelWorkflow ends unlocked unstarted nodes; skipped claims and running nodes
 // learn cancellation through the parent check or heartbeat. Repeated cancellation is a no-op.
@@ -343,7 +352,7 @@ func (s *Store) CancelWorkflow(ctx context.Context, id int64) error {
 	})
 }
 
-// ───────────── resume (§6.7) ─────────────
+// ───────────── resume (§2.5) ─────────────
 
 var ErrNotResumable = errors.New("store: run is not failed or cancelled")
 

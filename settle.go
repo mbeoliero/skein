@@ -30,7 +30,7 @@ const errMessageMax = 4096
 // encodeErr is the one place an errors entry is encoded. The message is the only
 // text the executor controls, and a failed attempt must always be recordable: a
 // document jsonb refuses would leave the row running until its lease expires and
-// turn a permanent failure into a retry (§6.5). Invalid UTF-8 and NUL are replaced
+// turn a permanent failure into a retry (§2.4). Invalid UTF-8 and NUL are replaced
 // (json/v2 rejects the first, jsonb the second), the text is cut to errMessageMax,
 // and an encode failure that survives that is recorded instead of ignored.
 func encodeErr(e errEntry) []byte {
@@ -52,7 +52,7 @@ func cleanMessage(s string) string {
 	return s
 }
 
-// settleResult turns what the executor returned into a settlement (§6.5).
+// settleResult turns what the executor returned into a settlement (§2.4).
 func (e *Engine) settleResult(log *slog.Logger, c store.Claimed, policy RetryPolicy, out RawJSON, err error, cause error, took time.Duration) {
 	attempt := int(c.Attempt) + 1
 	st := settlementFor(c, 0)

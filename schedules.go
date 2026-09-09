@@ -29,7 +29,7 @@ type ScheduleSpec struct {
 	Cron     string  // standard 5 fields, or @hourly / @daily / @weekly / @monthly; no TZ= prefix, no @every
 	Timezone string  // IANA name; default UTC. "Local" is rejected: it would mean whichever host scans
 	Overlap  Overlap // default OverlapSkip
-	Disabled bool    // design §8 Enabled = false; zero value is enabled
+	Disabled bool    // zero value leaves the schedule enabled (§2.1)
 }
 
 type Schedules struct{ e *Engine }
@@ -37,7 +37,7 @@ type Schedules struct{ e *Engine }
 func (e *Engine) Schedules() *Schedules { return &Schedules{e: e} }
 
 // Put upserts the rule. next_run_at is computed from the database clock and only
-// replaced when the cron or timezone changed or the schedule was re-enabled (§6.2).
+// replaced when the cron or timezone changed or the schedule was re-enabled (§2.1).
 func (s *Schedules) Put(ctx context.Context, spec ScheduleSpec) error {
 	if err := validName("schedule", spec.Name); err != nil {
 		return err
@@ -71,7 +71,7 @@ func (s *Schedules) Put(ctx context.Context, spec ScheduleSpec) error {
 	if err := mapErr(s.e.st.PutSchedule(ctx, p), cmp.Or(spec.Job, spec.Workflow)); err != nil {
 		return err
 	}
-	s.e.wakeScheduler() // other instances hear it through the schedule trigger (§6.11)
+	s.e.wakeScheduler() // other instances hear it through the schedule trigger (§2.7)
 	return nil
 }
 
@@ -120,7 +120,7 @@ func nextRun(spec, timezone string, after time.Time) (time.Time, error) {
 // the fields in loc: a local time that DST skips does not fire, and a local time that
 // DST repeats fires once per occurrence. It looks five years ahead and answers the
 // zero time beyond that ("0 0 31 2 *" never fires); that is an error here, because a
-// zero next_run_at would be due on every tick (§6.2). spec is for the message only.
+// zero next_run_at would be due on every tick (§2.1). spec is for the message only.
 func nextAfter(sched cron.Schedule, loc *time.Location, spec string, after time.Time) (time.Time, error) {
 	next := sched.Next(after.In(loc))
 	if next.IsZero() {

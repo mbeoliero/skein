@@ -15,7 +15,7 @@ import (
 	"github.com/mbeoliero/skein/internal/store"
 )
 
-// M2: multi-instance reliability (design §9). Fixtures that would need a paused
+// Multi-instance reliability acceptance checks. Fixtures that would need a paused
 // process or a clock are raw SQL on the test schema.
 
 func submitOnly(schema string) Config {
@@ -473,7 +473,7 @@ func TestShutdownReportsExecutorOfEarlierAttempt(t *testing.T) {
 }
 
 // A claimed run whose post-claim checks straddle Shutdown: run must not start an
-// executor that nothing would cancel; the row is settled released (§6.8 step 1).
+// executor that nothing would cancel; the row is settled released (§2.6 step 1).
 func TestRunAfterShutdownReleases(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
@@ -552,7 +552,7 @@ func TestCancelPendingRun(t *testing.T) {
 	}
 }
 
-// Cancel must recheck the new pending tuple after a retry or snooze commits (§6.6).
+// Cancel must recheck the new pending tuple after a retry or snooze commits (§2.5).
 func TestCancelSeesRunReleasedMeanwhile(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -822,32 +822,33 @@ func TestShutdownCancelsStart(t *testing.T) {
 	}
 }
 
-// §6.1: a winner can finish between INSERT and lookup. Exhausting all three
-// rounds permits (0, ErrDuplicate); this bounded trigger loop retries on its next round.
-func TestDedupWhileWinnersFinish(t *testing.T) {
+// §2.1: a user dedup key is held for the retention window, not only while the run is
+// in flight. Concurrent and later triggers all get the first run's id, even once it has
+// succeeded, and the params they carried are ignored.
+func TestDedupHoldsAfterFinish(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
 	e := startEngine(t, pool, fastConfig(schema), func(e *Engine) {
-		e.Register("quick", func(ctx context.Context, req *Request) (RawJSON, error) { return nil, nil })
+		e.Register("quick", func(ctx context.Context, req *Request) (RawJSON, error) { return req.Params, nil })
 	})
 	declare(t, e, JobSpec{Name: "j", ExecutorType: "quick"})
 	rounds := 300
 	if testing.Short() {
 		rounds = 50
 	}
-	var created, dups, ended atomic.Int32
+	var created, dups atomic.Int32
+	var winner atomic.Int64
 	var wg sync.WaitGroup
 	for range 4 {
 		wg.Go(func() {
-			for range rounds {
-				id, err := e.Jobs().Trigger(t.Context(), "j", nil, DedupKey("k"))
+			for i := range rounds {
+				id, err := e.Jobs().Trigger(t.Context(), "j", RawJSON(`{"n":`+itoa(int64(i))+`}`), DedupKey("k"))
 				switch {
 				case err == nil && id > 0:
 					created.Add(1)
+					winner.Store(id)
 				case errors.Is(err, ErrDuplicate) && id > 0:
 					dups.Add(1)
-				case errors.Is(err, ErrDuplicate) && id == 0:
-					ended.Add(1)
 				default:
 					t.Errorf("trigger: id %d err %v", id, err)
 					return
@@ -856,8 +857,14 @@ func TestDedupWhileWinnersFinish(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	t.Logf("created %d, duplicates %d, ended winners %d", created.Load(), dups.Load(), ended.Load())
-	if created.Load() == 0 || dups.Load() == 0 {
-		t.Errorf("both outcomes must occur for the test to mean anything: created %d duplicates %d", created.Load(), dups.Load())
+	if created.Load() != 1 || dups.Load() != int32(4*rounds-1) {
+		t.Fatalf("created %d, duplicates %d: a held key never frees mid-run", created.Load(), dups.Load())
+	}
+	run := waitRun(t, e, winner.Load(), StateSucceeded)
+	if id, err := e.Jobs().Trigger(t.Context(), "j", RawJSON(`{"n":-1}`), DedupKey("k")); !errors.Is(err, ErrDuplicate) || id != run.Id {
+		t.Fatalf("after success: id %d err %v, want %d ErrDuplicate", id, err, run.Id)
+	}
+	if again := waitRun(t, e, run.Id, StateSucceeded); string(again.Params) != string(run.Params) {
+		t.Fatalf("duplicate trigger changed params: %s -> %s", run.Params, again.Params)
 	}
 }

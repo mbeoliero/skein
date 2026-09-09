@@ -17,7 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// M5 performance baseline (design §9): three worker processes, 100k existing rows,
+// Performance baseline: three worker processes, 100k existing rows,
 // short and long tasks with 1 KB and 256 KB payloads. No SLA; it prints a markdown
 // report to compare against later. Gated because it takes a few minutes:
 //

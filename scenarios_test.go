@@ -1350,8 +1350,13 @@ func (h *scenarioHarness) dedup(rng *rand.Rand) {
 		h.t.Fatalf("duplicate: id=%d err=%v, want pending winner %d with ErrDuplicate", duplicate, err, id)
 	}
 	h.cancelRun(id)
-	p = scenarioPayload(rng, scenarioParams{Case: "dedup_after_terminal", Kind: "short", WorkMs: 5}, 1024)
-	h.drain([]int64{h.trigger("m7_short", "dedup", p, nil, DedupKey("smoke"))})
+	duplicate, err = h.e.Jobs().Trigger(h.ctx, "m7_short", scenarioJSON(p), DedupKey("smoke"))
+	h.record(map[string]any{"operation": "duplicate_after_terminal", "id": duplicate, "error": fmt.Sprint(err), "winner": id})
+	if !errors.Is(err, ErrDuplicate) || duplicate != id {
+		h.t.Fatalf("duplicate after terminal: id=%d err=%v, want cancelled holder %d with ErrDuplicate", duplicate, err, id)
+	}
+	p = scenarioPayload(rng, scenarioParams{Case: "dedup_new_key", Kind: "short", WorkMs: 5}, 1024)
+	h.drain([]int64{h.trigger("m7_short", "dedup", p, nil, DedupKey("smoke:new"))})
 }
 
 func (h *scenarioHarness) mixed(rng *rand.Rand) []int64 {

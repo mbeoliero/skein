@@ -1,4 +1,4 @@
--- design §3; the schema is created and selected by skein.Migrate
+-- Schema for design.md §1.2–§1.3; the schema is created and selected by skein.Migrate
 
 -- 迁移版本：Start 时校验，不匹配即拒绝启动
 CREATE TABLE schema_version (
@@ -59,7 +59,7 @@ CREATE TABLE workflow_run (
     workflow_name text NOT NULL,                               -- 弱引用
     schedule_name text,                                        -- 非空 = 定时触发
     scheduled_at  timestamptz,
-    dedup_key     text,                                        -- 在途唯一键；overlap = skip 时为 'sched:<schedule_name>'
+    dedup_key     text,                                        -- 用户键：保留窗口内唯一；overlap = skip 的拍为 'sched:<schedule_name>'，仅在途唯一
     input         jsonb NOT NULL DEFAULT '{}',                 -- 触发时传入，所有节点可读
     dag           jsonb NOT NULL DEFAULT '{}',                 -- {job_name: [dep_job_name, ...]}，创建时从 workflow_node 快照；推进、续跑、取前驱 output 都读它
     state         text NOT NULL CHECK (state IN ('running','cancelling','succeeded','failed','cancelled')),
@@ -69,7 +69,8 @@ CREATE TABLE workflow_run (
     CHECK ((schedule_name IS NULL) = (scheduled_at IS NULL)),
     CHECK (jsonb_typeof(input) = 'object' AND jsonb_typeof(dag) = 'object')
 );
-CREATE UNIQUE INDEX idx_workflow_run_dedup     ON workflow_run (workflow_name, dedup_key)   WHERE dedup_key IS NOT NULL AND state IN ('running','cancelling');
+CREATE UNIQUE INDEX idx_workflow_run_dedup     ON workflow_run (workflow_name, dedup_key)   WHERE dedup_key IS NOT NULL AND schedule_name IS NULL;      -- 用户键：不看 state，清理前不释放
+CREATE UNIQUE INDEX idx_workflow_run_overlap   ON workflow_run (workflow_name, dedup_key)   WHERE dedup_key IS NOT NULL AND schedule_name IS NOT NULL AND state IN ('running','cancelling');  -- skip 拍：只有扫描器写 schedule_name，终态释放
 CREATE UNIQUE INDEX idx_workflow_run_sched     ON workflow_run (schedule_name, scheduled_at) WHERE schedule_name IS NOT NULL;
 CREATE INDEX        idx_workflow_run_wf        ON workflow_run (workflow_name, id DESC);         -- 列表按 id 排序、游标翻页
 CREATE INDEX        idx_workflow_run_retention ON workflow_run (finished_at)                 WHERE finished_at IS NOT NULL;
@@ -81,7 +82,7 @@ CREATE TABLE job_run (
     job_name         text NOT NULL,                            -- 弱引用；节点实例也以它标识节点
     schedule_name    text,                                     -- 非空 = 定时触发（节点实例为空，计划信息在父 workflow_run 上）
     scheduled_at     timestamptz,
-    dedup_key        text,                                     -- 在途唯一键；overlap = skip 时为 'sched:<schedule_name>'
+    dedup_key        text,                                     -- 用户键：保留窗口内唯一；overlap = skip 的拍为 'sched:<schedule_name>'，仅在途唯一
     workflow_run_id  bigint REFERENCES workflow_run(id) ON DELETE CASCADE,  -- 非空 = 工作流节点实例；前驱在父行 dag 里
     -- 执行快照：创建时从 job 复制，params 已合并调用方覆盖；之后不读定义
     executor_type    text NOT NULL,
@@ -113,7 +114,8 @@ CREATE TABLE job_run (
 );
 CREATE INDEX        idx_job_run_claim     ON job_run (executor_type, run_at)        WHERE state = 'pending';   -- 到期领取
 CREATE INDEX        idx_job_run_running   ON job_run (executor_type)                WHERE state = 'running';   -- 僵尸扫描；running 行很少，lease_expires_at 在堆上过滤
-CREATE UNIQUE INDEX idx_job_run_dedup     ON job_run (job_name, dedup_key)          WHERE dedup_key IS NOT NULL AND state IN ('blocked','pending','running');
+CREATE UNIQUE INDEX idx_job_run_dedup     ON job_run (job_name, dedup_key)          WHERE dedup_key IS NOT NULL AND schedule_name IS NULL;      -- 用户键：不看 state，清理前不释放
+CREATE UNIQUE INDEX idx_job_run_overlap   ON job_run (job_name, dedup_key)          WHERE dedup_key IS NOT NULL AND schedule_name IS NOT NULL AND state IN ('pending','running');  -- skip 拍：计划实例不是节点，无 blocked；终态释放
 CREATE UNIQUE INDEX idx_job_run_sched     ON job_run (schedule_name, scheduled_at)  WHERE schedule_name IS NOT NULL;
 CREATE UNIQUE INDEX idx_job_run_node      ON job_run (workflow_run_id, job_name)    WHERE workflow_run_id IS NOT NULL;  -- FK 索引，兼作"载入本工作流全部节点"
 CREATE INDEX        idx_job_run_job       ON job_run (job_name, id DESC);               -- 列表按 id 排序、游标翻页
@@ -129,7 +131,7 @@ ALTER TABLE job_run SET (
     autovacuum_analyze_scale_factor = 0.02, autovacuum_analyze_threshold = 100
 );
 
--- ───────────── 唤醒（§6.11） ─────────────
+-- ───────────── 唤醒（§2.7） ─────────────
 -- pending 行出现（含 run_at 变化）或计划规则变化时通知本 schema 的监听者。通知在提交后投递，随事务回滚作废；
 -- 频道名 = schema 名，payload 区分领取与扫描。心跳只写 lease_expires_at，不在 OF 列表里，触发器不评估；
 -- 领取把 state 改成 running，WHEN 为假；AdvanceSchedule 只写 next_run_at，不通知

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,7 +14,7 @@ import (
 	"github.com/mbeoliero/skein/internal/store"
 )
 
-// M3: workflows (design §9). Executors record what they were handed so the tests can
+// Workflow acceptance checks. Executors record what they were handed so the tests can
 // check inputs, predecessor outputs and idempotency keys, not just final states.
 
 type recorder struct {
@@ -180,7 +181,7 @@ func TestWorkflowLinearRunsInOrder(t *testing.T) {
 
 // 100 parallel predecessors finish at the same time; the join runs exactly once. The
 // process has 100 slots and every predecessor waits until all of them are inside the
-// executor, so their settles really do race for the join (§9 M3).
+// executor, so their settles really do race for the join.
 func TestFanInActivatesOnce(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
@@ -282,7 +283,7 @@ func TestFailFastCancelsTheRest(t *testing.T) {
 
 // x fails while y, its pending sibling, is being claimed: the fail-fast cancel waits
 // for the claim's lock and skips y, so the node states must be read after it. Read
-// before, y counts as cancelled and the run ends failed with y executing (§6.5).
+// before, y counts as cancelled and the run ends failed with y executing (§2.4).
 func TestCancellationSkipsClaimInProgress(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -409,6 +410,54 @@ func TestCancelWorkflow(t *testing.T) {
 	}
 }
 
+func TestWorkflowResumeValidatesIdAndWakesClaimer(t *testing.T) {
+	t.Parallel()
+	pool, schema := freshSchema(t)
+	// No worker or listener can consume or manufacture a local wakeup.
+	e := startEngine(t, pool, submitOnly(schema), nil)
+	for _, id := range []int64{0, -1} {
+		t.Run(itoa(id), func(t *testing.T) {
+			if err := e.Workflows().Resume(t.Context(), id); err == nil ||
+				!strings.Contains(err.Error(), "id must be positive") {
+				t.Fatalf("Resume(%d): %v, want positive-id validation", id, err)
+			}
+		})
+	}
+	declare(t, e, JobSpec{Name: "x", ExecutorType: "x"})
+	declareWorkflow(t, e, WorkflowSpec{Name: "w", Nodes: []Node{{Job: "x"}}})
+	id := triggerWorkflow(t, e, "w", "")
+	if err := e.Workflows().CancelRun(t.Context(), id); err != nil {
+		t.Fatal(err)
+	}
+	<-e.wake // discard Trigger's local wakeup
+	if err := e.Workflows().Resume(t.Context(), id); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-e.wake:
+	default:
+		t.Fatal("successful Resume did not wake the local claimer")
+	}
+	run, err := e.Workflows().GetRun(t.Context(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.State != WorkflowRunning || nodeOf(t, run, "x").State != StatePending {
+		t.Fatalf("Resume did not commit: %+v", run)
+	}
+	if err := e.Workflows().Resume(t.Context(), id); !errors.Is(err, ErrNotResumable) {
+		t.Fatalf("Resume running workflow: %v", err)
+	}
+	if err := e.Workflows().Resume(t.Context(), id+1000); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Resume missing workflow: %v", err)
+	}
+	select {
+	case <-e.wake:
+		t.Fatal("failed Resume woke the local claimer")
+	default:
+	}
+}
+
 // Resume re-runs only the failed chain; succeeded nodes keep their start time and
 // output. b fails only once the test has seen d persisted as succeeded: a node still
 // inside its executor when the parent turns cancelling is settled cancelled through
@@ -471,7 +520,7 @@ func TestResumeRerunsFailedChain(t *testing.T) {
 
 // Concurrent workflow Triggers with the same key: one run, every other caller gets
 // its id with ErrDuplicate; a loser's INSERT waits for the winner to commit and
-// FindInflightWorkflowRun reads a fresh snapshot.
+// FindDedupWorkflowRun reads a fresh snapshot.
 func TestConcurrentWorkflowDedupCreatesOne(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
@@ -497,46 +546,109 @@ func TestConcurrentWorkflowDedupCreatesOne(t *testing.T) {
 	waitWorkflow(t, e, winner, WorkflowSucceeded)
 }
 
-// Resuming re-occupies the dedup key: an in-flight run with the same key wins.
+// Resume re-occupies the dedup key (§2.5). A user key is held by the resumed row
+// itself, so Resume never collides with it and a new Trigger keeps returning that row.
+// An overlap=skip beat is released at terminal state, so the next beat can start, and
+// the failed beat cannot come back while that one is in flight.
 func TestResumeRejectsDuplicateKey(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
 	gate := make(chan struct{})
-	var first sync.Once
-	var firstId int64
-	e := startEngine(t, pool, fastConfig(schema), func(e *Engine) {
-		e.Register("x", func(ctx context.Context, req *Request) (RawJSON, error) {
-			isFirst := false
-			first.Do(func() { firstId = *req.WorkflowRunId; isFirst = true })
-			if isFirst || *req.WorkflowRunId == firstId {
-				return nil, Permanent(errors.New("first run fails"))
+	failFirst := func() func(context.Context, *Request) (RawJSON, error) {
+		var calls atomic.Int32
+		return func(ctx context.Context, req *Request) (RawJSON, error) {
+			if calls.Add(1) == 1 {
+				return nil, Permanent(errors.New("first beat fails"))
 			}
 			<-gate
 			return nil, nil
-		})
+		}
+	}
+	e := startEngine(t, pool, fastConfig(schema), func(e *Engine) {
+		e.Register("fail", func(ctx context.Context, req *Request) (RawJSON, error) { return nil, Permanent(errors.New("always")) })
+		e.Register("beat_job", failFirst())
+		e.Register("beat_wf", failFirst())
 	})
-	declare(t, e, JobSpec{Name: "x", ExecutorType: "x"})
+	declare(t, e, JobSpec{Name: "x", ExecutorType: "fail"})
+	declare(t, e, JobSpec{Name: "yj", ExecutorType: "beat_job"})
+	declare(t, e, JobSpec{Name: "yw", ExecutorType: "beat_wf"})
 	declareWorkflow(t, e, WorkflowSpec{Name: "w", Nodes: []Node{{Job: "x"}}})
+	declareWorkflow(t, e, WorkflowSpec{Name: "v", Nodes: []Node{{Job: "yw"}}})
+
 	id1 := triggerWorkflow(t, e, "w", "", DedupKey("k"))
 	waitWorkflow(t, e, id1, WorkflowFailed)
-
-	id2 := triggerWorkflow(t, e, "w", "", DedupKey("k")) // terminal runs free the key
-	waitNode(t, e, id2, "x", StateRunning)
-	if again, err := e.Workflows().Trigger(t.Context(), "w", nil, DedupKey("k")); !errors.Is(err, ErrDuplicate) || again != id2 {
-		t.Errorf("third trigger: %d %v", again, err)
+	if again, err := e.Workflows().Trigger(t.Context(), "w", nil, DedupKey("k")); !errors.Is(err, ErrDuplicate) || again != id1 {
+		t.Errorf("trigger after failure: %d %v, want %d ErrDuplicate", again, err, id1)
 	}
-	if err := e.Workflows().Resume(t.Context(), id1); !errors.Is(err, ErrDuplicate) {
-		t.Errorf("resume while the key is held: %v", err)
+	if err := e.Workflows().Resume(t.Context(), id1); err != nil {
+		t.Fatalf("resume holding its own key: %v", err)
+	}
+	waitWorkflow(t, e, id1, WorkflowFailed)
+
+	for _, spec := range []ScheduleSpec{{Name: "pj", Job: "yj", Cron: yearly}, {Name: "pw", Workflow: "v", Cron: yearly}} {
+		if err := e.Schedules().Put(t.Context(), spec); err != nil {
+			t.Fatal(err)
+		}
+		dueAt(t, pool, schema, spec.Name, time.Now().Add(-2*time.Hour))
+	}
+	beats := func(schedule string) (ids []int64) {
+		t.Helper()
+		if schedule == "pj" {
+			for _, r := range scheduledRuns(t, e, schedule) {
+				ids = append(ids, r.Id)
+			}
+		} else {
+			page, _, err := e.Workflows().ListRuns(t.Context(), WorkflowRunFilter{WorkflowName: "v"}, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range page {
+				ids = append(ids, r.Id)
+			}
+		}
+		slices.Sort(ids)
+		return ids
+	}
+	waitFor(t, "first beats failed", func() bool {
+		pj, pw := beats("pj"), beats("pw")
+		if len(pj) != 1 || len(pw) != 1 {
+			return false
+		}
+		r, _ := e.Runs().Get(t.Context(), pj[0])
+		w, _ := e.Workflows().GetRun(t.Context(), pw[0])
+		return r != nil && r.State == StateFailed && w != nil && w.State == WorkflowFailed
+	})
+	beat1j, beat1w := beats("pj")[0], beats("pw")[0]
+	dueAt(t, pool, schema, "pj", time.Now().Add(-time.Hour))
+	dueAt(t, pool, schema, "pw", time.Now().Add(-time.Hour))
+	waitFor(t, "second beats created", func() bool { return len(beats("pj")) == 2 && len(beats("pw")) == 2 })
+	beat2j, beat2w := beats("pj")[1], beats("pw")[1]
+	waitRun(t, e, beat2j, StateRunning)
+	waitNode(t, e, beat2w, "yw", StateRunning)
+	if err := e.Runs().Resume(t.Context(), beat1j); !errors.Is(err, ErrDuplicate) {
+		t.Errorf("resume a beat while the next one runs: %v", err)
+	}
+	if err := e.Workflows().Resume(t.Context(), beat1w); !errors.Is(err, ErrDuplicate) {
+		t.Errorf("resume a workflow beat while the next one runs: %v", err)
+	}
+	if r := waitRun(t, e, beat1j, StateFailed); r.Attempt == 0 || r.FinishedAt == nil {
+		t.Errorf("rejected resume left a partial reset: %+v", r)
 	}
 	close(gate)
-	waitWorkflow(t, e, id2, WorkflowSucceeded)
-	if err := e.Workflows().Resume(t.Context(), id1); err != nil {
-		t.Errorf("resume after the key is free: %v", err)
+	waitRun(t, e, beat2j, StateSucceeded)
+	waitWorkflow(t, e, beat2w, WorkflowSucceeded)
+	if err := e.Runs().Resume(t.Context(), beat1j); err != nil {
+		t.Errorf("resume after the next beat finished: %v", err)
 	}
+	if err := e.Workflows().Resume(t.Context(), beat1w); err != nil {
+		t.Errorf("resume workflow after the next beat finished: %v", err)
+	}
+	waitRun(t, e, beat1j, StateSucceeded)
+	waitWorkflow(t, e, beat1w, WorkflowSucceeded)
 }
 
 // A node whose holder died while the workflow was cancelled: the reclaimer sees the
-// parent cancelling, settles the node cancelled and finalises the run (§6.3 step 2).
+// parent cancelling, settles the node cancelled and finalises the run (§2.2).
 func TestReclaimedNodeSeesCancellingParent(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)

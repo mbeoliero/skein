@@ -13,7 +13,7 @@ const CurrentSchemaVersion = `-- name: CurrentSchemaVersion :one
 SELECT coalesce(max(version), 0)::int AS version FROM schema_version
 `
 
-// §6.9: Start refuses to run unless this equals skein.schemaVersion
+// §2.6: Start refuses to run unless this equals skein.schemaVersion
 func (q *Queries) CurrentSchemaVersion(ctx context.Context, db DBTX) (int32, error) {
 	row := db.QueryRow(ctx, CurrentSchemaVersion)
 	var version int32
@@ -25,7 +25,7 @@ const RecordSchemaVersion = `-- name: RecordSchemaVersion :exec
 INSERT INTO schema_version (version) VALUES ($1)
 `
 
-// §8 Migrate: one row per applied migration, under pg_advisory_xact_lock
+// §1.3 Migrate: one row per applied migration, under pg_advisory_xact_lock
 func (q *Queries) RecordSchemaVersion(ctx context.Context, db DBTX, version int32) error {
 	_, err := db.Exec(ctx, RecordSchemaVersion, version)
 	return err

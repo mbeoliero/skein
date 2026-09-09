@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// listenLoop keeps the process's LISTEN connection alive (§6.11). Each payload is
+// listenLoop keeps the process's LISTEN connection alive (§2.7). Each payload is
 // routed to a loop: "run:<executor_type>" wakes the claimer when this process
 // registered that type, "schedule" wakes the scheduler, anything else wakes both.
 // Notifications only shorten a wait; a lost one costs at most a PollInterval, so an
@@ -45,7 +45,7 @@ func (e *Engine) listenLoop(ctx context.Context) {
 func (e *Engine) route(payload string) {
 	switch typ, ok := strings.CutPrefix(payload, "run:"); {
 	case ok:
-		if _, found := slices.BinarySearch(e.types, typ); found {
+		if _, found := slices.BinarySearch(e.registeredTypes(), typ); found {
 			e.wakeClaimer()
 		}
 	case payload == "schedule":

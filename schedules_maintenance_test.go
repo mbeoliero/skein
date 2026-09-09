@@ -12,7 +12,7 @@ import (
 	"github.com/mbeoliero/skein/internal/store"
 )
 
-// M4: schedules, retention, Stats and listing (design §9).
+// Schedules, retention, Stats and listing acceptance checks.
 
 type metricsRec struct {
 	mu     sync.Mutex
@@ -61,7 +61,7 @@ func dueAt(t *testing.T, pool *pgxpool.Pool, schema, name string, at time.Time) 
 	}
 }
 
-// maintain runs one §6.10 pass, retrying while another test's pass holds the advisory
+// maintain runs one §2.8 pass, retrying while another test's pass holds the advisory
 // lock, which is one per database, not per schema.
 func maintain(t *testing.T, e *Engine) {
 	t.Helper()
@@ -416,7 +416,7 @@ func TestRetentionKeepsNodesOfLiveWorkflows(t *testing.T) {
 
 // Retention races Resume on a workflow_run past the failed window: the DELETE picks the
 // row from its snapshot, waits for Resume's lock, and must re-check the row it then sees
-// (running again) instead of deleting it with all its nodes (§6.10, §7.3).
+// (running again) instead of deleting it with all its nodes (§2.8, §2.9).
 func TestRetentionSkipsResumedWorkflow(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
@@ -432,7 +432,7 @@ func TestRetentionSkipsResumedWorkflow(t *testing.T) {
 	execSql(t, pool, "UPDATE "+jr+" SET state = 'failed', finished_at = now() - interval '31 days' WHERE id = "+itoa(nodeOf(t, run, "a").Id))
 	execSql(t, pool, "UPDATE "+wr+" SET state = 'failed', finished_at = now() - interval '31 days' WHERE id = "+itoa(id))
 
-	// Resume's first statement, held while retention runs (§6.7)
+	// Resume's first statement, held while retention runs (§2.5)
 	tx, err := pool.Begin(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -462,7 +462,7 @@ func TestRetentionSkipsResumedWorkflow(t *testing.T) {
 }
 
 // A rule that stops producing fire times (robfig looks five years ahead) is disabled
-// by the scan instead of being due on every tick with a zero next_run_at (§6.2).
+// by the scan instead of being due on every tick with a zero next_run_at (§2.1).
 func TestScanDisablesScheduleWithoutNextFireTime(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)

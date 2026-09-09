@@ -12,7 +12,7 @@ import (
 	"github.com/mbeoliero/skein/internal/store"
 )
 
-// M6 (design §6.11): every check runs with a 5s PollInterval so that only a wake
+// Wakeup acceptance checks (design §2.7): every check runs with a 5s PollInterval so that only a wake
 // source (NOTIFY, a local event, or the next-due timer) can explain a fast result.
 // slowPoll is the fastConfig with the poll backstop pushed out of the way.
 func slowPoll(schema string) Config {
@@ -22,7 +22,7 @@ func slowPoll(schema string) Config {
 }
 
 // tight is the CI budget for one wake plus one or two round trips on a loaded local
-// machine: an upper bound, not the precision (design §9 M6; the distribution is the
+// machine: an upper bound, not the precision (README.md validation entry; the distribution is the
 // baseline's job).
 const tight = 300 * time.Millisecond
 
@@ -354,7 +354,7 @@ func TestListenerReconnects(t *testing.T) {
 	expectEntry(t, "after reconnect", entries, pool, schema, id)
 }
 
-// The wake trigger's firing rules (§3 / §6.11), observed on a raw LISTEN connection:
+// The wake trigger's firing rules (§1.3 / §2.7), observed on a raw LISTEN connection:
 // pending rows notify once per executor_type per transaction, heartbeat and claim
 // updates do not, a schedule Put and Delete do, an Advance does not, and a type too
 // long for a payload degrades to the broadcast wake instead of failing the insert.
@@ -403,7 +403,7 @@ func TestWakeTriggerRules(t *testing.T) {
 	collect("delete", "schedule")
 }
 
-// The next-due read is one idx_job_run_claim probe per type (§6.3), never a scan of
+// The next-due read is one idx_job_run_claim probe per type (§2.2), never a scan of
 // the pending backlog.
 func TestNextDueUsesClaimIndex(t *testing.T) {
 	t.Parallel()
@@ -441,18 +441,18 @@ func TestUntilDueSubtractsElapsedTime(t *testing.T) {
 	e := &Engine{cfg: Config{PollInterval: 5 * time.Second}}
 	dbNow := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
 	next := dbNow.Add(500 * time.Millisecond)
-	if got := e.untilDue(&next, dbNow, time.Now().Add(-200*time.Millisecond)); got < 250*time.Millisecond || got > 310*time.Millisecond {
+	if got := e.untilDue(store.Due{Next: &next, DbNow: dbNow, Sampled: time.Now().Add(-200 * time.Millisecond)}); got < 250*time.Millisecond || got > 310*time.Millisecond {
 		t.Errorf("wait %s, want about 300ms", got)
 	}
 	past := dbNow.Add(-time.Second)
-	if got := e.untilDue(&past, dbNow, time.Now()); got != wakeFloor {
+	if got := e.untilDue(store.Due{Next: &past, DbNow: dbNow, Sampled: time.Now()}); got != wakeFloor {
 		t.Errorf("due row: wait %s, want %s", got, wakeFloor)
 	}
-	if got := e.untilDue(nil, dbNow, time.Now()); got < 4*time.Second || got > 6*time.Second {
+	if got := e.untilDue(store.Due{DbNow: dbNow, Sampled: time.Now()}); got < 4*time.Second || got > 6*time.Second {
 		t.Errorf("nothing ahead: wait %s, want a jittered 5s", got)
 	}
 	far := dbNow.Add(time.Hour)
-	if got := e.untilDue(&far, dbNow, time.Now()); got > 6*time.Second {
+	if got := e.untilDue(store.Due{Next: &far, DbNow: dbNow, Sampled: time.Now()}); got > 6*time.Second {
 		t.Errorf("far ahead: wait %s, want capped by the poll", got)
 	}
 }

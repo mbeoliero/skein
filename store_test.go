@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"uuid"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mbeoliero/skein/internal/store"
 )
@@ -52,7 +54,10 @@ func (tx *queryThenTx) QueryRow(ctx context.Context, sql string, args ...any) pg
 	return rowThen{Row: tx.Tx.QueryRow(ctx, sql, args...), then: func() { tx.then(sql) }}
 }
 
-func TestDedupRoundsWhenWinnersFinish(t *testing.T) {
+// §2.1: a user key is held by terminal runs too, so the only way its holder vanishes
+// between the INSERT and the lookup is retention deleting the row. Each deleted winner
+// costs one more round; three rounds exhausted is (0, ErrDuplicate) and a plain retry works.
+func TestDedupRoundsWhenWinnersVanish(t *testing.T) {
 	t.Parallel()
 	for _, kind := range []string{"job", "workflow"} {
 		for _, ends := range []int{1, 3} {
@@ -62,7 +67,7 @@ func TestDedupRoundsWhenWinnersFinish(t *testing.T) {
 				e := startEngine(t, pool, submitOnly(schema), nil)
 				declare(t, e, JobSpec{Name: "j", ExecutorType: "x"})
 				create := func() (int64, error) { return e.Jobs().Trigger(t.Context(), "j", nil, DedupKey("k")) }
-				cancel := func(id int64) error { return e.Runs().Cancel(t.Context(), id) }
+				table := qualified(schema, "job_run")
 				triggerTx := func(tx pgx.Tx) (int64, error) {
 					return e.Jobs().TriggerTx(t.Context(), tx, "j", nil, DedupKey("k"))
 				}
@@ -71,10 +76,14 @@ func TestDedupRoundsWhenWinnersFinish(t *testing.T) {
 						t.Fatal(err)
 					}
 					create = func() (int64, error) { return e.Workflows().Trigger(t.Context(), "w", nil, DedupKey("k")) }
-					cancel = func(id int64) error { return e.Workflows().CancelRun(t.Context(), id) }
+					table = qualified(schema, "workflow_run")
 					triggerTx = func(tx pgx.Tx) (int64, error) {
 						return e.Workflows().TriggerTx(t.Context(), tx, "w", nil, DedupKey("k"))
 					}
+				}
+				vanish := func(id int64) error { // what retention does to a terminal holder (§2.8)
+					_, err := pool.Exec(t.Context(), "DELETE FROM "+table+" WHERE id = $1", id)
+					return err
 				}
 				winner, err := create()
 				if err != nil {
@@ -91,11 +100,11 @@ func TestDedupRoundsWhenWinnersFinish(t *testing.T) {
 					case store.TriggerJob, store.TriggerWorkflow:
 						inserts++
 						if inserts <= ends {
-							if err := cancel(winner); err != nil {
+							if err := vanish(winner); err != nil {
 								t.Fatal(err)
 							}
 						}
-					case store.FindInflightRun, store.FindInflightWorkflowRun:
+					case store.FindDedupRun, store.FindDedupWorkflowRun:
 						lookups++
 						if lookups < ends {
 							winner, err = create()
@@ -107,7 +116,7 @@ func TestDedupRoundsWhenWinnersFinish(t *testing.T) {
 				}}
 				id, err := triggerTx(wrapped)
 				if inserts != min(ends+1, 3) || lookups != ends {
-					t.Fatalf("inserts %d lookups %d after %d finished winners", inserts, lookups, ends)
+					t.Fatalf("inserts %d lookups %d after %d vanished winners", inserts, lookups, ends)
 				}
 				if ends == 3 {
 					if id != 0 || !errors.Is(err, ErrDuplicate) {
@@ -126,6 +135,73 @@ func TestDedupRoundsWhenWinnersFinish(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// commitTracer records when each COMMIT was sent: the fixture for "the local sample
+// was taken before the transaction committed" (§2.7).
+type commitTracer struct {
+	mu      sync.Mutex
+	commits []time.Time
+}
+
+func (c *commitTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.EqualFold(data.SQL, "commit") {
+		c.mu.Lock()
+		c.commits = append(c.commits, time.Now())
+		c.mu.Unlock()
+	}
+	return ctx
+}
+
+func (c *commitTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+func (c *commitTracer) last() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.commits[len(c.commits)-1]
+}
+
+// §2.7: the local clock behind a due wait is sampled when the statement returns, inside
+// the transaction, so the COMMIT round trip counts as elapsed time instead of being
+// added to the wait.
+func TestDueSampledBeforeCommit(t *testing.T) {
+	t.Parallel()
+	plain, schema := freshSchema(t)
+	e := startEngine(t, plain, submitOnly(schema), nil)
+	declare(t, e, JobSpec{Name: "j", ExecutorType: "x"})
+	trigger(t, e, "j", "", At(time.Now().Add(time.Hour)))
+	if err := e.Schedules().Put(t.Context(), ScheduleSpec{Name: "s", Job: "j", Cron: yearly}); err != nil {
+		t.Fatal(err)
+	}
+	tr := &commitTracer{}
+	cfg, err := pgxpool.ParseConfig(testDsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.Tracer = tr
+	traced, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(traced.Close)
+	st := store.Open(traced, schema)
+
+	before := time.Now()
+	due, err := st.NextPendingAt(t.Context(), []string{"x"})
+	if err != nil || due.Next == nil {
+		t.Fatalf("next pending: %+v %v", due, err)
+	}
+	if due.Sampled.Before(before) || !due.Sampled.Before(tr.last()) {
+		t.Errorf("pending sample %s not between statement return and commit %s", due.Sampled.Format(time.RFC3339Nano), tr.last().Format(time.RFC3339Nano))
+	}
+	before = time.Now()
+	sc, err := st.ScanDue(t.Context(), nextRun)
+	if err != nil || sc.Next == nil || len(sc.Fired) != 0 {
+		t.Fatalf("scan: %+v %v", sc, err)
+	}
+	if sc.Sampled.Before(before) || !sc.Sampled.Before(tr.last()) {
+		t.Errorf("schedule sample %s not between statement return and commit %s", sc.Sampled.Format(time.RFC3339Nano), tr.last().Format(time.RFC3339Nano))
 	}
 }
 
@@ -150,7 +226,7 @@ func TestCallerTxRestoresSearchPathAfterCancel(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	// QueryRow order: CurrentSearchPath, TriggerJob (conflict), JobExists, FindInflightRun; then the restore
+	// QueryRow order: CurrentSearchPath, TriggerJob (conflict), JobExists, FindDedupRun; then the restore
 	k := "k"
 	wtx := &cancelAfterTx{Tx: tx, cancel: cancel, after: 4}
 	id, err := store.Open(pool, schema).TriggerJob(ctx, wtx, store.TriggerJobParams{JobName: "j", Params: []byte("{}"), DedupKey: &k})

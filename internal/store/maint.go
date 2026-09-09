@@ -7,7 +7,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// ───────────── retention and checks (§6.10) ─────────────
+// ───────────── retention and checks (§2.8) ─────────────
 
 type Retention struct {
 	Succeeded time.Duration

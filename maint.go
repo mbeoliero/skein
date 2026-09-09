@@ -25,11 +25,11 @@ func (e *Engine) maintenanceLoop(ctx context.Context) {
 	}
 }
 
-// maintainOnce is §6.10: retention plus the stale-active check, on whichever instance
+// maintainOnce is §2.8: retention plus the stale-active check, on whichever instance
 // wins the advisory lock; skipped reports that another holder had it. A silent failure
 // is this job's biggest risk, so every step that fails is logged at error level and counted.
 // It runs under the loop ctx: a batch is its own short transaction, so Shutdown cancels
-// the one in flight instead of waiting for it (§6.8 step 1), unlike a claim.
+// the one in flight instead of waiting for it (§2.6 step 1), unlike a claim.
 func (e *Engine) maintainOnce(ctx context.Context) (skipped bool) {
 	mctx, cancel := context.WithTimeout(ctx, maintenanceTimeout)
 	defer cancel()
@@ -62,7 +62,7 @@ func (e *Engine) maintainOnce(ctx context.Context) (skipped bool) {
 	return false
 }
 
-// Stats is the §8 one-statement snapshot the host can scrape.
+// Stats is the §3.3 one-statement snapshot the host can scrape.
 type Stats struct {
 	PendingDue       int           // pending rows whose run_at has passed
 	Running          int           // rows holding a lease

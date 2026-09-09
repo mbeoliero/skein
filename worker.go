@@ -14,12 +14,13 @@ import (
 	"github.com/mbeoliero/skein/internal/store"
 )
 
-// inflight is one executor this process is responsible for renewing (§6.4).
+// inflight is one executor this process is responsible for renewing (§2.3).
 type inflight struct {
-	id      int64
-	token   uuid.UUID
-	cancel  context.CancelCauseFunc
-	dropped atomic.Bool // lease lost: the result must not be reported
+	id              int64
+	token           uuid.UUID
+	cancel          context.CancelCauseFunc
+	dropped         atomic.Bool // lease lost: the result must not be reported
+	cancelRequested atomic.Bool // context cause may already be fixed by timeout or shutdown
 }
 
 type inflightSet struct {
@@ -84,7 +85,7 @@ func (s *inflightSet) drain() {
 // dispatch takes a slot (never blocks: claimOnce only asked for free slots) and runs
 // the claimed row on its own goroutine. active tracks executor goroutines, which is
 // not the same set as inflight: a lease stops being renewed before its executor
-// necessarily returns (§6.4), and Shutdown reports the executors (§6.8 step 5). It is
+// necessarily returns (§2.3), and Shutdown reports the executors (§2.6 step 5). It is
 // keyed by lease token, not run id: an old attempt that ignores cancellation and the
 // new attempt this process reclaimed after its lease expired share the id.
 func (e *Engine) dispatch(c store.Claimed) {
@@ -94,7 +95,7 @@ func (e *Engine) dispatch(c store.Claimed) {
 		defer func() {
 			e.active.Delete(c.LeaseToken)
 			<-e.slots
-			e.wakeClaimer() // a free slot is a wake source (§6.11): throughput is not capped by the poll
+			e.wakeClaimer() // a free slot is a wake source (§2.7): throughput is not capped by the poll
 		}()
 		e.run(c)
 	})
@@ -117,7 +118,7 @@ func (e *Engine) run(c store.Claimed) {
 		WorkflowRunId: c.WorkflowRunId, IdempotencyKey: "run:" + strconv.FormatInt(c.Id, 10),
 	}
 
-	// §6.3 checks after the claim, before execution
+	// §2.2 checks after the claim, before execution
 	if c.CancelRequested {
 		e.settle(log, settlementFor(c, store.Cancelled))
 		return
@@ -157,7 +158,7 @@ func (e *Engine) run(c store.Claimed) {
 		e.settle(log, st)
 		return
 	}
-	// once the ctx ends, an executor that keeps running past CancelTimeout stops being renewed (§6.4)
+	// once the ctx ends, an executor that keeps running past CancelTimeout stops being renewed (§2.3)
 	var untrack atomic.Pointer[time.Timer]
 	stopAfter := context.AfterFunc(ctx, func() {
 		untrack.Store(time.AfterFunc(e.cfg.CancelTimeout, func() {
@@ -180,6 +181,9 @@ func (e *Engine) run(c store.Claimed) {
 	if inf.dropped.Load() {
 		log.Warn("result dropped: lease lost", "duration", time.Since(started))
 		return
+	}
+	if inf.cancelRequested.Load() {
+		cause = errCancelRequested
 	}
 	e.settleResult(log, c, policy, out, err, cause, time.Since(started))
 }

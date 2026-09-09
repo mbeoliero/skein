@@ -227,17 +227,16 @@ func TestRunResumeValidationDedupAndConcurrent(t *testing.T) {
 	if err := e.Runs().Resume(t.Context(), id); !errors.Is(err, ErrNotResumable) {
 		t.Fatalf("succeeded: %v", err)
 	}
-	old := trigger(t, e, "j", "", DedupKey("key"))
+	if dup, err := e.Jobs().Trigger(t.Context(), "j", nil, DedupKey("key")); !errors.Is(err, ErrDuplicate) || dup != id {
+		t.Fatalf("succeeded run keeps its key: id %d err %v, want %d ErrDuplicate", dup, err, id)
+	}
+	old := trigger(t, e, "j", "", DedupKey("key2"))
 	if err := e.Runs().Cancel(t.Context(), old); err != nil {
 		t.Fatal(err)
 	}
-	occupied := trigger(t, e, "j", "", DedupKey("key"))
-	if err := e.Runs().Resume(t.Context(), old); !errors.Is(err, ErrDuplicate) {
-		t.Fatalf("dedup: %v", err)
-	}
 	waitRun(t, e, old, StateCancelled)
-	if err := e.Runs().Cancel(t.Context(), occupied); err != nil {
-		t.Fatal(err)
+	if dup, err := e.Jobs().Trigger(t.Context(), "j", nil, DedupKey("key2")); !errors.Is(err, ErrDuplicate) || dup != old {
+		t.Fatalf("cancelled run keeps its key: id %d err %v, want %d ErrDuplicate", dup, err, old)
 	}
 	resume := func() error { return e.Runs().Resume(t.Context(), old) }
 	var ok, rejected int

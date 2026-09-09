@@ -13,7 +13,7 @@ import (
 	"github.com/mbeoliero/skein/internal/store"
 )
 
-// §7.3 lock-order checks: each pair of transactions that can touch the same rows runs
+// §2.9 lock-order checks: each pair of transactions that can touch the same rows runs
 // concurrently for many rounds; a deadlock surfaces as SQLSTATE 40P01. The pairs are
 // driven through Store directly so both sides start at the same instant.
 
@@ -245,7 +245,7 @@ func TestRaceSnoozeVsWorkflowCancellation(t *testing.T) {
 }
 
 // A heartbeat renewing two running nodes of one workflow races the fail-fast settle
-// of one of them: fail-fast must not wait for additional running rows (§7.3).
+// of one of them: fail-fast must not wait for additional running rows (§2.9).
 func TestRaceHeartbeatVsFailFast(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)

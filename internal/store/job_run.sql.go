@@ -21,10 +21,10 @@ UPDATE job_run
 RETURNING state
 `
 
-// §6.6 Runs.Cancel: plain runs only; a pending row ends now, a running row is flagged and its
+// §2.5 Runs.Cancel: plain runs only; a pending row ends now, a running row is flagged and its
 // holder settles it as cancelled after the next heartbeat. One statement for both states: a row
 // that a concurrent claim or settle moves between them is re-checked on its new version, so
-// zero rows keeps its §7.2 meaning (terminal, a node, or missing) and never means "moved".
+// zero rows keeps its §2.9 meaning (terminal, a node, or missing) and never means "moved".
 func (q *Queries) CancelRun(ctx context.Context, db DBTX, id int64) (string, error) {
 	row := db.QueryRow(ctx, CancelRun, id)
 	var state string
@@ -72,9 +72,9 @@ type ClaimExpiredRow struct {
 	WaitedSec       float64
 }
 
-// §6.3 branch two: running rows whose lease expired via idx_job_run_running; the previous holder counts as one interrupted attempt.
+// §2.2 branch two: running rows whose lease expired via idx_job_run_running; the previous holder counts as one interrupted attempt.
 // attempt is a smallint and max_attempts may be 32767: a holder that crashes at the cap would otherwise overflow the
-// next reclaim and fail the whole batch; capped, the post-claim check settles it failed (§6.3 step 3).
+// next reclaim and fail the whole batch; capped, the post-claim check settles it failed (§2.2).
 func (q *Queries) ClaimExpired(ctx context.Context, db DBTX, arg ClaimExpiredParams) ([]ClaimExpiredRow, error) {
 	rows, err := db.Query(ctx, ClaimExpired,
 		arg.Owner,
@@ -148,7 +148,7 @@ type ClaimPendingRow struct {
 	WaitedSec       float64
 }
 
-// §6.3 branch one: due pending rows via idx_job_run_claim
+// §2.2 branch one: due pending rows via idx_job_run_claim
 func (q *Queries) ClaimPending(ctx context.Context, db DBTX, arg ClaimPendingParams) ([]ClaimPendingRow, error) {
 	rows, err := db.Query(ctx, ClaimPending,
 		arg.Owner,
@@ -186,19 +186,37 @@ func (q *Queries) ClaimPending(ctx context.Context, db DBTX, arg ClaimPendingPar
 	return items, nil
 }
 
-const FindInflightRun = `-- name: FindInflightRun :one
+const FindDedupRun = `-- name: FindDedupRun :one
 SELECT id FROM job_run
- WHERE job_name = $1 AND dedup_key = $2::text AND state IN ('blocked', 'pending', 'running')
+ WHERE job_name = $1 AND dedup_key = $2::text AND schedule_name IS NULL
 `
 
-type FindInflightRunParams struct {
+type FindDedupRunParams struct {
 	JobName  string
 	DedupKey string
 }
 
-// §6.1: the run that holds the dedup key right now
-func (q *Queries) FindInflightRun(ctx context.Context, db DBTX, arg FindInflightRunParams) (int64, error) {
-	row := db.QueryRow(ctx, FindInflightRun, arg.JobName, arg.DedupKey)
+// §2.1: the run holding a user dedup key, terminal or not (idx_job_run_dedup)
+func (q *Queries) FindDedupRun(ctx context.Context, db DBTX, arg FindDedupRunParams) (int64, error) {
+	row := db.QueryRow(ctx, FindDedupRun, arg.JobName, arg.DedupKey)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
+const FindInflightBeat = `-- name: FindInflightBeat :one
+SELECT id FROM job_run
+ WHERE job_name = $1 AND dedup_key = $2::text AND schedule_name IS NOT NULL AND state IN ('pending', 'running')
+`
+
+type FindInflightBeatParams struct {
+	JobName  string
+	DedupKey string
+}
+
+// §2.1: the in-flight overlap=skip beat holding 'sched:<name>' (idx_job_run_overlap)
+func (q *Queries) FindInflightBeat(ctx context.Context, db DBTX, arg FindInflightBeatParams) (int64, error) {
+	row := db.QueryRow(ctx, FindInflightBeat, arg.JobName, arg.DedupKey)
 	var id int64
 	err := row.Scan(&id)
 	return id, err
@@ -208,7 +226,7 @@ const GetJobRun = `-- name: GetJobRun :one
 SELECT id, job_name, schedule_name, scheduled_at, dedup_key, workflow_run_id, executor_type, params, timeout, retry_policy, state, attempt, cancel_requested, run_at, lease_expires_at, lease_token, lease_owner, created_at, started_at, finished_at, output, errors FROM job_run WHERE id = $1
 `
 
-// §8 Runs.Get and the tests' state reads
+// §3.3 Runs.Get and the tests' state reads
 func (q *Queries) GetJobRun(ctx context.Context, db DBTX, id int64) (JobRun, error) {
 	row := db.QueryRow(ctx, GetJobRun, id)
 	var i JobRun
@@ -262,7 +280,7 @@ type HeartbeatRow struct {
 	WfCancelling    bool
 }
 
-// §6.4: one statement renews every lease this process holds; only lease_expires_at changes (HOT);
+// §2.3: one statement renews every lease this process holds; only lease_expires_at changes (HOT);
 // renewal is capped at started_at + timeout + CancelTimeout; ids missing from the result lost their lease
 func (q *Queries) Heartbeat(ctx context.Context, db DBTX, arg HeartbeatParams) ([]HeartbeatRow, error) {
 	rows, err := db.Query(ctx, Heartbeat,
@@ -304,7 +322,7 @@ type ListJobRunsParams struct {
 	Lim     int32
 }
 
-// §8 Runs.List: newest first, cursor = last id of the previous page, via idx_job_run_job
+// §3.3 Runs.List: newest first, cursor = last id of the previous page, via idx_job_run_job
 func (q *Queries) ListJobRuns(ctx context.Context, db DBTX, arg ListJobRunsParams) ([]JobRun, error) {
 	rows, err := db.Query(ctx, ListJobRuns,
 		arg.JobName,
@@ -367,7 +385,7 @@ type NextPendingAtRow struct {
 	DbNow   time.Time
 }
 
-// §6.3 / §6.11: the earliest pending run_at per registered type, one idx_job_run_claim probe each; the caller
+// §2.2 / §2.7: the earliest pending run_at per registered type, one idx_job_run_claim probe each; the caller
 // takes the minimum. Due rows are included on purpose: one that came due after the claim statement, or one
 // another instance's claim skipped and then rolled back, is found here and reclaimed after wakeFloor instead
 // of at the next poll. db_now is clock_timestamp(): now() would be the transaction start
@@ -399,7 +417,7 @@ UPDATE job_run
  WHERE id = $1 AND workflow_run_id IS NULL AND state IN ('failed', 'cancelled')
 `
 
-// §6.7 / §13: ordinary terminal runs only; recheck state after a concurrent resume.
+// §2.5: ordinary terminal runs only; recheck state after a concurrent resume.
 func (q *Queries) ResumeRun(ctx context.Context, db DBTX, id int64) (int64, error) {
 	result, err := db.Exec(ctx, ResumeRun, id)
 	if err != nil {
@@ -412,7 +430,7 @@ const RunIsNode = `-- name: RunIsNode :one
 SELECT (workflow_run_id IS NOT NULL)::boolean AS is_node FROM job_run WHERE id = $1
 `
 
-// §6.6 Runs.Cancel: a node is cancelled through its parent (Workflows.CancelRun), never directly
+// §2.5 Runs.Cancel: a node is cancelled through its parent (Workflows.CancelRun), never directly
 func (q *Queries) RunIsNode(ctx context.Context, db DBTX, id int64) (bool, error) {
 	row := db.QueryRow(ctx, RunIsNode, id)
 	var is_node bool
@@ -435,7 +453,7 @@ type SettleCancelledParams struct {
 	Token uuid.UUID
 }
 
-// §6.5 cancelled exit, same fence
+// §2.4 cancelled exit, same fence
 func (q *Queries) SettleCancelled(ctx context.Context, db DBTX, arg SettleCancelledParams) (string, error) {
 	row := db.QueryRow(ctx, SettleCancelled, arg.Err, arg.Id, arg.Token)
 	var state string
@@ -459,7 +477,7 @@ type SettleFailedParams struct {
 	Token        uuid.UUID
 }
 
-// §6.5 permanent failure or no attempts left
+// §2.4 permanent failure or no attempts left
 func (q *Queries) SettleFailed(ctx context.Context, db DBTX, arg SettleFailedParams) (string, error) {
 	row := db.QueryRow(ctx, SettleFailed,
 		arg.WfCancelling,
@@ -487,7 +505,7 @@ type SettleInterruptedParams struct {
 	Token        uuid.UUID
 }
 
-// §6.3 step 3: reclaimed with attempt >= max_attempts; the interrupted entry was appended by ClaimExpired
+// §2.2: reclaimed with attempt >= max_attempts; the interrupted entry was appended by ClaimExpired
 func (q *Queries) SettleInterrupted(ctx context.Context, db DBTX, arg SettleInterruptedParams) (string, error) {
 	row := db.QueryRow(ctx, SettleInterrupted, arg.WfCancelling, arg.Id, arg.Token)
 	var state string
@@ -518,7 +536,7 @@ type SettleReleasedRow struct {
 	ReleasedCount int32
 }
 
-// §6.5 / §6.8 graceful shutdown: back to pending now, attempt unchanged, a released entry for the alert
+// §2.4 / §2.6 graceful shutdown: back to pending now, attempt unchanged, a released entry for the alert
 func (q *Queries) SettleReleased(ctx context.Context, db DBTX, arg SettleReleasedParams) (SettleReleasedRow, error) {
 	row := db.QueryRow(ctx, SettleReleased,
 		arg.WfCancelling,
@@ -549,7 +567,7 @@ type SettleRetryParams struct {
 	Token        uuid.UUID
 }
 
-// §6.5 retryable failure with attempts left: pending again after backoff
+// §2.4 retryable failure with attempts left: pending again after backoff
 func (q *Queries) SettleRetry(ctx context.Context, db DBTX, arg SettleRetryParams) (string, error) {
 	row := db.QueryRow(ctx, SettleRetry,
 		arg.WfCancelling,
@@ -582,7 +600,7 @@ type SettleSnoozedParams struct {
 	Token        uuid.UUID
 }
 
-// §6.5 / §12: normal waiting, no attempt/error/output change; cancellation still wins.
+// §2.4 / §3.2: normal waiting, no attempt/error/output change; cancellation still wins.
 // Native interval input also handles PG 13; add the rounding remainder without Duration overflow.
 // sqlc.arg avoids sqlc 1.31's @ rewrite bug around this interval CASE.
 func (q *Queries) SettleSnoozed(ctx context.Context, db DBTX, arg SettleSnoozedParams) (string, error) {
@@ -613,10 +631,10 @@ type SettleSucceededParams struct {
 	Token  uuid.UUID
 }
 
-// §6.5 settle: one fenced UPDATE per outcome; WHERE lease_token = @token::uuid AND state = 'running' is the fence,
+// §2.4 settle: one fenced UPDATE per outcome; WHERE lease_token = @token::uuid AND state = 'running' is the fence,
 // ErrNoRows = ErrLeaseLost. Non-terminal outcomes apply the cancel-hit CASE:
 // cancel_requested OR @wf_cancelling → cancelled instead of pending / failed.
-// §6.5 succeeded exit; the fence is lease_token AND state = 'running', zero rows = ErrLeaseLost
+// §2.4 succeeded exit; the fence is lease_token AND state = 'running', zero rows = ErrLeaseLost
 func (q *Queries) SettleSucceeded(ctx context.Context, db DBTX, arg SettleSucceededParams) (string, error) {
 	row := db.QueryRow(ctx, SettleSucceeded, arg.Output, arg.Id, arg.Token)
 	var state string
@@ -643,7 +661,7 @@ type TriggerJobParams struct {
 	JobName      string
 }
 
-// §6.1 Jobs.Trigger: snapshot the job into a pending run; ErrNoRows = job missing or dedup conflict
+// §2.1 Jobs.Trigger: snapshot the job into a pending run; ErrNoRows = job missing or dedup conflict
 func (q *Queries) TriggerJob(ctx context.Context, db DBTX, arg TriggerJobParams) (int64, error) {
 	row := db.QueryRow(ctx, TriggerJob,
 		arg.DedupKey,

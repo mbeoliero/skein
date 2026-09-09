@@ -1,6 +1,6 @@
 package skein
 
-// Metrics receives the §8.1 measurements; the host adapts it to Prometheus or OTel.
+// Metrics receives the §3.5 measurements; the host adapts it to Prometheus or OTel.
 // Labels are alternating key, value pairs. Counters: lease_lost_total, reclaim_total,
 // released_alert_total, schedule_skipped_total{reason}, retention_deleted_total{table},
 // maintenance_failures_total{step}, listener_reconnect_total. Observations in seconds: claim_latency,

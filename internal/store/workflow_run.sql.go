@@ -20,7 +20,7 @@ type ActivateNodesParams struct {
 	JobNames      []string
 }
 
-// §6.5 propagate: blocked nodes whose predecessors all succeeded
+// §2.4 propagate: blocked nodes whose predecessors all succeeded
 func (q *Queries) ActivateNodes(ctx context.Context, db DBTX, arg ActivateNodesParams) (int64, error) {
 	result, err := db.Exec(ctx, ActivateNodes, arg.WorkflowRunId, arg.JobNames)
 	if err != nil {
@@ -43,7 +43,7 @@ type CancelUnstartedNodesParams struct {
 	WorkflowRunId int64
 }
 
-// §6.5 / §6.6 / §7.3: never wait for a claim or heartbeat on a newly running version;
+// §2.4 / §2.5 / §2.9: never wait for a claim or heartbeat on a newly running version;
 // skipped pending nodes observe the cancelling parent after this or a later claim
 func (q *Queries) CancelUnstartedNodes(ctx context.Context, db DBTX, arg CancelUnstartedNodesParams) (int64, error) {
 	result, err := db.Exec(ctx, CancelUnstartedNodes, arg.Err, arg.WorkflowRunId)
@@ -62,25 +62,43 @@ type FinalizeWorkflowRunParams struct {
 	Id    int64
 }
 
-// §6.5 finalize: every node terminal, the run takes succeeded / failed / cancelled
+// §2.4 finalize: every node terminal, the run takes succeeded / failed / cancelled
 func (q *Queries) FinalizeWorkflowRun(ctx context.Context, db DBTX, arg FinalizeWorkflowRunParams) error {
 	_, err := db.Exec(ctx, FinalizeWorkflowRun, arg.State, arg.Id)
 	return err
 }
 
-const FindInflightWorkflowRun = `-- name: FindInflightWorkflowRun :one
+const FindDedupWorkflowRun = `-- name: FindDedupWorkflowRun :one
 SELECT id FROM workflow_run
- WHERE workflow_name = $1 AND dedup_key = $2::text AND state IN ('running', 'cancelling')
+ WHERE workflow_name = $1 AND dedup_key = $2::text AND schedule_name IS NULL
 `
 
-type FindInflightWorkflowRunParams struct {
+type FindDedupWorkflowRunParams struct {
 	WorkflowName string
 	DedupKey     string
 }
 
-// §6.1: the workflow run holding the dedup key right now (returned with ErrDuplicate)
-func (q *Queries) FindInflightWorkflowRun(ctx context.Context, db DBTX, arg FindInflightWorkflowRunParams) (int64, error) {
-	row := db.QueryRow(ctx, FindInflightWorkflowRun, arg.WorkflowName, arg.DedupKey)
+// §2.1: the workflow run holding a user dedup key, terminal or not (idx_workflow_run_dedup)
+func (q *Queries) FindDedupWorkflowRun(ctx context.Context, db DBTX, arg FindDedupWorkflowRunParams) (int64, error) {
+	row := db.QueryRow(ctx, FindDedupWorkflowRun, arg.WorkflowName, arg.DedupKey)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
+const FindInflightWorkflowBeat = `-- name: FindInflightWorkflowBeat :one
+SELECT id FROM workflow_run
+ WHERE workflow_name = $1 AND dedup_key = $2::text AND schedule_name IS NOT NULL AND state IN ('running', 'cancelling')
+`
+
+type FindInflightWorkflowBeatParams struct {
+	WorkflowName string
+	DedupKey     string
+}
+
+// §2.1: the in-flight overlap=skip beat holding 'sched:<name>' (idx_workflow_run_overlap)
+func (q *Queries) FindInflightWorkflowBeat(ctx context.Context, db DBTX, arg FindInflightWorkflowBeatParams) (int64, error) {
+	row := db.QueryRow(ctx, FindInflightWorkflowBeat, arg.WorkflowName, arg.DedupKey)
 	var id int64
 	err := row.Scan(&id)
 	return id, err
@@ -90,7 +108,7 @@ const GetWorkflowRun = `-- name: GetWorkflowRun :one
 SELECT id, workflow_name, schedule_name, scheduled_at, dedup_key, input, dag, state, created_at, finished_at FROM workflow_run WHERE id = $1
 `
 
-// §6.7 Resume and §8: the parent row alone
+// §2.5 Resume and §3.3: the parent row alone
 func (q *Queries) GetWorkflowRun(ctx context.Context, db DBTX, id int64) (WorkflowRun, error) {
 	row := db.QueryRow(ctx, GetWorkflowRun, id)
 	var i WorkflowRun
@@ -124,7 +142,7 @@ type InsertNodeRunParams struct {
 	State         string
 }
 
-// §6.1 step 3: one job_run per node, blocked while it has predecessors
+// §2.1: one job_run per node, blocked while it has predecessors
 func (q *Queries) InsertNodeRun(ctx context.Context, db DBTX, arg InsertNodeRunParams) error {
 	_, err := db.Exec(ctx, InsertNodeRun,
 		arg.JobName,
@@ -153,7 +171,7 @@ type ListWorkflowRunsParams struct {
 	Lim          int32
 }
 
-// §8 Workflows.ListRuns: newest first, cursor = last id of the previous page, via idx_workflow_run_wf
+// §3.3 Workflows.ListRuns: newest first, cursor = last id of the previous page, via idx_workflow_run_wf
 func (q *Queries) ListWorkflowRuns(ctx context.Context, db DBTX, arg ListWorkflowRunsParams) ([]WorkflowRun, error) {
 	rows, err := db.Query(ctx, ListWorkflowRuns,
 		arg.WorkflowName,
@@ -199,7 +217,7 @@ type LockWorkflowRunRow struct {
 	Dag   []byte
 }
 
-// §6.5 / §6.7: first link of the lock order workflow_run → job_run
+// §2.4 / §2.5: first link of the lock order workflow_run → job_run
 func (q *Queries) LockWorkflowRun(ctx context.Context, db DBTX, id int64) (LockWorkflowRunRow, error) {
 	row := db.QueryRow(ctx, LockWorkflowRun, id)
 	var i LockWorkflowRunRow
@@ -211,7 +229,7 @@ const MarkWorkflowCancelling = `-- name: MarkWorkflowCancelling :execrows
 UPDATE workflow_run SET state = 'cancelling' WHERE id = $1 AND state = 'running'
 `
 
-// §6.5 / §6.6: fail-fast and Workflows.Cancel: running → cancelling; 0 rows = already cancelling or terminal
+// §2.4 / §2.5: fail-fast and Workflows.Cancel: running → cancelling; 0 rows = already cancelling or terminal
 func (q *Queries) MarkWorkflowCancelling(ctx context.Context, db DBTX, id int64) (int64, error) {
 	result, err := db.Exec(ctx, MarkWorkflowCancelling, id)
 	if err != nil {
@@ -235,7 +253,7 @@ type NodeOutputsRow struct {
 	Output  []byte
 }
 
-// §6.3 post-claim step 4: the direct predecessors' outputs for Request.Deps
+// §2.2 post-claim: the direct predecessors' outputs for Request.Deps
 func (q *Queries) NodeOutputs(ctx context.Context, db DBTX, arg NodeOutputsParams) ([]NodeOutputsRow, error) {
 	rows, err := db.Query(ctx, NodeOutputs, arg.WorkflowRunId, arg.JobNames)
 	if err != nil {
@@ -265,7 +283,7 @@ type NodeStatesRow struct {
 	State   string
 }
 
-// §6.5 / §6.7: propagate / finalize / resume view of the workflow, via idx_job_run_node
+// §2.4 / §2.5: propagate / finalize / resume view of the workflow, via idx_job_run_node
 func (q *Queries) NodeStates(ctx context.Context, db DBTX, workflowRunID int64) ([]NodeStatesRow, error) {
 	rows, err := db.Query(ctx, NodeStates, workflowRunID)
 	if err != nil {
@@ -290,7 +308,7 @@ const ReopenWorkflowRun = `-- name: ReopenWorkflowRun :exec
 UPDATE workflow_run SET state = 'running', finished_at = NULL WHERE id = $1
 `
 
-// §6.7: back to running; the dedup index may reject it with 23505 → ErrDuplicate
+// §2.5: back to running; the dedup index may reject it with 23505 → ErrDuplicate
 func (q *Queries) ReopenWorkflowRun(ctx context.Context, db DBTX, id int64) error {
 	_, err := db.Exec(ctx, ReopenWorkflowRun, id)
 	return err
@@ -310,7 +328,7 @@ type ResumeNodesParams struct {
 	States        []string
 }
 
-// §6.7: the reset set goes back to pending / blocked with attempt 0; errors are kept
+// §2.5: the reset set goes back to pending / blocked with attempt 0; errors are kept
 func (q *Queries) ResumeNodes(ctx context.Context, db DBTX, arg ResumeNodesParams) error {
 	_, err := db.Exec(ctx, ResumeNodes, arg.WorkflowRunId, arg.JobNames, arg.States)
 	return err
@@ -333,7 +351,7 @@ type TriggerWorkflowParams struct {
 	Dag          []byte
 }
 
-// §6.1 step 2: the parent row with the DAG snapshot; ErrNoRows = dedup conflict
+// §2.1: the parent row with the DAG snapshot; ErrNoRows = dedup conflict
 func (q *Queries) TriggerWorkflow(ctx context.Context, db DBTX, arg TriggerWorkflowParams) (int64, error) {
 	row := db.QueryRow(ctx, TriggerWorkflow,
 		arg.WorkflowName,
@@ -358,7 +376,7 @@ type WorkflowRunHeaderRow struct {
 	Dag   []byte
 }
 
-// §6.3 step 2 and 4: the worker reads the parent without a lock
+// §2.2: the worker reads the parent without a lock
 func (q *Queries) WorkflowRunHeader(ctx context.Context, db DBTX, id int64) (WorkflowRunHeaderRow, error) {
 	row := db.QueryRow(ctx, WorkflowRunHeader, id)
 	var i WorkflowRunHeaderRow
@@ -377,7 +395,7 @@ type WorkflowRunWithNodesRow struct {
 	JobRun      JobRun
 }
 
-// §8 Workflows.GetRun: parent and nodes from one statement snapshot, so a concurrent Resume
+// §3.3 Workflows.GetRun: parent and nodes from one statement snapshot, so a concurrent Resume
 // cannot show a failed parent next to pending nodes; a run always has at least one node
 func (q *Queries) WorkflowRunWithNodes(ctx context.Context, db DBTX, id int64) ([]WorkflowRunWithNodesRow, error) {
 	rows, err := db.Query(ctx, WorkflowRunWithNodes, id)

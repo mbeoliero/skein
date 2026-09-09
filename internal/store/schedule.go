@@ -8,7 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// ───────────── schedules (§6.2) ─────────────
+// ───────────── schedules (§2.1) ─────────────
 
 func (s *Store) PutSchedule(ctx context.Context, p PutScheduleParams) error {
 	return s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
@@ -71,17 +71,16 @@ type Fired struct {
 const dueBatch = 50
 
 // Scan is the outcome of one tick: what fired, and when the scheduler should wake
-// next (§6.11). NextDue is nil without an enabled schedule; DbNow is the clock it
-// was read against, so the caller sleeps NextDue − DbNow and never compares the
-// database clock with its own.
+// next (§2.7). Due.Next is nil without an enabled schedule; the caller sleeps
+// Next − DbNow less its own elapsed time and never compares the database clock with
+// its own.
 type Scan struct {
-	Fired   []Fired
-	NextDue *time.Time
-	DbNow   time.Time
-	Full    bool // dueBatch rows were due: more may be waiting
+	Fired []Fired
+	Due
+	Full bool // dueBatch rows were due: more may be waiting
 }
 
-// ScanDue is one scheduler tick (§6.2): lock due schedules, advance each to its next
+// ScanDue is one scheduler tick (§2.1): lock due schedules, advance each to its next
 // fire time after the database clock, and create one run per schedule with the missed
 // beat's scheduled_at. A dedup conflict is a skip and a rule without a next fire time
 // disables that schedule, neither is an error; anything else rolls the whole tick back
@@ -129,13 +128,14 @@ func (s *Store) ScanDue(ctx context.Context, next NextFunc) (sc Scan, err error)
 		}
 		sc.Fired = fired
 		n, err := s.q.NextScheduleAt(ctx, tx)
+		sc.Sampled = time.Now()
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
 			return nil
 		case err != nil:
 			return err
 		}
-		sc.NextDue, sc.DbNow = &n.NextDue, n.DbNow
+		sc.Next, sc.DbNow = &n.NextDue, n.DbNow
 		return nil
 	})
 	return sc, err
