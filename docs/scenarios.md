@@ -256,3 +256,11 @@ smoke 终态为 1,483 succeeded、102 预期 failed、57 cancelled；缺失返�
 2026-09-11 验证：Go 1.27.0，PG13.23 / PG18.4 无缓存全集、PG18 默认并发三轮 race 及 lint 通过；M5、独立领取索引与安静库 HOT 结果见[基线](baseline.md#2026-09-11-复跑)。PG13 三轮 race 与 M7 未运行。
 
 2026-09-12 审查修复验证：Go 1.27.0，PG13.23 / PG18.4 强制数据库可达的无缓存全集、默认并发三轮 race、独立领取索引 / HOT 及 M7 smoke 均通过，lint 通过。PG13 race 仅将整体测试超时设为 20 分钟；未缩减并发、竞争轮数或行为判据。M5 为 285 runs/s、负载估算 HOT 92%，差异与边界见[基线](baseline.md#2026-09-12-审查修复后的复跑)，场景证据见[场景验收](scenarios.md#2026-09-12-审查修复复跑)。
+
+## 2026-09-12 远程 CI 失租干扰修复
+
+[CI 34639670382](https://github.com/mbeoliero/skein/actions/runs/34639670382) 对提交 `cd3b489` 的 PG13 全部通过，PG18 的 lint / 普通全集通过；PG18 三轮 race 中 `TestFailFastCancelsTheRest` 失败。对应实例连续两次心跳超时，先发生本地失租，断言收到 `skein: lease lost` 而非工作流取消原因；日志没有数据竞争报告。
+
+该用例原用 100ms 心跳、400ms 租约。隔离 schema 中临时为心跳 UPDATE 注入 150ms 延迟，复现相同错误；改用已有 `behaviorConfig`（1s 心跳、10s 租约）后，同一延迟下十轮 race 通过（14.178s）。保留真实心跳取消路径、取消原因和父子终态断言；专门的短租约失效测试及 race 轮数不变。延迟夹具仅作诊断，不加入默认测试。
+
+本地 PG18 默认并发 `SKEIN_TEST_REQUIRE_DB=1 make race` 三轮全集通过（263.972s），`make lint` 通过。以上是本地修复验证，尚未在 GitHub 复跑，不将原失败运行改记为通过。

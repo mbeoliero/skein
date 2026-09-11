@@ -233,7 +233,8 @@ func TestFailFastCancelsTheRest(t *testing.T) {
 	cause := make(chan error, 1)
 	slowStarted := make(chan struct{})
 	slowRunning := sync.OnceFunc(func() { close(slowStarted) })
-	e := startEngine(t, pool, fastConfig(schema), func(e *Engine) {
+	// This checks fail-fast propagation; CI latency must not turn it into a lease-loss test.
+	e := startEngine(t, pool, behaviorConfig(schema), func(e *Engine) {
 		e.Register("bad", func(ctx context.Context, req *Request) (RawJSON, error) {
 			<-slowStarted // slow is executing when bad fails: it must be cancelled through its heartbeat, not as unstarted
 			return nil, Permanent(errors.New("nope"))
