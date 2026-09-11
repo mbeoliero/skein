@@ -50,7 +50,6 @@ jobs:
       SKEIN_TEST_REQUIRE_DB: "1"
       SKEIN_BENCH_POLL: 5s
       SKEIN_BENCH_CONCURRENCY: "16"
-      EVIDENCE_DIR: ${{ runner.temp }}/skein-validation
 
     steps:
       - uses: actions/checkout@v4
@@ -60,6 +59,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+
+      - name: Set evidence directory
+        run: echo "EVIDENCE_DIR=$RUNNER_TEMP/skein-validation" >> "$GITHUB_ENV"
 
       - name: Record source, environment and database configuration
         env:
