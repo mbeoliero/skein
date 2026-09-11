@@ -1,0 +1,126 @@
+name: Manual validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      checks:
+        description: Validation to run on PostgreSQL 13 and 18
+        type: choice
+        required: true
+        default: both
+        options:
+          - both
+          - m5
+          - m7-smoke
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    name: PostgreSQL ${{ matrix.postgres }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["13", "18"]
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: skein_validation
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d skein_validation"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      SKEIN_TEST_DSN: postgres://postgres:postgres@127.0.0.1:5432/skein_validation?sslmode=disable
+      SKEIN_TEST_REQUIRE_DB: "1"
+      SKEIN_BENCH_POLL: 5s
+      SKEIN_BENCH_CONCURRENCY: "16"
+      EVIDENCE_DIR: ${{ runner.temp }}/skein-validation
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Record source, environment and database configuration
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          CHECKS: ${{ inputs.checks }}
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          {
+            date -u '+%Y-%m-%dT%H:%M:%SZ'
+            git show --no-patch --format=fuller HEAD
+            git status --short
+            go version
+            go env GOOS GOARCH GOEXPERIMENT GOVERSION
+            uname -a
+            lscpu
+            printf 'checks=%s\nSKEIN_BENCH_POLL=%s\nSKEIN_BENCH_CONCURRENCY=%s\nSKEIN_SCENARIO_PROFILE=smoke\n' \
+              "$CHECKS" "$SKEIN_BENCH_POLL" "$SKEIN_BENCH_CONCURRENCY"
+          } > "$EVIDENCE_DIR/environment.txt"
+          git archive --format=tar --output="$EVIDENCE_DIR/source.tar" HEAD
+          sha256sum "$EVIDENCE_DIR/source.tar" > "$EVIDENCE_DIR/source.sha256"
+          docker exec "$POSTGRES_CONTAINER" psql -U postgres -d skein_validation \
+            -X --set=ON_ERROR_STOP=1 \
+            --command='SELECT version();' \
+            --command="SELECT name, setting, unit FROM pg_settings WHERE name IN ('max_connections', 'shared_buffers', 'synchronous_commit', 'fsync', 'full_page_writes', 'autovacuum', 'autovacuum_naptime', 'jit', 'max_locks_per_transaction') ORDER BY name;" \
+            > "$EVIDENCE_DIR/postgres.txt"
+          cp go.mod go.sum "$EVIDENCE_DIR/"
+          cp docs/baseline.md docs/scenarios.md "$EVIDENCE_DIR/"
+
+      # Each database has its own runner. Measurements within a runner are serial;
+      # this records a CI baseline, not a comparison with a developer's machine.
+      - name: M5 baseline
+        if: inputs.checks == 'both' || inputs.checks == 'm5'
+        env:
+          SKEIN_BENCH: "1"
+        run: |
+          SKEIN_BENCH_OUT="$EVIDENCE_DIR/m5.md" \
+            go test -count=1 -parallel=1 -run '^TestPerformanceBaseline$' -v -timeout 20m \
+            2>&1 | tee "$EVIDENCE_DIR/m5.log"
+
+      - name: Independent claim index and heartbeat HOT checks
+        if: inputs.checks == 'both' || inputs.checks == 'm5'
+        run: |
+          go test -count=1 -parallel=1 -run '^(TestClaimUsesPartialIndexes|TestHeartbeatIsHot)$' -v -timeout 5m \
+            2>&1 | tee "$EVIDENCE_DIR/storage-checks.log"
+
+      - name: M7 smoke
+        if: inputs.checks == 'both' || inputs.checks == 'm7-smoke'
+        env:
+          SKEIN_SCENARIO: "1"
+          SKEIN_SCENARIO_PROFILE: smoke
+        run: |
+          mkdir -p "$EVIDENCE_DIR/m7-smoke"
+          go test -count=1 -parallel=1 -run '^TestScenarioAcceptance$' -timeout 15m \
+            -artifacts -outputdir="$EVIDENCE_DIR/m7-smoke" -v \
+            2>&1 | tee "$EVIDENCE_DIR/m7-smoke.log"
+
+      - name: Preserve validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-pg${{ matrix.postgres }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/skein-validation
+          if-no-files-found: error
+          retention-days: 30

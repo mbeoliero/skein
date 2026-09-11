@@ -60,45 +60,36 @@ func (q *Queries) DisableSchedule(ctx context.Context, db DBTX, name string) err
 	return err
 }
 
-const DueSchedules = `-- name: DueSchedules :many
-SELECT name, job_name, workflow_name, cron, timezone, overlap, next_run_at, now()::timestamptz AS db_now
-  FROM schedule
+const DueScheduleCandidates = `-- name: DueScheduleCandidates :many
+SELECT name, next_run_at FROM schedule
  WHERE enabled AND next_run_at <= now()
- ORDER BY next_run_at LIMIT $1::int
-   FOR UPDATE SKIP LOCKED
+   AND ($1::timestamptz IS NULL
+        OR (next_run_at, name) > ($1::timestamptz, $2::text))
+ ORDER BY next_run_at, name LIMIT $3::int
 `
 
-type DueSchedulesRow struct {
-	Name         string
-	JobName      *string
-	WorkflowName *string
-	Cron         string
-	Timezone     string
-	Overlap      string
-	NextRunAt    time.Time
-	DbNow        time.Time
+type DueScheduleCandidatesParams struct {
+	AfterDue  *time.Time
+	AfterName string
+	Lim       int32
 }
 
-// §2.1: due schedules, locked so two instances never fire the same one; db_now drives the next computation
-func (q *Queries) DueSchedules(ctx context.Context, db DBTX, lim int32) ([]DueSchedulesRow, error) {
-	rows, err := db.Query(ctx, DueSchedules, lim)
+type DueScheduleCandidatesRow struct {
+	Name      string
+	NextRunAt time.Time
+}
+
+// §2.1: enumerate without locks, continuing past names held by other transactions until a real batch is filled.
+func (q *Queries) DueScheduleCandidates(ctx context.Context, db DBTX, arg DueScheduleCandidatesParams) ([]DueScheduleCandidatesRow, error) {
+	rows, err := db.Query(ctx, DueScheduleCandidates, arg.AfterDue, arg.AfterName, arg.Lim)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []DueSchedulesRow{}
+	items := []DueScheduleCandidatesRow{}
 	for rows.Next() {
-		var i DueSchedulesRow
-		if err := rows.Scan(
-			&i.Name,
-			&i.JobName,
-			&i.WorkflowName,
-			&i.Cron,
-			&i.Timezone,
-			&i.Overlap,
-			&i.NextRunAt,
-			&i.DbNow,
-		); err != nil {
+		var i DueScheduleCandidatesRow
+		if err := rows.Scan(&i.Name, &i.NextRunAt); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -129,6 +120,89 @@ func (q *Queries) GetSchedule(ctx context.Context, db DBTX, name string) (Schedu
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const InflightScheduleRunExists = `-- name: InflightScheduleRunExists :one
+SELECT (EXISTS (
+    SELECT 1 FROM job_run
+     WHERE schedule_name = $1::text AND state IN ('pending', 'running') AND id <> $2::bigint
+) OR EXISTS (
+    SELECT 1 FROM workflow_run
+     WHERE schedule_name = $1::text AND state IN ('running', 'cancelling') AND id <> $3::bigint
+))::boolean AS found
+`
+
+type InflightScheduleRunExistsParams struct {
+	Name                 string
+	ExcludeRunID         int64
+	ExcludeWorkflowRunID int64
+}
+
+// §2.1 / §2.5: current skip rules cover historical allow beats and target changes across both run tables.
+// The name lock serializes all openings, so these candidates must remain unlocked; settlement may only remove them.
+func (q *Queries) InflightScheduleRunExists(ctx context.Context, db DBTX, arg InflightScheduleRunExistsParams) (bool, error) {
+	row := db.QueryRow(ctx, InflightScheduleRunExists, arg.Name, arg.ExcludeRunID, arg.ExcludeWorkflowRunID)
+	var found bool
+	err := row.Scan(&found)
+	return found, err
+}
+
+const LockDueSchedule = `-- name: LockDueSchedule :one
+SELECT name, job_name, workflow_name, cron, timezone, overlap, next_run_at, now()::timestamptz AS db_now
+  FROM schedule
+ WHERE name = $1 AND enabled AND next_run_at <= now()
+   FOR UPDATE SKIP LOCKED
+`
+
+type LockDueScheduleRow struct {
+	Name         string
+	JobName      *string
+	WorkflowName *string
+	Cron         string
+	Timezone     string
+	Overlap      string
+	NextRunAt    time.Time
+	DbNow        time.Time
+}
+
+// §2.1 / §2.9: only after the name lock; recheck a candidate's current rule and due time without waiting on a row.
+func (q *Queries) LockDueSchedule(ctx context.Context, db DBTX, name string) (LockDueScheduleRow, error) {
+	row := db.QueryRow(ctx, LockDueSchedule, name)
+	var i LockDueScheduleRow
+	err := row.Scan(
+		&i.Name,
+		&i.JobName,
+		&i.WorkflowName,
+		&i.Cron,
+		&i.Timezone,
+		&i.Overlap,
+		&i.NextRunAt,
+		&i.DbNow,
+	)
+	return i, err
+}
+
+const LockScheduleName = `-- name: LockScheduleName :exec
+SELECT pg_advisory_xact_lock(hashtext('skein:schedule'), hashtext(jsonb_build_array(current_schema(), $1::text)::text))
+`
+
+// §1.3 / §2.1 / §2.5 / §2.9: coordinate a schema/name even while its schedule row is absent.
+// The two-integer lock space is separate from the one-bigint maintenance and migration locks.
+func (q *Queries) LockScheduleName(ctx context.Context, db DBTX, name string) error {
+	_, err := db.Exec(ctx, LockScheduleName, name)
+	return err
+}
+
+const LockScheduleRule = `-- name: LockScheduleRule :one
+SELECT overlap FROM schedule WHERE name = $1 FOR UPDATE
+`
+
+// §2.5 / §2.9: scheduled Resume holds the name lock before reading the current rule; no row means deleted.
+func (q *Queries) LockScheduleRule(ctx context.Context, db DBTX, name string) (string, error) {
+	row := db.QueryRow(ctx, LockScheduleRule, name)
+	var overlap string
+	err := row.Scan(&overlap)
+	return overlap, err
 }
 
 const NextScheduleAt = `-- name: NextScheduleAt :one
@@ -188,4 +262,16 @@ func (q *Queries) PutSchedule(ctx context.Context, db DBTX, arg PutScheduleParam
 		arg.NextRunAt,
 	)
 	return err
+}
+
+const TryLockScheduleName = `-- name: TryLockScheduleName :one
+SELECT pg_try_advisory_xact_lock(hashtext('skein:schedule'), hashtext(jsonb_build_array(current_schema(), $1::text)::text))::boolean AS locked
+`
+
+// §2.1 / §2.9: a scanner never waits while acquiring another name in its batch.
+func (q *Queries) TryLockScheduleName(ctx context.Context, db DBTX, name string) (bool, error) {
+	row := db.QueryRow(ctx, TryLockScheduleName, name)
+	var locked bool
+	err := row.Scan(&locked)
+	return locked, err
 }

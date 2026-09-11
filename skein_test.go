@@ -67,9 +67,9 @@ func namedPool(t *testing.T, appName string) *pgxpool.Pool {
 // fixture for "that transaction has reached the row this test holds".
 func waitBlocked(t *testing.T, pool *pgxpool.Pool, appName string) {
 	t.Helper()
-	waitFor(t, appName+" to block on a lock", func() bool {
+	waitFor(t, appName+" to block on a lock", func(ctx context.Context) bool {
 		var n int
-		err := pool.QueryRow(t.Context(), "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock'", appName).Scan(&n)
+		err := pool.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock'", appName).Scan(&n)
 		return err == nil && n > 0
 	})
 }
@@ -93,6 +93,7 @@ func freshSchema(t *testing.T) (*pgxpool.Pool, string) {
 	return pool, schema
 }
 
+// fastConfig keeps deliberate lease-loss and cancellation tests short.
 func fastConfig(schema string) Config {
 	return Config{
 		Schema:            schema,
@@ -107,8 +108,46 @@ func fastConfig(schema string) Config {
 	}
 }
 
-// startEngine registers executors via setup, starts, and shuts down at cleanup.
+// behaviorConfig keeps polling and retries quick without turning ordinary behavior
+// checks into subsecond lease tests when parallel CI work delays database access.
+func behaviorConfig(schema string) Config {
+	cfg := fastConfig(schema)
+	cfg.HeartbeatInterval = time.Second
+	cfg.LeaseTTL = 10 * time.Second
+	return cfg
+}
+
 func startEngine(t *testing.T, pool *pgxpool.Pool, cfg Config, setup func(e *Engine)) *Engine {
+	t.Helper()
+	return startEngineWithShutdownError(
+		t,
+		pool,
+		cfg,
+		setup,
+		nil,
+	)
+}
+
+// startEngineNotDrained permits the cached result of a deliberately incomplete
+// shutdown. The test must still assert ErrNotDrained at its shutdown boundary.
+func startEngineNotDrained(t *testing.T, pool *pgxpool.Pool, cfg Config, setup func(e *Engine)) *Engine {
+	t.Helper()
+	return startEngineWithShutdownError(
+		t,
+		pool,
+		cfg,
+		setup,
+		ErrNotDrained,
+	)
+}
+
+func startEngineWithShutdownError(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	cfg Config,
+	setup func(e *Engine),
+	allowed error,
+) *Engine {
 	t.Helper()
 	e, err := New(pool, cfg)
 	if err != nil {
@@ -121,8 +160,8 @@ func startEngine(t *testing.T, pool *pgxpool.Pool, cfg Config, setup func(e *Eng
 		t.Fatalf("start: %v", err)
 	}
 	t.Cleanup(func() {
-		if err := e.Shutdown(context.Background()); err != nil {
-			t.Logf("shutdown: %v", err)
+		if err := e.Shutdown(context.Background()); err != nil && !errors.Is(err, allowed) {
+			t.Errorf("shutdown: %v", err)
 		}
 	})
 	return e
@@ -130,30 +169,54 @@ func startEngine(t *testing.T, pool *pgxpool.Pool, cfg Config, setup func(e *Eng
 
 func waitRun(t *testing.T, e *Engine, id int64, state RunState) *JobRun {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		run, err := e.Runs().Get(t.Context(), id)
-		if err != nil {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	var run *JobRun
+	err := pollUntil(ctx, func(ctx context.Context) (bool, error) {
+		current, err := e.Runs().Get(ctx, id)
+		if err == nil {
+			run = current
+		}
+		return err == nil && run.State == state, err
+	})
+	if err != nil {
+		if run == nil {
 			t.Fatalf("get run %d: %v", id, err)
 		}
-		if run.State == state {
-			return run
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("run %d is %s, want %s (attempt %d, errors %s)", id, run.State, state, run.Attempt, run.Errors)
-		}
-		time.Sleep(20 * time.Millisecond)
+		t.Fatalf("run %d is %s, want %s (attempt %d, errors %s): %v", id, run.State, state, run.Attempt, run.Errors, err)
+	}
+	return run
+}
+
+func waitFor(t *testing.T, what string, cond func(context.Context) bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if err := pollUntil(ctx, func(ctx context.Context) (bool, error) { return cond(ctx), nil }); err != nil {
+		t.Fatalf("waiting for %s: %v", what, err)
 	}
 }
 
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
+// Conditions must use ctx for I/O so the deadline also bounds each query.
+func pollUntil(ctx context.Context, cond func(context.Context) (bool, error)) error {
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		time.Sleep(20 * time.Millisecond)
+		ready, err := cond(ctx)
+		if err != nil {
+			return err
+		}
+		if ready {
+			return ctx.Err()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -202,8 +265,11 @@ func TestTriggerRunsToSuccess(t *testing.T) {
 	if run.Attempt != 0 || run.StartedAt == nil || run.FinishedAt == nil || run.LeaseOwner != "" || run.LeaseExpiresAt != nil {
 		t.Errorf("settled row %+v", run)
 	}
-	if got.Attempt != 1 || got.IdempotencyKey != "run:"+itoa(id) || got.JobName != "echo" {
+	if got.RunId != id || got.ExecutionId == "" || got.Attempt != 1 || got.IdempotencyKey != "run:"+itoa(id) || got.JobName != "echo" {
 		t.Errorf("request %+v", got)
+	}
+	if got.WorkflowRunId != nil || got.Input != nil || got.Deps != nil {
+		t.Errorf("plain request has workflow fields: %+v", got)
 	}
 }
 
@@ -221,7 +287,6 @@ func TestDuplicateReturnsExistingId(t *testing.T) {
 	id := trigger(t, e, "j", "", DedupKey("k"))
 	waitRun(t, e, id, StateRunning)
 
-	// a lost response is retried with the same key: same id, ErrDuplicate
 	again, err := e.Jobs().Trigger(t.Context(), "j", nil, DedupKey("k"))
 	if !errors.Is(err, ErrDuplicate) || again != id {
 		t.Fatalf("second trigger: id %d err %v, want %d ErrDuplicate", again, err, id)
@@ -265,8 +330,6 @@ func TestConcurrentDedupCreatesOne(t *testing.T) {
 	waitRun(t, e, winner, StateSucceeded)
 }
 
-// expectOneWinner: exactly one of n concurrent dedup-keyed triggers created a run;
-// every other one got ErrDuplicate carrying that run's id.
 func expectOneWinner(t *testing.T, ids []int64, errs []error) (winner int64) {
 	t.Helper()
 	created := 0
@@ -286,10 +349,8 @@ func expectOneWinner(t *testing.T, ids []int64, errs []error) (winner int64) {
 	return winner
 }
 
-// An output the database cannot store is a permanent failure carrying the reason,
-// not a lease left to expire: "not json" is caught in Go; a NUL escape and a number
-// past numeric only by jsonb, which used to leave the row running until it was
-// reclaimed with nothing but interrupted entries.
+// Invalid Go JSON and jsonb-only rejections (NUL and numeric overflow) must all
+// settle as permanent failures rather than wait for lease recovery.
 func TestInvalidOutputFailsPermanently(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
@@ -317,15 +378,15 @@ func TestEmptyOutputSucceeds(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			pool, schema := freshSchema(t)
-			e := startEngine(t, pool, fastConfig(schema), func(e *Engine) {
+			e := startEngine(t, pool, behaviorConfig(schema), func(e *Engine) {
 				e.Register("empty", func(context.Context, *Request) (RawJSON, error) { return tc.out, nil })
 			})
 			declare(t, e, JobSpec{Name: "j", ExecutorType: "empty"})
 			id := trigger(t, e, "j", "")
 			var run *JobRun
-			waitFor(t, "empty output to settle", func() bool {
+			waitFor(t, "empty output to settle", func(ctx context.Context) bool {
 				var err error
-				run, err = e.Runs().Get(t.Context(), id)
+				run, err = e.Runs().Get(ctx, id)
 				return err == nil && run.State.Terminal()
 			})
 			if run.State != StateSucceeded || run.Attempt != 0 || run.Output != nil || len(errorsOf(t, run)) != 0 {
@@ -363,25 +424,6 @@ func TestPanicCountsOneFailure(t *testing.T) {
 	}
 }
 
-func TestPermanentIsTerminal(t *testing.T) {
-	t.Parallel()
-	pool, schema := freshSchema(t)
-	calls := 0
-	e := startEngine(t, pool, fastConfig(schema), func(e *Engine) {
-		e.Register("bad", func(ctx context.Context, req *Request) (RawJSON, error) {
-			calls++
-			return nil, Permanent(errors.New("no way"))
-		})
-	})
-	declare(t, e, JobSpec{Name: "j", ExecutorType: "bad", Retry: RetryPolicy{MaxAttempts: 3}})
-	run := waitRun(t, e, trigger(t, e, "j", ""), StateFailed)
-
-	es := errorsOf(t, run)
-	if calls != 1 || run.Attempt != 1 || len(es) != 1 || es[0].Kind != "business" || es[0].Message != "permanent: no way" {
-		t.Fatalf("calls %d attempt %d errors %+v", calls, run.Attempt, es)
-	}
-}
-
 func TestRetryUntilMaxAttempts(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
@@ -401,35 +443,36 @@ func TestRetryUntilMaxAttempts(t *testing.T) {
 	}
 }
 
-// The message of a permanent error is the executor's text: invalid UTF-8 (json/v2
-// refuses to encode it) and NUL (jsonb refuses to store it) must still end as one
-// recorded failed attempt, not as a settle that cannot commit, a lease that expires
-// and a third execution that leaves only an interrupted entry.
-func TestPermanentErrorWithBadTextIsRecorded(t *testing.T) {
+// Invalid UTF-8 is rejected by json/v2 and NUL by jsonb. Executor error text
+// containing either must still be recorded as one permanent failure.
+func TestPermanentErrorIsRecorded(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
-	messages := map[string]string{"nul": "nul \x00 here", "utf8": "bad \xff utf8"}
+	cases := map[string]struct{ message, want string }{
+		"plain": {"no way", "permanent: no way"},
+		"nul":   {"nul \x00 here", "permanent: nul \uFFFD here"},
+		"utf8":  {"bad \xff utf8", "permanent: bad \uFFFD utf8"},
+	}
 	var calls atomic.Int32
 	e := startEngine(t, pool, fastConfig(schema), func(e *Engine) {
 		e.Register("bad", func(ctx context.Context, req *Request) (RawJSON, error) {
 			calls.Add(1)
-			return nil, Permanent(errors.New(messages[req.JobName]))
+			return nil, Permanent(errors.New(cases[req.JobName].message))
 		})
 	})
-	for name := range messages {
-		declare(t, e, JobSpec{Name: name, ExecutorType: "bad", Retry: RetryPolicy{MaxAttempts: 3}})
-		calls.Store(0)
-		run := waitRun(t, e, trigger(t, e, name, ""), StateFailed)
-		es := errorsOf(t, run)
-		if run.Attempt != 1 || calls.Load() != 1 || len(es) != 1 || es[0].Kind != "business" || !strings.Contains(es[0].Message, "\uFFFD") {
-			t.Fatalf("%s: attempt %d calls %d errors %+v", name, run.Attempt, calls.Load(), es)
-		}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			declare(t, e, JobSpec{Name: name, ExecutorType: "bad", Retry: RetryPolicy{MaxAttempts: 3}})
+			calls.Store(0)
+			run := waitRun(t, e, trigger(t, e, name, ""), StateFailed)
+			es := errorsOf(t, run)
+			if run.Attempt != 1 || calls.Load() != 1 || len(es) != 1 || es[0].Kind != "business" || es[0].Message != tc.want {
+				t.Fatalf("attempt %d calls %d errors %+v", run.Attempt, calls.Load(), es)
+			}
+		})
 	}
 }
 
-// cleanMessage is what makes the above hold for every message the executor can
-// produce: replacements, a length cap on a rune boundary, and a document the
-// database accepts.
 func TestCleanMessage(t *testing.T) {
 	t.Parallel()
 	if got := cleanMessage("a\x00b\xffc"); got != "a\uFFFDb\uFFFDc" {
@@ -497,7 +540,7 @@ func TestRegisterSerializesLifecycle(t *testing.T) {
 		e.Register("x", func(context.Context, *Request) (RawJSON, error) { return nil, nil })
 	}()
 	// Observe the actual mutex wait, not a scheduling delay before Register starts.
-	waitFor(t, "Register to wait on lifecycle", func() bool {
+	waitFor(t, "Register to wait on lifecycle", func(ctx context.Context) bool {
 		select {
 		case <-done:
 			t.Fatal("Register completed while lifecycle was locked")
@@ -779,9 +822,8 @@ func TestEmptyInputIsSizeChecked(t *testing.T) {
 	}
 }
 
-// New rejects what would fail later: a negative period panics in time.NewTicker on a
-// loop goroutine, a retry policy attempt (smallint) cannot hold overflows on reclaim,
-// and an Engine that was shut down cannot be started again.
+// Constructor validation must reject values that would panic in a background
+// loop or overflow the database's duration and attempt columns.
 func TestConfigValidation(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
@@ -796,7 +838,7 @@ func TestConfigValidation(t *testing.T) {
 		{Schema: schema, DefaultRetry: RetryPolicy{MaxAttempts: 3, Jitter: math.NaN()}},
 		{Schema: schema, DefaultRetry: RetryPolicy{BaseSec: -1}}, // a partial policy is validated, not replaced by the default
 		{Schema: schema, DefaultRetry: RetryPolicy{Jitter: math.NaN()}},
-		{Schema: schema, DefaultTimeout: (math.MaxInt32 + 1) * time.Second}, // int32 seconds in the column: 4294967297s would wrap to 1s
+		{Schema: schema, DefaultTimeout: (math.MaxInt32 + 1) * time.Second},
 	}
 	for _, cfg := range bad {
 		if _, err := New(pool, cfg); err == nil {
@@ -816,12 +858,6 @@ func TestConfigValidation(t *testing.T) {
 	}
 	if err := e.Jobs().Declare(t.Context(), JobSpec{Name: "j", ExecutorType: "x", Timeout: (math.MaxInt32 + 1) * time.Second}); err == nil {
 		t.Error("declared a timeout past int32 seconds")
-	}
-	if err := e.Shutdown(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.Start(t.Context()); err == nil {
-		t.Error("Start after Shutdown succeeded")
 	}
 }
 

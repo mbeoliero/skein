@@ -1,5 +1,4 @@
-// Package store is the persistence layer: the sqlc output in *.sql.go plus this file,
-// which holds one method per design §2 transaction. Nothing outside this package writes SQL.
+// Package store owns persistence transactions and their SQL.
 package store
 
 import (
@@ -57,7 +56,6 @@ func cleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 }
 
-// tx runs fn in its own transaction on the pool.
 func (s *Store) tx(ctx context.Context, fn func(ctx context.Context, tx pgx.Tx) error) error {
 	return s.txOn(ctx, s.pool, fn)
 }
@@ -107,8 +105,6 @@ func (s *Store) inCallerTx(ctx context.Context, tx pgx.Tx, fn func(ctx context.C
 	}
 	return err
 }
-
-// ───────────── migrations (§2.6, §1.3) ─────────────
 
 type Migration struct {
 	Version int
@@ -178,8 +174,6 @@ func (s *Store) schemaVersion(ctx context.Context, tx pgx.Tx) (int, error) {
 	return int(v), err
 }
 
-// ───────────── definitions (§2.1) ─────────────
-
 func (s *Store) DeclareJob(ctx context.Context, p DeclareJobParams) error {
 	return s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		return s.q.DeclareJob(ctx, tx, p)
@@ -201,8 +195,6 @@ func (s *Store) DeleteJob(ctx context.Context, name string) error {
 		return nil
 	})
 }
-
-// ───────────── submit (§2.1) ─────────────
 
 // TriggerJob snapshots the job into a pending run. With tx == nil it uses its own
 // transaction; otherwise it runs inside the caller's. ErrDuplicate carries the id of
@@ -279,21 +271,24 @@ func (s *Store) GetJobRun(ctx context.Context, id int64) (r JobRun, err error) {
 	return r, err
 }
 
-// ───────────── claim (§2.2) ─────────────
-
-// Claimed is what both claim branches hand to the worker.
-type Claimed ClaimPendingRow
+type Claimed struct {
+	ClaimPendingRow
+	Reclaimed bool
+}
 
 // ClaimPending is branch one: due pending rows, ordered by run_at.
 func (s *Store) ClaimPending(ctx context.Context, types []string, limit int, owner string, ttl time.Duration) (out []Claimed, err error) {
 	err = s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		rows, err := s.q.ClaimPending(ctx, tx, ClaimPendingParams{ExecutorTypes: types, Lim: int32(limit), Owner: owner, LeaseTtl: ttl})
 		for _, r := range rows {
-			out = append(out, Claimed(r))
+			out = append(out, Claimed{ClaimPendingRow: r})
 		}
 		return err
 	})
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ClaimExpired is branch two: running rows whose lease expired; attempt +1, an interrupted entry appended.
@@ -301,11 +296,14 @@ func (s *Store) ClaimExpired(ctx context.Context, types []string, limit int, own
 	err = s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		rows, err := s.q.ClaimExpired(ctx, tx, ClaimExpiredParams{ExecutorTypes: types, Lim: int32(limit), Owner: owner, LeaseTtl: ttl})
 		for _, r := range rows {
-			out = append(out, Claimed(r))
+			out = append(out, Claimed{ClaimPendingRow: ClaimPendingRow(r), Reclaimed: true})
 		}
 		return err
 	})
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // Due is the nearest future due time with the clocks it was read against (§2.7):
@@ -337,8 +335,6 @@ func (s *Store) NextPendingAt(ctx context.Context, types []string) (d Due, err e
 	return d, err
 }
 
-// ───────────── heartbeat (§2.3) ─────────────
-
 // Heartbeat renews every (id, token) pair in one statement; ids absent from the
 // result no longer belong to the caller.
 func (s *Store) Heartbeat(ctx context.Context, ids []int64, tokens []uuid.UUID, ttl, cancelTimeout time.Duration) (rows []HeartbeatRow, err error) {
@@ -348,8 +344,6 @@ func (s *Store) Heartbeat(ctx context.Context, ids []int64, tokens []uuid.UUID, 
 	})
 	return rows, err
 }
-
-// ───────────── settle (§2.4) ─────────────
 
 type Outcome int
 
@@ -368,17 +362,20 @@ type Settlement struct {
 	Id            int64
 	Token         uuid.UUID
 	WorkflowRunId *int64 // node instance: the parent is locked first and propagate runs after
-	JobName       string
 	Outcome       Outcome
 	Output        []byte        // Succeeded
 	Err           []byte        // one-element JSON array: Released, Retry, Failed; optional for Cancelled
 	Backoff       time.Duration // Retry
 	Delay         time.Duration // Snoozed
+	Reason        string
+	Error         string
+	Duration      time.Duration
 }
 
 type Settled struct {
 	State         string
 	ReleasedCount int // Released only: entries of kind released on this run, for the alert
+	Changes       []Change
 }
 
 // Settle is the only path out of running. The fence is WHERE lease_token = $token AND
@@ -386,45 +383,75 @@ type Settled struct {
 // parent row is locked first (lock order §2.9) and propagate runs in the same transaction.
 func (s *Store) Settle(ctx context.Context, st Settlement) (res Settled, err error) {
 	err = s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
-		var wfState string
+		var parent changedWorkflow
 		var dag Dag
 		if st.WorkflowRunId != nil {
 			w, err := s.q.LockWorkflowRun(ctx, tx, *st.WorkflowRunId)
 			if err != nil {
 				return err
 			}
-			wfState = w.State
+			parent = changedWorkflow{
+				Id: *st.WorkflowRunId, WorkflowName: w.WorkflowName, State: w.State, Extra: w.Extra,
+			}
 			if dag, err = parseDag(w.Dag); err != nil {
 				return err
 			}
 		}
-		wfCancelling := wfState == "cancelling"
-		var state string
+		wfCancelling := parent.State == "cancelling"
+		var changed changedRun
 		var err error
 		switch st.Outcome {
 		case Succeeded:
-			state, err = s.q.SettleSucceeded(ctx, tx, SettleSucceededParams{Id: st.Id, Token: st.Token, Output: st.Output})
+			var row SettleSucceededRow
+			row, err = s.q.SettleSucceeded(ctx, tx, SettleSucceededParams{
+				Id: st.Id, Token: st.Token, Output: st.Output,
+			})
+			changed = changedRun(row)
 		case Cancelled:
-			state, err = s.q.SettleCancelled(ctx, tx, SettleCancelledParams{Id: st.Id, Token: st.Token, Err: st.Err})
+			var row SettleCancelledRow
+			row, err = s.q.SettleCancelled(ctx, tx, SettleCancelledParams{
+				Id: st.Id, Token: st.Token, Err: st.Err,
+			})
+			changed = changedRun(row)
 		case Released:
 			var row SettleReleasedRow
-			row, err = s.q.SettleReleased(ctx, tx, SettleReleasedParams{Id: st.Id, Token: st.Token, Err: st.Err, WfCancelling: wfCancelling})
-			state, res.ReleasedCount = row.State, int(row.ReleasedCount)
+			row, err = s.q.SettleReleased(ctx, tx, SettleReleasedParams{
+				Id: st.Id, Token: st.Token, Err: st.Err, WfCancelling: wfCancelling,
+			})
+			changed = changedRun{
+				Id: row.Id, JobName: row.JobName, WorkflowRunId: row.WorkflowRunId, ExecutorType: row.ExecutorType,
+				State: row.State, LeaseToken: row.LeaseToken, Extra: row.Extra,
+			}
+			res.ReleasedCount = int(row.ReleasedCount)
 		case Retry:
-			state, err = s.q.SettleRetry(ctx, tx, SettleRetryParams{Id: st.Id, Token: st.Token, Err: st.Err, Backoff: st.Backoff, WfCancelling: wfCancelling})
+			var row SettleRetryRow
+			row, err = s.q.SettleRetry(ctx, tx, SettleRetryParams{
+				Id: st.Id, Token: st.Token, Err: st.Err, Backoff: st.Backoff, WfCancelling: wfCancelling,
+			})
+			changed = changedRun(row)
 		case Snoozed:
 			if st.Delay <= 0 {
 				return fmt.Errorf("store: snooze delay must be > 0, got %s", st.Delay)
 			}
 			// pgx truncates to microseconds; SQL rounds up without overflowing Duration.
-			state, err = s.q.SettleSnoozed(ctx, tx, SettleSnoozedParams{
+			var row SettleSnoozedRow
+			row, err = s.q.SettleSnoozed(ctx, tx, SettleSnoozedParams{
 				Id: st.Id, Token: st.Token, Delay: st.Delay,
 				RoundUp: st.Delay%time.Microsecond != 0, WfCancelling: wfCancelling,
 			})
+			changed = changedRun(row)
 		case Failed:
-			state, err = s.q.SettleFailed(ctx, tx, SettleFailedParams{Id: st.Id, Token: st.Token, Err: st.Err, WfCancelling: wfCancelling})
+			var row SettleFailedRow
+			row, err = s.q.SettleFailed(ctx, tx, SettleFailedParams{
+				Id: st.Id, Token: st.Token, Err: st.Err, WfCancelling: wfCancelling,
+			})
+			changed = changedRun(row)
 		case Interrupted:
-			state, err = s.q.SettleInterrupted(ctx, tx, SettleInterruptedParams{Id: st.Id, Token: st.Token, WfCancelling: wfCancelling})
+			var row SettleInterruptedRow
+			row, err = s.q.SettleInterrupted(ctx, tx, SettleInterruptedParams{
+				Id: st.Id, Token: st.Token, WfCancelling: wfCancelling,
+			})
+			changed = changedRun(row)
 		default:
 			return fmt.Errorf("store: unknown outcome %d", st.Outcome)
 		}
@@ -438,13 +465,25 @@ func (s *Store) Settle(ctx context.Context, st Settlement) (res Settled, err err
 		if err != nil {
 			return err
 		}
-		res.State = state
-		if st.WorkflowRunId != nil && terminal(state) {
-			return s.propagate(ctx, tx, *st.WorkflowRunId, dag, wfState, st.JobName, state)
+		res.State = changed.State
+		change := changed.settled(st)
+		if st.WorkflowRunId != nil {
+			change.WorkflowName, change.Extra = parent.WorkflowName, parent.Extra
+		}
+		res.Changes = append(res.Changes, change)
+		if st.WorkflowRunId != nil && terminal(changed.State) {
+			more, err := s.propagate(ctx, tx, parent, dag, change)
+			if err != nil {
+				return err
+			}
+			res.Changes = append(res.Changes, more...)
 		}
 		return nil
 	})
-	return res, err
+	if err != nil {
+		return Settled{}, err
+	}
+	return res, nil
 }
 
 // isReferenced: ON DELETE RESTRICT raises 23001 (restrict_violation); 23503 is the plain FK violation.
@@ -468,16 +507,56 @@ func dataException(err error) (reason string, ok bool) {
 	return strings.TrimSpace(pgErr.Message + " " + pgErr.Detail), true
 }
 
-// ───────────── cancel (§2.5) ─────────────
-
 // ResumeRun never locks a workflow node; terminal state is rechecked by the UPDATE.
-func (s *Store) ResumeRun(ctx context.Context, id int64) error {
-	return s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
-		n, err := s.q.ResumeRun(ctx, tx, id)
+func (s *Store) ResumeRun(ctx context.Context, id int64) ([]Change, error) {
+	changes := []Change{}
+	err := s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		identity, err := s.q.RunResumeIdentity(ctx, tx, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if identity.WorkflowRunId != nil {
+			return ErrNode
+		}
+		if identity.ScheduleName != nil {
+			skip, err := s.lockScheduleForResume(ctx, tx, *identity.ScheduleName)
+			if err != nil {
+				return err
+			}
+			state, err := s.q.LockPlainRunState(ctx, tx, id)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrNotFound
+			}
+			if err != nil {
+				return err
+			}
+			if !resumable(state) {
+				return ErrNotResumable
+			}
+			if skip {
+				found, err := s.q.InflightScheduleRunExists(ctx, tx, InflightScheduleRunExistsParams{
+					Name: *identity.ScheduleName, ExcludeRunID: id,
+				})
+				if err != nil {
+					return err
+				}
+				if found {
+					return ErrDuplicate
+				}
+			}
+		}
+		row, err := s.q.ResumeRun(ctx, tx, id)
 		if isPgCode(err, "23505") {
 			return ErrDuplicate
 		}
-		if err != nil || n > 0 {
+		if err == nil {
+			changes = append(changes, changedRun(row).change(ChangeRunResumed, "manual_resume"))
+			return nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
 		isNode, err := s.q.RunIsNode(ctx, tx, id)
@@ -492,6 +571,10 @@ func (s *Store) ResumeRun(ctx context.Context, id int64) error {
 			return ErrNotResumable
 		}
 	})
+	if err != nil {
+		return nil, err
+	}
+	return changes, nil
 }
 
 // ErrNode: the run is a workflow node; cancel and resume go through its workflow.
@@ -499,10 +582,19 @@ var ErrNode = errors.New("store: run is a workflow node")
 
 // CancelRun cancels a plain run: pending ends now, running is flagged for its holder,
 // in one statement so a row moving between the two is re-checked on its new version.
-// Zero rows means the row is terminal (idempotent), a node, or missing.
-func (s *Store) CancelRun(ctx context.Context, id int64) error {
-	return s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
-		_, err := s.q.CancelRun(ctx, tx, id)
+// Zero rows means terminal, already requested, a node, or missing.
+func (s *Store) CancelRun(ctx context.Context, id int64) ([]Change, error) {
+	changes := []Change{}
+	err := s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		row, err := s.q.CancelRun(ctx, tx, id)
+		if err == nil {
+			eventType := ChangeRunCancelRequested
+			if row.State == "cancelled" {
+				eventType = ChangeRunCancelled
+			}
+			changes = append(changes, changedRun(row).change(eventType, "cancel_requested"))
+			return nil
+		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
@@ -517,4 +609,8 @@ func (s *Store) CancelRun(ctx context.Context, id int64) error {
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return changes, nil
 }

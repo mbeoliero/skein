@@ -3,7 +3,6 @@ package skein
 import (
 	"context"
 	"fmt"
-
 	"runtime/debug"
 	"strconv"
 	"sync"
@@ -75,19 +74,15 @@ func (s *inflightSet) cancelAll(cause error) {
 	}
 }
 
-// drain stops tracking everything: Shutdown no longer renews what is left.
 func (s *inflightSet) drain() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	clear(s.m)
 }
 
-// dispatch takes a slot (never blocks: claimOnce only asked for free slots) and runs
-// the claimed row on its own goroutine. active tracks executor goroutines, which is
-// not the same set as inflight: a lease stops being renewed before its executor
-// necessarily returns (§2.3), and Shutdown reports the executors (§2.6 step 5). It is
-// keyed by lease token, not run id: an old attempt that ignores cancellation and the
-// new attempt this process reclaimed after its lease expired share the id.
+// Taking a slot cannot block: claimOnce requests only free slots. active tracks
+// executor lifetimes beyond lease renewal for Shutdown (§2.3/§2.6). It is keyed by token:
+// an old executor and a reclaimed execution can share the same run id.
 func (e *Engine) dispatch(c store.Claimed) {
 	e.slots <- struct{}{}
 	e.active.Store(c.LeaseToken, c.Id)
@@ -95,7 +90,7 @@ func (e *Engine) dispatch(c store.Claimed) {
 		defer func() {
 			e.active.Delete(c.LeaseToken)
 			<-e.slots
-			e.wakeClaimer() // a free slot is a wake source (§2.7): throughput is not capped by the poll
+			e.wakeClaimer()
 		}()
 		e.run(c)
 	})
@@ -111,51 +106,66 @@ func (e *Engine) activeIds() []int64 {
 }
 
 func (e *Engine) run(c store.Claimed) {
-	log := e.log.With("run_id", c.Id, "job_name", c.JobName, "attempt", int(c.Attempt)+1)
+	execId := executionId(c.LeaseToken)
+	log := e.log.With("run_id", c.Id, "job_name", c.JobName, "attempt", int(c.Attempt)+1, "execution_id", execId)
+	baseCtx := restoreTrace(c.Extra)
+	if id := traceId(baseCtx); id != "" {
+		log = log.With("trace_id", id)
+	}
 	policy := parseRetry(c.RetryPolicy)
-	req := &Request{
-		RunId: c.Id, JobName: c.JobName, Attempt: int(c.Attempt) + 1, Params: RawJSON(c.Params),
-		WorkflowRunId: c.WorkflowRunId, IdempotencyKey: "run:" + strconv.FormatInt(c.Id, 10),
+	extra, workflowName := c.Extra, ""
+	var nc store.NodeContext
+	// Direct settlement has no lease renewal; commit before callbacks can delay it.
+	settleClaim := func(st store.Settlement) {
+		res, err := e.commitSettlement(log, st)
+		e.observeReclaim(c, extra, workflowName)
+		if err == nil {
+			e.observe(res.Changes)
+		}
 	}
 
-	// §2.2 checks after the claim, before execution
+	// Cancellation precedes budget checks (§2.2).
 	if c.CancelRequested {
-		e.settle(log, settlementFor(c, store.Cancelled))
+		settleClaim(settlementFor(c, store.Cancelled))
 		return
 	}
 	if c.WorkflowRunId != nil {
 		nctx, cancelNc := context.WithTimeout(context.Background(), claimTimeout)
-		nc, err := e.st.NodeContext(nctx, *c.WorkflowRunId, c.JobName)
+		var err error
+		nc, err = e.st.NodeContext(nctx, *c.WorkflowRunId, c.JobName)
 		cancelNc()
 		if err != nil {
 			log.Error("read workflow run failed; leaving the lease to expire", "err", err)
+			e.observeReclaim(c, extra, workflowName)
 			return
+		}
+		extra, workflowName = nc.Extra, nc.WorkflowName
+		baseCtx = restoreTrace(nc.Extra)
+		if id := traceId(baseCtx); id != "" {
+			log = log.With("trace_id", id)
 		}
 		if nc.Cancelling {
-			e.settle(log, settlementFor(c, store.Cancelled))
+			settleClaim(settlementFor(c, store.Cancelled))
 			return
 		}
-		req.Input = RawJSON(nc.Input)
-		req.Deps = make(map[string]RawJSON, len(nc.Outputs))
-		for name, out := range nc.Outputs {
-			req.Deps[name] = RawJSON(out)
-		}
-		req.IdempotencyKey = "wf:" + strconv.FormatInt(*c.WorkflowRunId, 10) + "/" + c.JobName
 	}
 	if int(c.Attempt) >= policy.MaxAttempts {
-		e.settle(log, settlementFor(c, store.Interrupted))
+		settleClaim(settlementFor(c, store.Interrupted))
 		return
 	}
+	req := requestFor(c, nc, execId)
+	req.TraceId = traceId(baseCtx)
 	fn := e.executors[c.ExecutorType]
-	ctx, cancel := context.WithCancelCause(context.Background())
+	ctx, cancel := context.WithCancelCause(baseCtx)
 	ctx, cancelTimeout := context.WithTimeoutCause(ctx, time.Duration(c.Timeout)*time.Second, errTimeout)
 	inf := &inflight{id: c.Id, token: c.LeaseToken, cancel: cancel}
 	if !e.inflight.add(e.loopCtx, inf) {
 		cancel(errShuttingDown)
 		cancelTimeout()
 		st := settlementFor(c, store.Released)
+		st.Error = "shutdown"
 		st.Err = encodeErr(errEntry{Attempt: int(c.Attempt) + 1, At: time.Now().UTC(), Kind: "released", Message: "shutdown"})
-		e.settle(log, st)
+		settleClaim(st)
 		return
 	}
 	// once the ctx ends, an executor that keeps running past CancelTimeout stops being renewed (§2.3)
@@ -168,9 +178,18 @@ func (e *Engine) run(c store.Claimed) {
 		}))
 	})
 
-	started := time.Now()
-	out, err := callExecutor(ctx, fn, req)
-	cause := context.Cause(ctx) // nil unless the ctx ended before the executor returned
+	// A slow observer must remain inside lease tracking, and cannot admit an
+	// executor after heartbeat or shutdown cancelled this holder while it waited.
+	e.observeReclaim(c, extra, workflowName)
+	var out RawJSON
+	var took time.Duration
+	err := ctx.Err()
+	if err == nil && !inf.dropped.Load() {
+		started := time.Now()
+		out, err = callExecutor(ctx, fn, req)
+		took = time.Since(started)
+	}
+	cause := context.Cause(ctx)
 	stopAfter()
 	if t := untrack.Load(); t != nil {
 		t.Stop()
@@ -179,19 +198,39 @@ func (e *Engine) run(c store.Claimed) {
 	cancel(nil)
 	e.inflight.removeIf(inf, false)
 	if inf.dropped.Load() {
-		log.Warn("result dropped: lease lost", "duration", time.Since(started))
+		log.Warn("result dropped: lease lost", "duration", took)
 		return
 	}
 	if inf.cancelRequested.Load() {
 		cause = errCancelRequested
 	}
-	e.settleResult(log, c, policy, out, err, cause, time.Since(started))
+	e.settleResult(log, c, policy, out, err, cause, took)
 }
 
-// settlementFor starts a settlement for a claimed row; the node fields make Settle
-// lock the parent first and propagate afterwards.
+// Request identity is owned by the executor; settlement must keep its original
+// parent even if the executor writes through Request.WorkflowRunId (§3.1).
+func requestFor(c store.Claimed, nc store.NodeContext, execId string) *Request {
+	req := &Request{
+		RunId: c.Id, ExecutionId: execId, JobName: c.JobName,
+		Attempt: int(c.Attempt) + 1, Params: RawJSON(c.Params),
+		IdempotencyKey: "run:" + strconv.FormatInt(c.Id, 10),
+	}
+	if c.WorkflowRunId == nil {
+		return req
+	}
+	req.WorkflowRunId = new(*c.WorkflowRunId)
+	req.IdempotencyKey = "wf:" + strconv.FormatInt(*c.WorkflowRunId, 10) + "/" + c.JobName
+	req.Input = RawJSON(nc.Input)
+	req.Deps = make(map[string]RawJSON, len(nc.Outputs))
+	for name, out := range nc.Outputs {
+		req.Deps[name] = RawJSON(out)
+	}
+	return req
+}
+
+// Parent identity makes Settle lock the workflow before updating and propagating.
 func settlementFor(c store.Claimed, outcome store.Outcome) store.Settlement {
-	return store.Settlement{Id: c.Id, Token: c.LeaseToken, WorkflowRunId: c.WorkflowRunId, JobName: c.JobName, Outcome: outcome}
+	return store.Settlement{Id: c.Id, Token: c.LeaseToken, WorkflowRunId: c.WorkflowRunId, Outcome: outcome}
 }
 
 type panicError struct {

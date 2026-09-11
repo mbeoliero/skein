@@ -11,7 +11,7 @@ var (
 	ErrDuplicate    = errors.New("skein: another run already holds this dedup key")
 	ErrReferenced   = errors.New("skein: definition is referenced by a workflow node or schedule")
 	ErrNotDrained   = errors.New("skein: shutdown finished with executors still running")
-	ErrNotResumable = errors.New("skein: run is not failed or cancelled")
+	ErrNotResumable = errors.New("skein: run is not resumable")
 )
 
 // Context causes; settle reads them back with context.Cause to pick the outcome (§2.4).

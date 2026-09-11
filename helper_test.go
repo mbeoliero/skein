@@ -43,7 +43,15 @@ func helperMain() {
 	}
 	cfg := fastConfig(os.Getenv("SKEIN_HELPER_SCHEMA"))
 	if os.Getenv("SKEIN_HELPER_MODE") == "bench" {
-		cfg = benchWorkerConfig(os.Getenv("SKEIN_HELPER_SCHEMA"))
+		cfg, err = benchWorkerConfig(os.Getenv("SKEIN_HELPER_SCHEMA"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "helper bench config:", err)
+			os.Exit(2)
+		}
+	}
+	if os.Getenv("SKEIN_HELPER_MODE") == "trace" {
+		cfg.DisableScheduler = true
+		cfg.HeartbeatInterval, cfg.LeaseTTL = 500*time.Millisecond, 3*time.Second
 	}
 	leaseMode := os.Getenv("SKEIN_HELPER_MODE") == "lease"
 	if leaseMode {
@@ -73,6 +81,9 @@ func helperMain() {
 			}
 			select {} // parent kills us after the provider side effect, before settle
 		})
+	}
+	if os.Getenv("SKEIN_HELPER_MODE") == "trace" {
+		e.Register("trace", traceProbe)
 	}
 	registerBenchExecutors(e)
 	if err := e.Start(context.Background()); err != nil {

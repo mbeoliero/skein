@@ -11,6 +11,7 @@ import (
 	"github.com/mbeoliero/skein/internal/store"
 )
 
+// RunState is a persisted ordinary-run or workflow-node state.
 type RunState string
 
 const (
@@ -54,8 +55,10 @@ type JobRun struct {
 
 	Output RawJSON
 	Errors RawJSON // array of {attempt, at, kind, message}
+	Extra  RawJSON // library-managed metadata
 }
 
+// Runs queries runs and controls ordinary runs; workflow nodes use Workflows.
 type Runs struct{ e *Engine }
 
 func (e *Engine) Runs() *Runs { return &Runs{e: e} }
@@ -63,38 +66,43 @@ func (e *Engine) Runs() *Runs { return &Runs{e: e} }
 func (r *Runs) Get(ctx context.Context, id int64) (*JobRun, error) {
 	row, err := r.e.st.GetJobRun(ctx, id)
 	if err != nil {
-		return nil, mapErr(err, "")
+		return nil, mapErr(err, strconv.FormatInt(id, 10))
 	}
 	return jobRunFromStore(row), nil
 }
 
 // Resume gives a failed or cancelled ordinary run a fresh retry budget with the same identity.
+// A scheduled run also obeys its current schedule's overlap policy; an in-flight
+// conflict returns ErrDuplicate without changing the run. Workflow nodes must be
+// resumed through Workflows.Resume.
 func (r *Runs) Resume(ctx context.Context, id int64) error {
 	if id <= 0 {
 		return fmt.Errorf("skein: run id must be positive")
 	}
-	err := r.e.st.ResumeRun(ctx, id)
+	changes, err := r.e.st.ResumeRun(ctx, id)
 	if errors.Is(err, store.ErrNode) {
 		return fmt.Errorf("skein: run %d is a workflow node; resume its workflow run", id)
 	}
 	if err == nil {
 		r.e.wakeClaimer()
+		r.e.observe(changes)
 	}
 	return mapErr(err, strconv.FormatInt(id, 10))
 }
 
+// RunFilter restricts a run page; empty names and states do not filter.
 type RunFilter struct {
 	JobName string
 	State   RunState
 	Limit   int // default 50, at most 500
 }
 
-// List pages newest first (id descending, idx_job_run_job); cursor is the last id of
+// List pages newest first (id descending); cursor is the last id of
 // the previous page (0 for the first), next is 0 when there is no further page.
 func (r *Runs) List(ctx context.Context, f RunFilter, cursor int64) (page []JobRun, next int64, err error) {
 	limit := pageLimit(f.Limit)
 	rows, err := r.e.st.ListJobRuns(ctx, store.ListJobRunsParams{
-		JobName: optional(f.JobName), State: optional(string(f.State)), Cursor: cursor, Lim: int32(limit + 1), // one more row tells whether a next page exists
+		JobName: optional(f.JobName), State: optional(string(f.State)), Cursor: cursor, Lim: int32(limit + 1),
 	})
 	if err != nil {
 		return nil, 0, err
@@ -129,17 +137,16 @@ func jobRunFromStore(r store.JobRun) *JobRun {
 		State: RunState(r.State), Attempt: int(r.Attempt), CancelRequested: r.CancelRequested,
 		RunAt: r.RunAt, LeaseExpiresAt: r.LeaseExpiresAt,
 		CreatedAt: r.CreatedAt, StartedAt: r.StartedAt, FinishedAt: r.FinishedAt,
-		Output: RawJSON(r.Output), Errors: RawJSON(r.Errors),
+		Output: RawJSON(r.Output), Errors: RawJSON(r.Errors), Extra: RawJSON(r.Extra),
 	}
 	run.RetryPolicy = parseRetry(r.RetryPolicy)
 	run.ScheduleName = deref(r.ScheduleName)
 	run.DedupKey = deref(r.DedupKey)
-	run.LeaseOwner = deref(r.LeaseOwner)
+	run.LeaseOwner = parseExtra(r.Extra).LeaseOwner
 	return run
 }
 
-// parseRetry never fails: the CHECK on job guarantees max_attempts >= 1, and a
-// document this code cannot read still must not retry forever.
+// Malformed or invalid stored policies get one attempt to avoid infinite retries.
 func parseRetry(raw []byte) RetryPolicy {
 	var p RetryPolicy
 	if err := json.Unmarshal(raw, &p); err != nil || p.MaxAttempts < 1 {
@@ -160,9 +167,12 @@ func deref[T any](p *T) T {
 // request at the next heartbeat and settles it as cancelled. Terminal runs are a
 // no-op. Workflow nodes are cancelled through Workflows().CancelRun.
 func (r *Runs) Cancel(ctx context.Context, id int64) error {
-	err := r.e.st.CancelRun(ctx, id)
+	changes, err := r.e.st.CancelRun(ctx, id)
 	if errors.Is(err, store.ErrNode) {
 		return fmt.Errorf("skein: run %d is a workflow node; cancel its workflow run", id)
+	}
+	if err == nil {
+		r.e.observe(changes)
 	}
 	return mapErr(err, strconv.FormatInt(id, 10))
 }

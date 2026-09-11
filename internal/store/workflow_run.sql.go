@@ -8,6 +8,8 @@ package store
 import (
 	"context"
 	"time"
+
+	"uuid"
 )
 
 const ActivateNodes = `-- name: ActivateNodes :execrows
@@ -29,13 +31,14 @@ func (q *Queries) ActivateNodes(ctx context.Context, db DBTX, arg ActivateNodesP
 	return result.RowsAffected(), nil
 }
 
-const CancelUnstartedNodes = `-- name: CancelUnstartedNodes :execrows
+const CancelUnstartedNodes = `-- name: CancelUnstartedNodes :many
 WITH picked AS (
     SELECT id FROM job_run
      WHERE workflow_run_id = $2::bigint AND state IN ('blocked', 'pending')
        FOR UPDATE SKIP LOCKED)
 UPDATE job_run r SET state = 'cancelled', finished_at = now(), errors = r.errors || $1::jsonb
   FROM picked WHERE r.id = picked.id AND r.state IN ('blocked', 'pending')
+RETURNING r.id, r.job_name, r.workflow_run_id, r.executor_type, r.state, r.lease_token, r.extra
 `
 
 type CancelUnstartedNodesParams struct {
@@ -43,18 +46,49 @@ type CancelUnstartedNodesParams struct {
 	WorkflowRunId int64
 }
 
-// §2.4 / §2.5 / §2.9: never wait for a claim or heartbeat on a newly running version;
-// skipped pending nodes observe the cancelling parent after this or a later claim
-func (q *Queries) CancelUnstartedNodes(ctx context.Context, db DBTX, arg CancelUnstartedNodesParams) (int64, error) {
-	result, err := db.Exec(ctx, CancelUnstartedNodes, arg.Err, arg.WorkflowRunId)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+type CancelUnstartedNodesRow struct {
+	Id            int64
+	JobName       string
+	WorkflowRunId *int64
+	ExecutorType  string
+	State         string
+	LeaseToken    *uuid.UUID
+	Extra         []byte
 }
 
-const FinalizeWorkflowRun = `-- name: FinalizeWorkflowRun :exec
+// §2.4 / §2.5 / §2.9: never wait for a claim or heartbeat on a newly running version;
+// skipped pending nodes observe the cancelling parent after this or a later claim
+func (q *Queries) CancelUnstartedNodes(ctx context.Context, db DBTX, arg CancelUnstartedNodesParams) ([]CancelUnstartedNodesRow, error) {
+	rows, err := db.Query(ctx, CancelUnstartedNodes, arg.Err, arg.WorkflowRunId)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []CancelUnstartedNodesRow{}
+	for rows.Next() {
+		var i CancelUnstartedNodesRow
+		if err := rows.Scan(
+			&i.Id,
+			&i.JobName,
+			&i.WorkflowRunId,
+			&i.ExecutorType,
+			&i.State,
+			&i.LeaseToken,
+			&i.Extra,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const FinalizeWorkflowRun = `-- name: FinalizeWorkflowRun :one
 UPDATE workflow_run SET state = $1, finished_at = now() WHERE id = $2
+RETURNING id, workflow_name, state, extra
 `
 
 type FinalizeWorkflowRunParams struct {
@@ -62,10 +96,24 @@ type FinalizeWorkflowRunParams struct {
 	Id    int64
 }
 
+type FinalizeWorkflowRunRow struct {
+	Id           int64
+	WorkflowName string
+	State        string
+	Extra        []byte
+}
+
 // §2.4 finalize: every node terminal, the run takes succeeded / failed / cancelled
-func (q *Queries) FinalizeWorkflowRun(ctx context.Context, db DBTX, arg FinalizeWorkflowRunParams) error {
-	_, err := db.Exec(ctx, FinalizeWorkflowRun, arg.State, arg.Id)
-	return err
+func (q *Queries) FinalizeWorkflowRun(ctx context.Context, db DBTX, arg FinalizeWorkflowRunParams) (FinalizeWorkflowRunRow, error) {
+	row := db.QueryRow(ctx, FinalizeWorkflowRun, arg.State, arg.Id)
+	var i FinalizeWorkflowRunRow
+	err := row.Scan(
+		&i.Id,
+		&i.WorkflowName,
+		&i.State,
+		&i.Extra,
+	)
+	return i, err
 }
 
 const FindDedupWorkflowRun = `-- name: FindDedupWorkflowRun :one
@@ -105,7 +153,7 @@ func (q *Queries) FindInflightWorkflowBeat(ctx context.Context, db DBTX, arg Fin
 }
 
 const GetWorkflowRun = `-- name: GetWorkflowRun :one
-SELECT id, workflow_name, schedule_name, scheduled_at, dedup_key, input, dag, state, created_at, finished_at FROM workflow_run WHERE id = $1
+SELECT id, workflow_name, schedule_name, scheduled_at, dedup_key, input, dag, state, created_at, finished_at, extra FROM workflow_run WHERE id = $1
 `
 
 // §2.5 Resume and §3.3: the parent row alone
@@ -123,41 +171,48 @@ func (q *Queries) GetWorkflowRun(ctx context.Context, db DBTX, id int64) (Workfl
 		&i.State,
 		&i.CreatedAt,
 		&i.FinishedAt,
+		&i.Extra,
 	)
 	return i, err
 }
 
-const InsertNodeRun = `-- name: InsertNodeRun :exec
+const InsertNodeRuns = `-- name: InsertNodeRuns :exec
 INSERT INTO job_run (job_name, workflow_run_id, executor_type, params, timeout, retry_policy, state)
-VALUES ($1, $2::bigint, $3, $4, $5, $6, $7)
+SELECT v.job_name, $1::bigint, v.executor_type, v.params, v.timeout, v.retry_policy, v.state
+  FROM (SELECT unnest($2::text[]) AS job_name,
+               unnest($3::text[]) AS executor_type,
+               unnest($4::jsonb[]) AS params,
+               unnest($5::int[]) AS timeout,
+               unnest($6::jsonb[]) AS retry_policy,
+               unnest($7::text[]) AS state) v
 `
 
-type InsertNodeRunParams struct {
-	JobName       string
+type InsertNodeRunsParams struct {
 	WorkflowRunId int64
-	ExecutorType  string
-	Params        []byte
-	Timeout       int32
-	RetryPolicy   []byte
-	State         string
+	JobNames      []string
+	ExecutorTypes []string
+	Params        [][]byte
+	Timeouts      []int32
+	RetryPolicies [][]byte
+	States        []string
 }
 
-// §2.1: one job_run per node, blocked while it has predecessors
-func (q *Queries) InsertNodeRun(ctx context.Context, db DBTX, arg InsertNodeRunParams) error {
-	_, err := db.Exec(ctx, InsertNodeRun,
-		arg.JobName,
+// §2.1: bulk-create the already-read node snapshots in the parent's transaction.
+func (q *Queries) InsertNodeRuns(ctx context.Context, db DBTX, arg InsertNodeRunsParams) error {
+	_, err := db.Exec(ctx, InsertNodeRuns,
 		arg.WorkflowRunId,
-		arg.ExecutorType,
+		arg.JobNames,
+		arg.ExecutorTypes,
 		arg.Params,
-		arg.Timeout,
-		arg.RetryPolicy,
-		arg.State,
+		arg.Timeouts,
+		arg.RetryPolicies,
+		arg.States,
 	)
 	return err
 }
 
 const ListWorkflowRuns = `-- name: ListWorkflowRuns :many
-SELECT id, workflow_name, schedule_name, scheduled_at, dedup_key, input, dag, state, created_at, finished_at FROM workflow_run
+SELECT id, workflow_name, schedule_name, scheduled_at, dedup_key, input, dag, state, created_at, finished_at, extra FROM workflow_run
  WHERE ($1::text IS NULL OR workflow_name = $1::text)
    AND ($2::text IS NULL OR state = $2::text)
    AND ($3::bigint = 0 OR id < $3::bigint)
@@ -197,6 +252,7 @@ func (q *Queries) ListWorkflowRuns(ctx context.Context, db DBTX, arg ListWorkflo
 			&i.State,
 			&i.CreatedAt,
 			&i.FinishedAt,
+			&i.Extra,
 		); err != nil {
 			return nil, err
 		}
@@ -209,33 +265,52 @@ func (q *Queries) ListWorkflowRuns(ctx context.Context, db DBTX, arg ListWorkflo
 }
 
 const LockWorkflowRun = `-- name: LockWorkflowRun :one
-SELECT state, dag FROM workflow_run WHERE id = $1 FOR UPDATE
+SELECT state, dag, workflow_name, extra FROM workflow_run WHERE id = $1 FOR UPDATE
 `
 
 type LockWorkflowRunRow struct {
-	State string
-	Dag   []byte
+	State        string
+	Dag          []byte
+	WorkflowName string
+	Extra        []byte
 }
 
 // §2.4 / §2.5: first link of the lock order workflow_run → job_run
 func (q *Queries) LockWorkflowRun(ctx context.Context, db DBTX, id int64) (LockWorkflowRunRow, error) {
 	row := db.QueryRow(ctx, LockWorkflowRun, id)
 	var i LockWorkflowRunRow
-	err := row.Scan(&i.State, &i.Dag)
+	err := row.Scan(
+		&i.State,
+		&i.Dag,
+		&i.WorkflowName,
+		&i.Extra,
+	)
 	return i, err
 }
 
-const MarkWorkflowCancelling = `-- name: MarkWorkflowCancelling :execrows
+const MarkWorkflowCancelling = `-- name: MarkWorkflowCancelling :one
 UPDATE workflow_run SET state = 'cancelling' WHERE id = $1 AND state = 'running'
+RETURNING id, workflow_name, state, extra
 `
 
+type MarkWorkflowCancellingRow struct {
+	Id           int64
+	WorkflowName string
+	State        string
+	Extra        []byte
+}
+
 // §2.4 / §2.5: fail-fast and Workflows.Cancel: running → cancelling; 0 rows = already cancelling or terminal
-func (q *Queries) MarkWorkflowCancelling(ctx context.Context, db DBTX, id int64) (int64, error) {
-	result, err := db.Exec(ctx, MarkWorkflowCancelling, id)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+func (q *Queries) MarkWorkflowCancelling(ctx context.Context, db DBTX, id int64) (MarkWorkflowCancellingRow, error) {
+	row := db.QueryRow(ctx, MarkWorkflowCancelling, id)
+	var i MarkWorkflowCancellingRow
+	err := row.Scan(
+		&i.Id,
+		&i.WorkflowName,
+		&i.State,
+		&i.Extra,
+	)
+	return i, err
 }
 
 const NodeOutputs = `-- name: NodeOutputs :many
@@ -304,22 +379,38 @@ func (q *Queries) NodeStates(ctx context.Context, db DBTX, workflowRunID int64) 
 	return items, nil
 }
 
-const ReopenWorkflowRun = `-- name: ReopenWorkflowRun :exec
+const ReopenWorkflowRun = `-- name: ReopenWorkflowRun :one
 UPDATE workflow_run SET state = 'running', finished_at = NULL WHERE id = $1
+RETURNING id, workflow_name, state, extra
 `
 
-// §2.5: back to running; the dedup index may reject it with 23505 → ErrDuplicate
-func (q *Queries) ReopenWorkflowRun(ctx context.Context, db DBTX, id int64) error {
-	_, err := db.Exec(ctx, ReopenWorkflowRun, id)
-	return err
+type ReopenWorkflowRunRow struct {
+	Id           int64
+	WorkflowName string
+	State        string
+	Extra        []byte
 }
 
-const ResumeNodes = `-- name: ResumeNodes :exec
+// §2.5: back to running; the dedup index may reject it with 23505 → ErrDuplicate
+func (q *Queries) ReopenWorkflowRun(ctx context.Context, db DBTX, id int64) (ReopenWorkflowRunRow, error) {
+	row := db.QueryRow(ctx, ReopenWorkflowRun, id)
+	var i ReopenWorkflowRunRow
+	err := row.Scan(
+		&i.Id,
+		&i.WorkflowName,
+		&i.State,
+		&i.Extra,
+	)
+	return i, err
+}
+
+const ResumeNodes = `-- name: ResumeNodes :many
 UPDATE job_run r
    SET state = v.state, attempt = 0, run_at = now(),
        started_at = NULL, finished_at = NULL, output = NULL
   FROM (SELECT unnest($2::text[]) AS job_name, unnest($3::text[]) AS state) v
  WHERE r.workflow_run_id = $1::bigint AND r.job_name = v.job_name
+RETURNING r.id, r.job_name, r.workflow_run_id, r.executor_type, r.state, r.lease_token, r.extra
 `
 
 type ResumeNodesParams struct {
@@ -328,16 +419,49 @@ type ResumeNodesParams struct {
 	States        []string
 }
 
+type ResumeNodesRow struct {
+	Id            int64
+	JobName       string
+	WorkflowRunId *int64
+	ExecutorType  string
+	State         string
+	LeaseToken    *uuid.UUID
+	Extra         []byte
+}
+
 // §2.5: the reset set goes back to pending / blocked with attempt 0; errors are kept
-func (q *Queries) ResumeNodes(ctx context.Context, db DBTX, arg ResumeNodesParams) error {
-	_, err := db.Exec(ctx, ResumeNodes, arg.WorkflowRunId, arg.JobNames, arg.States)
-	return err
+func (q *Queries) ResumeNodes(ctx context.Context, db DBTX, arg ResumeNodesParams) ([]ResumeNodesRow, error) {
+	rows, err := db.Query(ctx, ResumeNodes, arg.WorkflowRunId, arg.JobNames, arg.States)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ResumeNodesRow{}
+	for rows.Next() {
+		var i ResumeNodesRow
+		if err := rows.Scan(
+			&i.Id,
+			&i.JobName,
+			&i.WorkflowRunId,
+			&i.ExecutorType,
+			&i.State,
+			&i.LeaseToken,
+			&i.Extra,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const TriggerWorkflow = `-- name: TriggerWorkflow :one
-INSERT INTO workflow_run (workflow_name, dedup_key, schedule_name, scheduled_at, input, dag, state)
+INSERT INTO workflow_run (workflow_name, dedup_key, schedule_name, scheduled_at, input, dag, state, extra)
 VALUES ($1, $2::text, $3::text, $4::timestamptz,
-        $5::jsonb, $6::jsonb, 'running')
+        $5::jsonb, $6::jsonb, 'running', coalesce($7::jsonb, '{}'::jsonb))
 ON CONFLICT DO NOTHING
 RETURNING id
 `
@@ -349,6 +473,7 @@ type TriggerWorkflowParams struct {
 	ScheduledAt  *time.Time
 	Input        []byte
 	Dag          []byte
+	Extra        []byte
 }
 
 // §2.1: the parent row with the DAG snapshot; ErrNoRows = dedup conflict
@@ -360,32 +485,53 @@ func (q *Queries) TriggerWorkflow(ctx context.Context, db DBTX, arg TriggerWorkf
 		arg.ScheduledAt,
 		arg.Input,
 		arg.Dag,
+		arg.Extra,
 	)
 	var id int64
 	err := row.Scan(&id)
 	return id, err
 }
 
+const WorkflowResumeIdentity = `-- name: WorkflowResumeIdentity :one
+SELECT schedule_name FROM workflow_run WHERE id = $1
+`
+
+// §2.5 / §2.9: schedule_name is immutable; discover its name lock before locking the parent.
+func (q *Queries) WorkflowResumeIdentity(ctx context.Context, db DBTX, id int64) (*string, error) {
+	row := db.QueryRow(ctx, WorkflowResumeIdentity, id)
+	var schedule_name *string
+	err := row.Scan(&schedule_name)
+	return schedule_name, err
+}
+
 const WorkflowRunHeader = `-- name: WorkflowRunHeader :one
-SELECT state, input, dag FROM workflow_run WHERE id = $1
+SELECT state, input, dag, extra, workflow_name FROM workflow_run WHERE id = $1
 `
 
 type WorkflowRunHeaderRow struct {
-	State string
-	Input []byte
-	Dag   []byte
+	State        string
+	Input        []byte
+	Dag          []byte
+	Extra        []byte
+	WorkflowName string
 }
 
 // §2.2: the worker reads the parent without a lock
 func (q *Queries) WorkflowRunHeader(ctx context.Context, db DBTX, id int64) (WorkflowRunHeaderRow, error) {
 	row := db.QueryRow(ctx, WorkflowRunHeader, id)
 	var i WorkflowRunHeaderRow
-	err := row.Scan(&i.State, &i.Input, &i.Dag)
+	err := row.Scan(
+		&i.State,
+		&i.Input,
+		&i.Dag,
+		&i.Extra,
+		&i.WorkflowName,
+	)
 	return i, err
 }
 
 const WorkflowRunWithNodes = `-- name: WorkflowRunWithNodes :many
-SELECT w.id, w.workflow_name, w.schedule_name, w.scheduled_at, w.dedup_key, w.input, w.dag, w.state, w.created_at, w.finished_at, r.id, r.job_name, r.schedule_name, r.scheduled_at, r.dedup_key, r.workflow_run_id, r.executor_type, r.params, r.timeout, r.retry_policy, r.state, r.attempt, r.cancel_requested, r.run_at, r.lease_expires_at, r.lease_token, r.lease_owner, r.created_at, r.started_at, r.finished_at, r.output, r.errors
+SELECT w.id, w.workflow_name, w.schedule_name, w.scheduled_at, w.dedup_key, w.input, w.dag, w.state, w.created_at, w.finished_at, w.extra, r.id, r.job_name, r.schedule_name, r.scheduled_at, r.dedup_key, r.workflow_run_id, r.executor_type, r.params, r.timeout, r.retry_policy, r.state, r.attempt, r.cancel_requested, r.run_at, r.lease_expires_at, r.lease_token, r.created_at, r.started_at, r.finished_at, r.output, r.errors, r.extra
   FROM workflow_run w JOIN job_run r ON r.workflow_run_id = w.id
  WHERE w.id = $1 ORDER BY r.job_name
 `
@@ -417,6 +563,7 @@ func (q *Queries) WorkflowRunWithNodes(ctx context.Context, db DBTX, id int64) (
 			&i.WorkflowRun.State,
 			&i.WorkflowRun.CreatedAt,
 			&i.WorkflowRun.FinishedAt,
+			&i.WorkflowRun.Extra,
 			&i.JobRun.Id,
 			&i.JobRun.JobName,
 			&i.JobRun.ScheduleName,
@@ -433,12 +580,12 @@ func (q *Queries) WorkflowRunWithNodes(ctx context.Context, db DBTX, id int64) (
 			&i.JobRun.RunAt,
 			&i.JobRun.LeaseExpiresAt,
 			&i.JobRun.LeaseToken,
-			&i.JobRun.LeaseOwner,
 			&i.JobRun.CreatedAt,
 			&i.JobRun.StartedAt,
 			&i.JobRun.FinishedAt,
 			&i.JobRun.Output,
 			&i.JobRun.Errors,
+			&i.JobRun.Extra,
 		); err != nil {
 			return nil, err
 		}

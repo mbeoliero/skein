@@ -23,11 +23,10 @@ type RetryPolicy struct {
 	Jitter      float64 `json:"jitter,omitzero"`
 }
 
-// maxRetrySeconds bounds base_sec and max_sec: 30 days, far inside what time.Duration holds.
+// Keep retry seconds within time.Duration's range.
 const maxRetrySeconds = 30 * 24 * 60 * 60
 
-// validate is the one rule for job.retry_policy and Config.DefaultRetry: attempt is a
-// smallint, and the backoff is computed in time.Duration.
+// Attempt is stored as smallint; backoff is computed as time.Duration.
 func (p RetryPolicy) validate() error {
 	switch {
 	case p.MaxAttempts < 1 || p.MaxAttempts > math.MaxInt16:
@@ -40,6 +39,7 @@ func (p RetryPolicy) validate() error {
 	return nil
 }
 
+// JobSpec declares the execution settings copied into subsequently submitted runs.
 type JobSpec struct {
 	Name         string
 	ExecutorType string
@@ -48,13 +48,12 @@ type JobSpec struct {
 	Retry        RetryPolicy   // default Config.DefaultRetry
 }
 
+// Jobs declares definitions and submits ordinary runs.
 type Jobs struct{ e *Engine }
 
 func (e *Engine) Jobs() *Jobs { return &Jobs{e: e} }
 
-// maxNameLen bounds job, workflow, schedule and executor type names. They are keys
-// and they travel: into dedup keys, into errors entries ("<job> failed"), into the
-// NOTIFY payload. Bounding them at the source keeps every one of those bounded.
+// Name bytes also consume space in dedup keys, errors and NOTIFY payloads.
 const maxNameLen = 255
 
 func validName(kind, name string) error {
@@ -81,7 +80,7 @@ func (j *Jobs) Declare(ctx context.Context, spec JobSpec) error {
 		return fmt.Errorf("skein: job %q timeout %w", spec.Name, err)
 	}
 	retry := spec.Retry
-	if retry == (RetryPolicy{}) { // only the untouched policy takes the default; {BaseSec: -1} must fail validation, not vanish
+	if retry == (RetryPolicy{}) { // partial policies are validated as given
 		retry = j.e.cfg.DefaultRetry
 	}
 	if err := retry.validate(); err != nil {
@@ -97,8 +96,7 @@ func (j *Jobs) Declare(ctx context.Context, spec JobSpec) error {
 	})
 }
 
-// validTimeout is the one rule for job.timeout and Config.DefaultTimeout: whole
-// seconds in an integer column, so 1s up to what int32 holds.
+// Timeouts are stored as whole seconds in an integer column.
 func validTimeout(d time.Duration) error {
 	if d < time.Second || d/time.Second > math.MaxInt32 {
 		return fmt.Errorf("must be between 1s and %d seconds, got %s", math.MaxInt32, d)
@@ -112,6 +110,7 @@ func (j *Jobs) Delete(ctx context.Context, name string) error {
 	return mapErr(j.e.st.DeleteJob(ctx, name), name)
 }
 
+// TriggerOption configures submission through At or DedupKey.
 type TriggerOption func(*triggerOptions)
 
 type triggerOptions struct {
@@ -139,8 +138,12 @@ func (j *Jobs) Trigger(ctx context.Context, name string, params RawJSON, opts ..
 	return id, err
 }
 
-// TriggerTx is Trigger inside the caller's transaction: the run becomes visible when
-// the caller commits.
+// TriggerTx applies Trigger inside tx without committing it. The run and its wakeup
+// become visible only when the caller commits. ErrDuplicate returns the retained
+// holder's id (possibly zero if it vanished), without aborting tx.
+// The caller's search_path is restored before return. A SQL or path-restoration
+// failure requires the caller to roll back; a restoration failure takes precedence
+// over a dedup result. The caller must not use tx concurrently with this call.
 func (j *Jobs) TriggerTx(ctx context.Context, tx pgx.Tx, name string, params RawJSON, opts ...TriggerOption) (int64, error) {
 	if tx == nil {
 		return 0, errors.New("skein: TriggerTx needs a transaction")
@@ -157,12 +160,13 @@ func (j *Jobs) trigger(ctx context.Context, tx pgx.Tx, name string, params RawJS
 	if err != nil {
 		return 0, fmt.Errorf("skein: trigger %q params: %w", name, err)
 	}
-	id, err := j.e.st.TriggerJob(ctx, tx, store.TriggerJobParams{JobName: name, Params: p, DedupKey: o.dedup, RunAt: o.at})
+	id, err := j.e.st.TriggerJob(ctx, tx, store.TriggerJobParams{
+		JobName: name, Params: p, DedupKey: o.dedup, RunAt: o.at, Extra: traceExtra(ctx),
+	})
 	return id, mapErr(err, name)
 }
 
-// objectPayload validates a params / input document: an object within MaxPayload. An
-// absent document is the empty object and is checked like any other (§3.1).
+// Missing input becomes {}; it must still pass MaxPayload and object validation.
 func (e *Engine) objectPayload(raw RawJSON) ([]byte, error) {
 	if len(raw) == 0 {
 		raw = RawJSON("{}")

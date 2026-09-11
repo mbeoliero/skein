@@ -1,9 +1,9 @@
 -- name: TriggerJob :one
 -- §2.1 Jobs.Trigger: snapshot the job into a pending run; ErrNoRows = job missing or dedup conflict
-INSERT INTO job_run (job_name, dedup_key, schedule_name, scheduled_at, executor_type, params, timeout, retry_policy, state, run_at)
+INSERT INTO job_run (job_name, dedup_key, schedule_name, scheduled_at, executor_type, params, timeout, retry_policy, state, run_at, extra)
 SELECT j.name, sqlc.narg(dedup_key)::text, sqlc.narg(schedule_name)::text, sqlc.narg(scheduled_at)::timestamptz,
        j.executor_type, j.params || @params::jsonb, j.timeout, j.retry_policy,
-       'pending', coalesce(sqlc.narg(run_at)::timestamptz, now())
+       'pending', coalesce(sqlc.narg(run_at)::timestamptz, now()), coalesce(sqlc.narg(extra)::jsonb, '{}'::jsonb)
   FROM job j WHERE j.name = @job_name
 ON CONFLICT DO NOTHING
 RETURNING id;
@@ -30,12 +30,13 @@ WITH picked AS (
      ORDER BY run_at LIMIT @lim::int
        FOR UPDATE SKIP LOCKED)
 UPDATE job_run r
-   SET state = 'running', lease_token = gen_random_uuid(), lease_owner = @owner::text,
+   SET state = 'running', lease_token = gen_random_uuid(),
+       extra = jsonb_set(r.extra, '{lease_owner}', to_jsonb(@owner::text)),
        lease_expires_at = now() + @lease_ttl::interval, started_at = now()
   FROM picked WHERE r.id = picked.id
 RETURNING r.id, r.job_name, r.workflow_run_id, r.executor_type, r.params, r.timeout,
           r.retry_policy, r.attempt, r.cancel_requested, r.lease_token::uuid AS lease_token,
-          extract(epoch FROM now() - r.run_at)::float8 AS waited_sec;
+          extract(epoch FROM now() - r.run_at)::float8 AS waited_sec, r.extra;
 
 -- name: NextPendingAt :many
 -- §2.2 / §2.7: the earliest pending run_at per registered type, one idx_job_run_claim probe each; the caller
@@ -56,19 +57,19 @@ SELECT x.run_at::timestamptz AS next_due, clock_timestamp()::timestamptz AS db_n
 WITH picked AS (
     SELECT id FROM job_run
      WHERE state = 'running' AND executor_type = ANY(@executor_types::text[]) AND lease_expires_at <= now()
-     LIMIT @lim::int
+     ORDER BY lease_expires_at, id LIMIT @lim::int
        FOR UPDATE SKIP LOCKED)
 UPDATE job_run r
    SET attempt = LEAST(r.attempt + 1, 32767),
        errors = r.errors || jsonb_build_array(jsonb_build_object(
                   'attempt', LEAST(r.attempt + 1, 32767), 'at', now(), 'kind', 'interrupted',
-                  'message', 'lease expired; last owner ' || coalesce(r.lease_owner, '?'))),
-       lease_token = gen_random_uuid(), lease_owner = @owner::text,
+                  'message', 'lease expired; last owner ' || coalesce(r.extra ->> 'lease_owner', '?'))),
+       lease_token = gen_random_uuid(), extra = jsonb_set(r.extra, '{lease_owner}', to_jsonb(@owner::text)),
        lease_expires_at = now() + @lease_ttl::interval, started_at = now()
   FROM picked WHERE r.id = picked.id
 RETURNING r.id, r.job_name, r.workflow_run_id, r.executor_type, r.params, r.timeout,
           r.retry_policy, r.attempt, r.cancel_requested, r.lease_token::uuid AS lease_token,
-          extract(epoch FROM now() - r.run_at)::float8 AS waited_sec;
+          extract(epoch FROM now() - r.run_at)::float8 AS waited_sec, r.extra;
 
 -- name: Heartbeat :many
 -- §2.3: one statement renews every lease this process holds; only lease_expires_at changes (HOT);
@@ -89,18 +90,18 @@ RETURNING r.id, r.cancel_requested,
 -- §2.4 succeeded exit; the fence is lease_token AND state = 'running', zero rows = ErrLeaseLost
 UPDATE job_run
    SET state = 'succeeded', output = @output, finished_at = now(),
-       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
+       lease_token = NULL, lease_expires_at = NULL, extra = extra - 'lease_owner'
  WHERE id = @id AND lease_token = @token::uuid AND state = 'running'
-RETURNING state;
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra;
 
 -- name: SettleCancelled :one
 -- §2.4 cancelled exit, same fence
 UPDATE job_run
    SET state = 'cancelled', finished_at = now(),
        errors = errors || COALESCE(sqlc.narg(err)::jsonb, '[]'::jsonb),
-       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
+       lease_token = NULL, lease_expires_at = NULL, extra = extra - 'lease_owner'
  WHERE id = @id AND lease_token = @token::uuid AND state = 'running'
-RETURNING state;
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra;
 
 -- name: SettleReleased :one
 -- §2.4 / §2.6 graceful shutdown: back to pending now, attempt unchanged, a released entry for the alert
@@ -108,9 +109,9 @@ UPDATE job_run
    SET state       = CASE WHEN cancel_requested OR @wf_cancelling::boolean THEN 'cancelled' ELSE 'pending' END,
        finished_at = CASE WHEN cancel_requested OR @wf_cancelling::boolean THEN now() END,
        run_at = now(), errors = errors || @err::jsonb,
-       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
+       lease_token = NULL, lease_expires_at = NULL, extra = extra - 'lease_owner'
  WHERE id = @id AND lease_token = @token::uuid AND state = 'running'
-RETURNING state,
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra,
           (SELECT count(*) FROM jsonb_array_elements(errors) x WHERE x->>'kind' = 'released')::int AS released_count;
 
 -- name: SettleRetry :one
@@ -119,9 +120,9 @@ UPDATE job_run
    SET state       = CASE WHEN cancel_requested OR @wf_cancelling::boolean THEN 'cancelled' ELSE 'pending' END,
        finished_at = CASE WHEN cancel_requested OR @wf_cancelling::boolean THEN now() END,
        attempt = attempt + 1, run_at = now() + @backoff::interval, errors = errors || @err::jsonb,
-       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
+       lease_token = NULL, lease_expires_at = NULL, extra = extra - 'lease_owner'
  WHERE id = @id AND lease_token = @token::uuid AND state = 'running'
-RETURNING state;
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra;
 
 -- name: SettleSnoozed :one
 -- §2.4 / §3.2: normal waiting, no attempt/error/output change; cancellation still wins.
@@ -132,47 +133,57 @@ UPDATE job_run
        finished_at = CASE WHEN cancel_requested OR @wf_cancelling::boolean THEN now() END,
        run_at = now() + sqlc.arg(delay)::interval
               + CASE WHEN sqlc.arg(round_up)::boolean THEN interval '1 microsecond' ELSE interval '0' END,
-       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
+       lease_token = NULL, lease_expires_at = NULL, extra = extra - 'lease_owner'
  WHERE id = @id AND lease_token = @token::uuid AND state = 'running'
-RETURNING state;
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra;
 
 -- name: SettleFailed :one
 -- §2.4 permanent failure or no attempts left
 UPDATE job_run
    SET state = CASE WHEN cancel_requested OR @wf_cancelling::boolean THEN 'cancelled' ELSE 'failed' END,
        attempt = attempt + 1, errors = errors || @err::jsonb, finished_at = now(),
-       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
+       lease_token = NULL, lease_expires_at = NULL, extra = extra - 'lease_owner'
  WHERE id = @id AND lease_token = @token::uuid AND state = 'running'
-RETURNING state;
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra;
 
 -- name: SettleInterrupted :one
 -- §2.2: reclaimed with attempt >= max_attempts; the interrupted entry was appended by ClaimExpired
 UPDATE job_run
    SET state = CASE WHEN cancel_requested OR @wf_cancelling::boolean THEN 'cancelled' ELSE 'failed' END,
        finished_at = now(),
-       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
+       lease_token = NULL, lease_expires_at = NULL, extra = extra - 'lease_owner'
  WHERE id = @id AND lease_token = @token::uuid AND state = 'running'
-RETURNING state;
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra;
 
 -- name: CancelRun :one
 -- §2.5 Runs.Cancel: plain runs only; a pending row ends now, a running row is flagged and its
 -- holder settles it as cancelled after the next heartbeat. One statement for both states: a row
 -- that a concurrent claim or settle moves between them is re-checked on its new version, so
--- zero rows keeps its §2.9 meaning (terminal, a node, or missing) and never means "moved".
+-- zero rows means terminal, already requested, a node, or missing; never "moved".
 UPDATE job_run
    SET state            = CASE WHEN state = 'pending' THEN 'cancelled' ELSE state END,
        finished_at      = CASE WHEN state = 'pending' THEN now() ELSE finished_at END,
        cancel_requested = CASE WHEN state = 'running' THEN true ELSE cancel_requested END
  WHERE id = @id AND state IN ('pending', 'running') AND workflow_run_id IS NULL
-RETURNING state;
+   AND (state = 'pending' OR NOT cancel_requested)
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra;
 
--- name: ResumeRun :execrows
+-- name: ResumeRun :one
 -- §2.5: ordinary terminal runs only; recheck state after a concurrent resume.
 UPDATE job_run
    SET state = 'pending', attempt = 0, run_at = now(),
-       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL,
+       lease_token = NULL, lease_expires_at = NULL, extra = extra - 'lease_owner',
        started_at = NULL, finished_at = NULL, output = NULL, cancel_requested = false
- WHERE id = @id AND workflow_run_id IS NULL AND state IN ('failed', 'cancelled');
+ WHERE id = @id AND workflow_run_id IS NULL AND state IN ('failed', 'cancelled')
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra;
+
+-- name: RunResumeIdentity :one
+-- §2.5 / §2.9: read immutable ownership without locks before choosing the scheduled Resume lock order.
+SELECT schedule_name, workflow_run_id FROM job_run WHERE id = @id;
+
+-- name: LockPlainRunState :one
+-- §2.5 / §2.9: scheduled Resume locks its plain run only after the name and schedule row; nodes are never locked here.
+SELECT state FROM job_run WHERE id = @id AND workflow_run_id IS NULL FOR UPDATE;
 
 -- name: RunIsNode :one
 -- §2.5 Runs.Cancel: a node is cancelled through its parent (Workflows.CancelRun), never directly

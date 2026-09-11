@@ -219,7 +219,8 @@ func TestRaceSnoozeVsWorkflowCancellation(t *testing.T) {
 					},
 					func() error {
 						if name == "cancel" {
-							return st.CancelWorkflow(ctx, id)
+							_, err := st.CancelWorkflow(ctx, id)
+							return err
 						}
 						s := settlementFor(failing, store.Failed)
 						s.Err = encodeErr(errEntry{Attempt: 1, Kind: "business", Message: "failed"})
@@ -297,5 +298,124 @@ func TestRaceHeartbeatVsFailFast(t *testing.T) {
 		if err := e.Workflows().CancelRun(ctx, id); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestRaceScheduledResumeVsScan(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		workflow  bool
+		recreated bool
+	}{
+		{name: "job"},
+		{name: "workflow", workflow: true},
+		{name: "recreated_job", recreated: true},
+		{name: "recreated_workflow", workflow: true, recreated: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e, pool, schema := protocolEngine(t)
+			for round := range raceRounds() {
+				spec := protocolSpec(tc.workflow)
+				if err := e.Schedules().Put(t.Context(), spec); err != nil {
+					t.Fatal(err)
+				}
+				old := protocolBeat(t, e, pool, schema, "s", 1)
+				cancelProtocolBeat(t, e, old)
+				spec.Overlap = OverlapSkip
+				if tc.recreated {
+					if err := e.Schedules().Delete(t.Context(), "s"); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					if err := e.Schedules().Put(t.Context(), spec); err != nil {
+						t.Fatal(err)
+					}
+					execSql(t, pool, "UPDATE "+qualified(schema, "schedule")+" SET next_run_at = now() - interval '1 hour'")
+				}
+				var scan store.Scan
+				errs := parallel(
+					func() error { return resumeProtocolBeat(t.Context(), e, old) },
+					func() error {
+						if tc.recreated {
+							if err := e.Schedules().Put(t.Context(), spec); err != nil {
+								return err
+							}
+							_, err := pool.Exec(t.Context(), "UPDATE "+qualified(schema, "schedule")+" SET next_run_at = now() - interval '1 hour'")
+							if err != nil {
+								return err
+							}
+						}
+						var err error
+						scan, err = e.st.ScanDue(t.Context(), nextRun)
+						return err
+					},
+				)
+				noDeadlock(t, round, errs)
+				if errs[1] != nil {
+					t.Fatalf("round %d scan: %v", round, errs[1])
+				}
+				switch {
+				case errs[0] == nil:
+					if len(scan.Fired) > 0 && !scan.Fired[0].Skipped {
+						t.Fatalf("round %d resumed and fired: %+v", round, scan)
+					}
+					cancelProtocolBeat(t, e, old)
+				case errors.Is(errs[0], ErrDuplicate):
+					if len(scan.Fired) != 1 || scan.Fired[0].Skipped || scan.Fired[0].RunId == 0 {
+						t.Fatalf("round %d duplicate without a winning scan: %+v", round, scan)
+					}
+					cancelProtocolBeat(t, e, scan.Fired[0])
+				default:
+					t.Fatalf("round %d resume: %v", round, errs[0])
+				}
+				// A skipped locked candidate remains due; clear it before making the next fixture.
+				dueAt(t, pool, schema, "s", nextNewYear())
+			}
+		})
+	}
+}
+
+func TestRaceHistoricalAllowResumes(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		workflow bool
+	}{
+		{name: "job"},
+		{name: "workflow", workflow: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e, pool, schema := protocolEngine(t)
+			for round := range raceRounds() {
+				spec := protocolSpec(tc.workflow)
+				if err := e.Schedules().Put(t.Context(), spec); err != nil {
+					t.Fatal(err)
+				}
+				first := protocolBeat(t, e, pool, schema, "s", 1)
+				second := protocolBeat(t, e, pool, schema, "s", 2)
+				cancelProtocolBeat(t, e, first)
+				cancelProtocolBeat(t, e, second)
+				spec.Overlap = OverlapSkip
+				if err := e.Schedules().Put(t.Context(), spec); err != nil {
+					t.Fatal(err)
+				}
+				errs := parallel(
+					func() error { return resumeProtocolBeat(t.Context(), e, first) },
+					func() error { return resumeProtocolBeat(t.Context(), e, second) },
+				)
+				noDeadlock(t, round, errs)
+				switch {
+				case errs[0] == nil && errors.Is(errs[1], ErrDuplicate):
+					cancelProtocolBeat(t, e, first)
+				case errs[1] == nil && errors.Is(errs[0], ErrDuplicate):
+					cancelProtocolBeat(t, e, second)
+				default:
+					t.Fatalf("round %d needs exactly one admitted Resume: %v", round, errs)
+				}
+			}
+		})
 	}
 }

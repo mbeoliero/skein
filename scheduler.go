@@ -17,13 +17,13 @@ func (e *Engine) scheduleLoop(ctx context.Context) {
 	}
 }
 
-// scanOnce is one §2.1 tick. Like a claim it runs on its own bounded ctx so a tick
-// that already committed is always accounted for. It returns how long the loop waits
-// unless woken: until the nearest next_run_at, or nothing at all after a full batch.
+// Keep an independent bounded ctx so committed scans are always accounted for (§2.1/§2.6).
 func (e *Engine) scanOnce() time.Duration {
+	e.scanHealth.tick()
 	ctx, cancel := context.WithTimeout(context.Background(), claimTimeout)
 	defer cancel()
 	sc, err := e.st.ScanDue(ctx, nextRun)
+	e.scanHealth.finish(err)
 	if err != nil {
 		e.log.Error("schedule scan failed", "err", err)
 		return jitter(e.cfg.PollInterval)

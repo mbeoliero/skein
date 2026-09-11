@@ -22,6 +22,7 @@ const (
 )
 
 // ScheduleSpec answers "when": a cron rule for exactly one job or workflow.
+// ScheduleSpec defines a cron rule and exactly one declared job or workflow target.
 type ScheduleSpec struct {
 	Name     string
 	Job      string // exactly one of Job and Workflow
@@ -32,12 +33,16 @@ type ScheduleSpec struct {
 	Disabled bool    // zero value leaves the schedule enabled (§2.1)
 }
 
+// Schedules manages cron rules; scheduled runs retain their execution snapshots.
 type Schedules struct{ e *Engine }
 
 func (e *Engine) Schedules() *Schedules { return &Schedules{e: e} }
 
 // Put upserts the rule. next_run_at is computed from the database clock and only
 // replaced when the cron or timezone changed or the schedule was re-enabled (§2.1).
+// Switching to OverlapSkip lets existing runs finish, but blocks new beats and
+// scheduled Resume calls while another beat of the same name is in flight,
+// including beats created under OverlapAllow or a previous target.
 func (s *Schedules) Put(ctx context.Context, spec ScheduleSpec) error {
 	if err := validName("schedule", spec.Name); err != nil {
 		return err
@@ -71,7 +76,7 @@ func (s *Schedules) Put(ctx context.Context, spec ScheduleSpec) error {
 	if err := mapErr(s.e.st.PutSchedule(ctx, p), cmp.Or(spec.Job, spec.Workflow)); err != nil {
 		return err
 	}
-	s.e.wakeScheduler() // other instances hear it through the schedule trigger (§2.7)
+	s.e.wakeScheduler()
 	return nil
 }
 
@@ -83,10 +88,8 @@ func (s *Schedules) Delete(ctx context.Context, name string) error {
 	return nil
 }
 
-// parseSchedule is the one place a rule is parsed: Put validates with it, nextRun
-// evaluates with it. Timezone is the only source of the location: robfig's TZ= /
-// CRON_TZ= prefix would override it (and panics without a following space), and
-// @every is relative to the scan time rather than a grid, so neither is accepted.
+// Timezone is authoritative: TZ=/CRON_TZ= would override it and can panic without
+// a following space. @every is relative to scan time rather than a fixed grid.
 func parseSchedule(spec, timezone string) (cron.Schedule, *time.Location, error) {
 	switch {
 	case strings.HasPrefix(spec, "TZ=") || strings.HasPrefix(spec, "CRON_TZ="):
@@ -107,7 +110,6 @@ func parseSchedule(spec, timezone string) (cron.Schedule, *time.Location, error)
 	return sched, loc, nil
 }
 
-// nextRun is the store.NextFunc: parse, then nextAfter.
 func nextRun(spec, timezone string, after time.Time) (time.Time, error) {
 	sched, loc, err := parseSchedule(spec, timezone)
 	if err != nil {
@@ -116,11 +118,9 @@ func nextRun(spec, timezone string, after time.Time) (time.Time, error) {
 	return nextAfter(sched, loc, spec, after)
 }
 
-// nextAfter is the first fire time of sched strictly after t. robfig/cron evaluates
-// the fields in loc: a local time that DST skips does not fire, and a local time that
-// DST repeats fires once per occurrence. It looks five years ahead and answers the
-// zero time beyond that ("0 0 31 2 *" never fires); that is an error here, because a
-// zero next_run_at would be due on every tick (§2.1). spec is for the message only.
+// Cron evaluates in loc: skipped DST times do not fire; repeated times fire per
+// occurrence. Its five-year search returns zero if no beat exists; reject that to
+// avoid a schedule due on every tick (§2.1).
 func nextAfter(sched cron.Schedule, loc *time.Location, spec string, after time.Time) (time.Time, error) {
 	next := sched.Next(after.In(loc))
 	if next.IsZero() {

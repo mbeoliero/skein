@@ -39,7 +39,7 @@ func TestRealLeaseProcessRecovery(t *testing.T) {
 			child := startHelper(t, schema, "SKEIN_HELPER_MODE=lease", "SKEIN_HELPER_MARKER="+marker)
 			waitMarker := func(want string) {
 				t.Helper()
-				waitFor(t, "helper "+want, func() bool {
+				waitFor(t, "helper "+want, func(ctx context.Context) bool {
 					b, err := os.ReadFile(marker)
 					if err != nil && !errors.Is(err, os.ErrNotExist) {
 						t.Fatal(err)
@@ -63,7 +63,7 @@ func TestRealLeaseProcessRecovery(t *testing.T) {
 				}
 				// Observe the kernel stop, not just successful signal delivery. This
 				// consumes only the stop event; startHelper still reaps the child.
-				waitFor(t, "holder stopped", func() bool {
+				waitFor(t, "holder stopped", func(ctx context.Context) bool {
 					var status syscall.WaitStatus
 					pid, err := syscall.Wait4(
 						child.Process.Pid,

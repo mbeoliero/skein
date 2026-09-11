@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 	"uuid"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -22,16 +24,29 @@ import (
 
 const defaultSchema = "skein"
 
+// Reject aliases before pgx removes NULs or PostgreSQL truncates identifiers.
+func validSchema(schema string) error {
+	switch {
+	case !utf8.ValidString(schema):
+		return errors.New("skein: schema must be valid UTF-8")
+	case strings.ContainsRune(schema, 0):
+		return errors.New("skein: schema must not contain NUL")
+	case len(schema) > 63:
+		return errors.New("skein: schema must be at most 63 bytes")
+	}
+	return nil
+}
+
 // Zero values use the defaults below; validation follows design §3.1.
 type Config struct {
-	Schema           string // one schema per application; default "skein"
+	Schema           string // valid UTF-8, no NUL, at most 63 bytes; default "skein"
 	DisableWorker    bool   // no claiming or execution; the scheduler is independent (§1.1)
 	DisableScheduler bool   // no schedule scan or retention on this process (§1.1)
 
 	Concurrency       int           // execution slots in this process, not a cluster limit; default 16
 	PollInterval      time.Duration // backstop period of the claim and scan loops, ±20% jitter (§2.7); default 5s
 	HeartbeatInterval time.Duration // default 15s
-	LeaseTTL          time.Duration // default 60s = 4 × HeartbeatInterval; crash takeover waits about this long
+	LeaseTTL          time.Duration // default 60s
 
 	DefaultTimeout time.Duration // Declare without Timeout; default 1h
 	DefaultRetry   RetryPolicy   // Declare without Retry; default {MaxAttempts: 3}
@@ -48,8 +63,9 @@ type Config struct {
 	RetentionFailed     time.Duration // delete failed / cancelled runs after; default 30d
 	MaintenanceInterval time.Duration // retention period; default 1h
 
-	Logger  *slog.Logger // default slog.Default()
-	Metrics Metrics      // default discards
+	Logger   *slog.Logger // default slog.Default()
+	Metrics  Metrics      // default discards
+	Observer Observer     // optional concurrent post-commit callbacks; must return promptly
 }
 
 func (c Config) withDefaults() Config {
@@ -59,7 +75,7 @@ func (c Config) withDefaults() Config {
 	c.HeartbeatInterval = cmp.Or(c.HeartbeatInterval, 15*time.Second)
 	c.LeaseTTL = cmp.Or(c.LeaseTTL, 60*time.Second)
 	c.DefaultTimeout = cmp.Or(c.DefaultTimeout, time.Hour)
-	if c.DefaultRetry == (RetryPolicy{}) { // only the untouched policy takes the default; a partial one is validated as given
+	if c.DefaultRetry == (RetryPolicy{}) { // partial policies are validated as given
 		c.DefaultRetry = RetryPolicy{MaxAttempts: 3}
 	}
 	c.BackoffBase = cmp.Or(c.BackoffBase, 5*time.Second)
@@ -81,9 +97,11 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
-// validate runs after withDefaults: a zero became its default, so what is left must be
-// in range. A negative period would panic in time.NewTicker on a loop goroutine.
+// Validate after defaulting; invalid periods must not reach loop tickers.
 func (c Config) validate() error {
+	if err := validSchema(c.Schema); err != nil {
+		return err
+	}
 	durations := []struct {
 		name string
 		v    time.Duration
@@ -134,16 +152,22 @@ type Engine struct {
 	executors map[string]Executor
 	types     atomic.Pointer[[]string] // sorted executor types, republished by Register; loops and Stats read the snapshot
 	started   atomic.Bool
+	ready     atomic.Bool // successful loop startup; started also covers the schema check
 
-	wake      chan struct{} // local Trigger, slot release and NOTIFY nudge the claim loop (§2.7)
-	wakeSched chan struct{} // local Put / Delete and NOTIFY nudge the schedule loop
+	claimHealth     loopHealth
+	heartbeatHealth loopHealth
+	scanHealth      loopHealth
+
+	wake      chan struct{}
+	wakeSched chan struct{}
 	slots     chan struct{} // Concurrency semaphore
 	inflight  inflightSet   // leases this process renews
 	active    sync.Map      // lease token → run id, one entry per executor goroutine still running
-	lastOK    time.Time     // start of the last successful heartbeat (§2.3 local deadline); written by the heartbeat goroutine only, so it keeps its monotonic reading
+	lastOK    time.Time     // last successful heartbeat's start, monotonic; heartbeat goroutine only (§2.3)
+	claimTurn uint8         // effective claim rounds modulo reclaimEvery; owned by the claim loop
 
-	lifecycle sync.Mutex      // serializes lifecycle transitions, never startup database I/O
-	loopCtx   context.Context // claim loop
+	lifecycle sync.Mutex // serializes lifecycle transitions, never startup database I/O
+	loopCtx   context.Context
 	stopLoops context.CancelFunc
 	loops     sync.WaitGroup
 	hbCtx     context.Context // heartbeat outlives the claim loop during Shutdown
@@ -157,6 +181,8 @@ type Engine struct {
 	shutErr  error
 }
 
+// New validates cfg and creates an Engine using the caller-owned pool. Call
+// Migrate explicitly before Start; New performs no database I/O or background work.
 func New(pool *pgxpool.Pool, cfg Config) (*Engine, error) {
 	if pool == nil {
 		return nil, errors.New("skein: nil pool")
@@ -170,7 +196,7 @@ func New(pool *pgxpool.Pool, cfg Config) (*Engine, error) {
 	e := &Engine{
 		cfg:       cfg,
 		st:        store.Open(pool, cfg.Schema),
-		log:       cfg.Logger.With("instance", owner), // every line of this process carries it; run loggers add run_id, job_name, attempt
+		log:       cfg.Logger.With("instance", owner),
 		metrics:   cfg.Metrics,
 		owner:     owner,
 		executors: map[string]Executor{},
@@ -233,12 +259,13 @@ func (e *Engine) Start(ctx context.Context) error {
 	if !e.cfg.DisableWorker || !e.cfg.DisableScheduler {
 		e.loops.Go(func() { e.listenLoop(e.loopCtx) })
 	}
+	e.ready.Store(true)
 	context.AfterFunc(ctx, func() { _ = e.Shutdown(context.Background()) })
 	return nil
 }
 
 // registeredTypes is the sorted snapshot Register published last. Never nil: pgx
-// sends a nil slice as NULL, and NOT x = ANY(NULL) is never true (Stats).
+// sends a nil slice as NULL, so ANY(NULL) cannot classify registration in Stats.
 func (e *Engine) registeredTypes() []string {
 	if p := e.types.Load(); p != nil {
 		return *p
@@ -246,15 +273,11 @@ func (e *Engine) registeredTypes() []string {
 	return []string{}
 }
 
-// Shutdown drains this process (§2.6). The first caller runs it; a later caller waits
-// for that run or for its own ctx, whichever ends first, and returns the run's result
-// or its ctx error. It never blocks on the lifecycle mutex behind a Shutdown in
-// progress: the host's call with a short budget must not inherit the budget of the
-// background one that a cancelled Start ctx began. ErrNotDrained means executors were
-// still running when it gave up; their leases expire and another instance reclaims
-// them. The run returns within its ctx plus one claim or scan transaction in flight
-// (claimTimeout): a maintenance batch or a heartbeat statement in flight is
-// cancelled, not waited for.
+// Shutdown drains this process (§2.6). Later callers wait for the first call's
+// result or their own ctx error, without inheriting the first caller's budget.
+// ErrNotDrained means executors remain running; their leases expire for takeover.
+// The first call is bounded by its ctx plus one in-flight claim or scan transaction
+// (claimTimeout). Maintenance and heartbeat I/O are cancelled.
 func (e *Engine) Shutdown(ctx context.Context) error {
 	first := false
 	e.shutOnce.Do(func() {
@@ -277,22 +300,20 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 }
 
 func (e *Engine) shutdown(ctx context.Context) error {
-	// 1. stop claiming, scanning and listening; a claim or scan in flight finishes on its own bounded ctx
+	// Stop admission under its lock; an in-flight claim or scan keeps its bounded ctx.
 	e.inflight.mu.Lock()
 	e.stopLoops()
 	e.inflight.mu.Unlock()
 	e.loops.Wait()
-	// 2. let executors finish; heartbeat keeps running
+	// Heartbeat continues through both executor waits.
 	if !waitGroup(ctx, &e.execs, e.cfg.ShutdownGrace) {
-		// 3. cancel them; whoever returns now settles as released
 		e.inflight.cancelAll(errShuttingDown)
 		waitGroup(ctx, &e.execs, e.cfg.CancelTimeout)
 	}
-	// 5. the rest are no longer renewed; report the executors still running
+	// Stop renewal but retain the identities of executors still running.
 	e.inflight.drain()
 	left := e.activeIds()
-	// 6. stop the heartbeat, cancelling a statement in flight: inflight is empty, so
-	//    nothing is left to renew; the host owns the pool
+	// Cancel heartbeat I/O only after inflight is empty.
 	e.stopHb()
 	e.hb.Wait()
 	if len(left) > 0 {
@@ -302,7 +323,6 @@ func (e *Engine) shutdown(ctx context.Context) error {
 	return nil
 }
 
-// waitGroup waits for wg up to d or until ctx ends; true when wg finished.
 func waitGroup(ctx context.Context, wg *sync.WaitGroup, d time.Duration) bool {
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()

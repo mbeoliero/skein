@@ -7,15 +7,12 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// ───────────── retention and checks (§2.8) ─────────────
-
 type Retention struct {
 	Succeeded time.Duration
 	Failed    time.Duration
 	Batch     int
 }
 
-// MaintenanceReport is what one holder did; a step that failed is in Failures.
 type MaintenanceReport struct {
 	Skipped       bool // another instance holds the lock
 	Deleted       map[string]int64
@@ -110,12 +107,15 @@ func (s *Store) Maintain(ctx context.Context, r Retention) (rep MaintenanceRepor
 	return rep, nil
 }
 
-func (s *Store) Stats(ctx context.Context, registered []string) (row StatsRow, err error) {
+func (s *Store) Stats(ctx context.Context, registered []string) (rows []StatsRow, err error) {
 	err = s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
-		row, err = s.q.Stats(ctx, tx, registered)
+		rows, err = s.q.Stats(ctx, tx, registered)
 		return err
 	})
-	return row, err
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 func (s *Store) ListJobRuns(ctx context.Context, p ListJobRunsParams) (rows []JobRun, err error) {

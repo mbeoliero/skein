@@ -242,7 +242,7 @@ func TestCallerTxRestoresSearchPathAfterCancel(t *testing.T) {
 	}
 }
 
-// M1 check: the two claim branches each use their own partial index. Seq scans are
+// The two claim branches each use their own partial index. Seq scans are
 // disabled so a predicate the partial index cannot serve shows up as a seq scan
 // with a huge cost instead of a plan the planner merely preferred on a small table.
 func TestClaimUsesPartialIndexes(t *testing.T) {
@@ -255,8 +255,8 @@ func TestClaimUsesPartialIndexes(t *testing.T) {
 		INSERT INTO job_run (job_name, executor_type, params, timeout, retry_policy, state, run_at)
 		SELECT 'j', 'x', '{}', 60, '{"max_attempts":3}', 'pending', now() - (g || ' seconds')::interval FROM generate_series(1, 2000) g;
 		INSERT INTO job_run (job_name, executor_type, params, timeout, retry_policy, state, run_at,
-		                     lease_token, lease_owner, lease_expires_at, started_at)
-		SELECT 'j', 'x', '{}', 60, '{"max_attempts":3}', 'running', now(), gen_random_uuid(), 'old', now() - interval '1 minute', now() FROM generate_series(1, 5);
+		                     lease_token, extra, lease_expires_at, started_at)
+		SELECT 'j', 'x', '{}', 60, '{"max_attempts":3}', 'running', now(), gen_random_uuid(), '{"lease_owner":"old"}', now() - interval '1 minute', now() FROM generate_series(1, 5);
 		ANALYZE job_run;`)
 
 	plan := func(sql string) string {
@@ -284,11 +284,8 @@ func TestClaimUsesPartialIndexes(t *testing.T) {
 	}
 }
 
-// M1 check: heartbeat updates are HOT (no index touched, new version on the same page).
-// Not parallel on purpose: HOT pruning needs the previous version to be older than
-// every live snapshot, and sibling tests hammering the same database hold snapshots
-// open. Sequential tests run while the parallel ones are paused, so this measures a
-// quiet database, which is what a heartbeat every 15 s sees in production.
+// Run without parallel siblings: their open snapshots can prevent HOT pruning.
+// This acceptance check requires a quiet database.
 func TestHeartbeatIsHot(t *testing.T) {
 	pool, schema := freshSchema(t)
 	e := startEngine(t, pool, fastConfig(schema), nil) // no executors: nothing claims
@@ -300,9 +297,8 @@ func TestHeartbeatIsHot(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim: %v %v", claimed, err)
 	}
-	// Production heartbeats are seconds apart, so the previous version is always
-	// older than every live snapshot and page pruning reclaims it. Back-to-back
-	// updates would defeat pruning and measure the test, not the storage settings.
+	// Space updates so previous versions can be pruned on this quiet database;
+	// back-to-back updates would measure artificial snapshot pressure.
 	const beats = 200
 	for range beats {
 		time.Sleep(2 * time.Millisecond)
@@ -312,8 +308,8 @@ func TestHeartbeatIsHot(t *testing.T) {
 		}
 	}
 	var upd, hot int64
-	waitFor(t, "table statistics", func() bool {
-		err := pool.QueryRow(t.Context(),
+	waitFor(t, "table statistics", func(ctx context.Context) bool {
+		err := pool.QueryRow(ctx,
 			"SELECT n_tup_upd, n_tup_hot_upd FROM pg_stat_user_tables WHERE schemaname = $1 AND relname = 'job_run'", schema).Scan(&upd, &hot)
 		return err == nil && upd >= beats+1
 	})

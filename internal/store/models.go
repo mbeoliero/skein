@@ -36,12 +36,12 @@ type JobRun struct {
 	RunAt           time.Time
 	LeaseExpiresAt  *time.Time
 	LeaseToken      *uuid.UUID
-	LeaseOwner      *string
 	CreatedAt       time.Time
 	StartedAt       *time.Time
 	FinishedAt      *time.Time
 	Output          []byte
 	Errors          []byte
+	Extra           []byte
 }
 
 type Schedule struct {
@@ -83,4 +83,5 @@ type WorkflowRun struct {
 	State        string
 	CreatedAt    time.Time
 	FinishedAt   *time.Time
+	Extra        []byte
 }

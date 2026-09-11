@@ -7,17 +7,14 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Listener is the one dedicated LISTEN connection of a process (§2.7). It is taken
-// out of the pool for good: a pooled connection would be handed to other callers
-// between notifications, and the pool's health checks would race WaitForNotification.
+// Listener owns a connection removed from the pool: reuse and health checks
+// would race WaitForNotification (§2.7).
 type Listener struct {
 	conn *pgx.Conn
 }
 
-// Listen hijacks a pool connection and subscribes to the schema's channel. The
-// channel name is the schema name itself (the trigger sends on TG_TABLE_SCHEMA);
-// LISTEN takes an identifier, so like CREATE SCHEMA it is the one statement built
-// from the quoted name instead of a query parameter.
+// Listen subscribes on a hijacked connection. The channel is the schema name
+// (TG_TABLE_SCHEMA in the trigger); LISTEN requires a quoted identifier.
 func (s *Store) Listen(ctx context.Context) (*Listener, error) {
 	c, err := s.pool.Acquire(ctx)
 	if err != nil {
@@ -33,8 +30,7 @@ func (s *Store) Listen(ctx context.Context) (*Listener, error) {
 	return &Listener{conn: conn}, nil
 }
 
-// Wait blocks for the next notification and returns its payload. Any error ends the
-// subscription: the caller closes and reconnects.
+// Wait errors require the caller to close the subscription and reconnect.
 func (l *Listener) Wait(ctx context.Context) (string, error) {
 	n, err := l.conn.WaitForNotification(ctx)
 	if err != nil {

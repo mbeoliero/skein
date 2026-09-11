@@ -1,18 +1,20 @@
 # 性能基线（M5）
 
-来源：`SKEIN_BENCH=1 go test -run TestPerformanceBaseline -v -timeout 20m`（`bench_test.go`）。不设 SLA，只留数字供后续对比。
+入口：`SKEIN_BENCH=1 go test -run TestPerformanceBaseline -v -timeout 20m`（`bench_test.go`）；用于同参数比较，不设 SLA。
 
-场景：3 个 worker 进程（测试二进制的 bench 模式）、10 万条存量终态 `job_run`（约 1KB params）、三组任务并发提交：`short_1k`（5ms，1KB）4000 条、`short_256k`（5ms，250KB）400 条、`long_1k`（3s，1KB）240 条。queue = `started_at − run_at`，exec = `finished_at − started_at`，trigger = `Jobs().Trigger` 调用耗时。心跳间隔 1s、租约 4s，让长任务经历几次心跳以便观察 HOT 比例。
+共用配置：3 个 worker 进程 × Concurrency 16，心跳 1s、租约 4s，10 万条约 1KB params 的终态 `job_run`。并发提交 `short_1k`（5ms，1KB）4000 条、`short_256k`（5ms，250KB）400 条、`long_1k`（3s，1KB）240 条；PollInterval 见各轮。queue = `started_at − run_at`，exec = `finished_at − started_at`，trigger = `Jobs().Trigger` 耗时。
 
 机器：Apple Silicon 笔记本，PostgreSQL 18.4（Homebrew，本机 socket），Go 1.27，测试与数据库同机。
 
-兼容性：基线入口也支持 PG 13；该版本没有 `pg_stat_database.active_time`，报告标记 N/A，不填零，其余测量照常。以下历史 PG 18 数据保持原样。
+PG13 缺少 `pg_stat_database.active_time`，报告记 N/A，其余测量照常。以下为 PG18 实测。
 
-计数口径：心跳次数 = `job_run` 总更新 − 2 × 启动次数（每次启动一条 claim、一条 settle，两者都改索引列，永不 HOT；启动次数 = Σ(attempt + 1)）；HOT 比例 = HOT 更新 / 心跳次数。此估算仅适用于无 released / 取消 / Resume 的普通任务，不能外推到混合负载或解释 CPU。`pg_stat_user_tables` 的快照在等过空闲后端的 10 s 刷新超时、再连续 3 s 不变之后才取。同日 10:27 / 10:28 的两次运行用执行时长估算心跳数、且快照取早了，HOT 一行不自洽（9696 − 9280 = 416 条非 claim/settle 更新却报 663 HOT），已由下面同参数的重跑替代。
+计数口径：启动次数 = Σ(attempt + 1)；心跳次数 = `job_run` 总更新 − 2 × 启动次数；HOT 比例 = HOT 更新 / 心跳次数。claim / settle 改索引列，不计 HOT。此估算仅适用于无 released / 取消 / Resume 的普通任务，不能外推其它混合负载或解释 CPU。统计先等空闲后端 10s 刷新，再确认连续 3s 不变。
+
+09-07 10:27 / 10:28 的旧数据因按执行时长估算心跳数、提前取快照而失真（9696 − 9280 = 416 次非 claim/settle 更新，却报 663 HOT），已由同参数重跑替代。
 
 ## Baseline 2026-09-07 15:53
 
-Workers 3 processes × Concurrency 16, PollInterval 1s, HeartbeatInterval 1s, LeaseTTL 4s; 100k seeded rows; PostgreSQL 18.4 (Homebrew).
+PollInterval = 1s；其余配置同上。
 
 | group | runs | payload | trigger p50 / p95 / p99 | queue p50 / p95 / p99 | exec p50 / p95 / p99 |
 |---|---|---|---|---|---|
@@ -32,7 +34,7 @@ Workers 3 processes × Concurrency 16, PollInterval 1s, HeartbeatInterval 1s, Le
 
 ## Baseline 2026-09-07 15:54
 
-Workers 3 processes × Concurrency 16, PollInterval 100ms, HeartbeatInterval 1s, LeaseTTL 4s; 100k seeded rows; PostgreSQL 18.4 (Homebrew).
+PollInterval = 100ms；其余配置同上。
 
 | group | runs | payload | trigger p50 / p95 / p99 | queue p50 / p95 / p99 | exec p50 / p95 / p99 |
 |---|---|---|---|---|---|
@@ -52,20 +54,20 @@ Workers 3 processes × Concurrency 16, PollInterval 100ms, HeartbeatInterval 1s,
 
 ## 解读
 
-1. **短任务吞吐被轮询周期封顶。** 每实例每个 `PollInterval` 最多领 `Concurrency` 条，3 × 16 / 1s = 48/s 是理论上限，实测 42/s；轮询 100ms 时 184/s。这是当时采用 1s 轮询的取舍。事件唤醒（现设计 §2.7）之后槽位释放即唤醒领取，这个上限已解除：下面"M6 之后的复跑"在 5s 轮询下达到 286 runs/s，与轮询周期无关。
-2. **提交很便宜。** `Trigger` 是一条 INSERT … SELECT：1KB p50 约 1ms，250KB p50 5ms；每组 8 个、共 24 个 goroutine 并发约 8300 条/s。250KB payload 只抬高触发 p99（26 到 37ms），本组的排队与执行延迟没有变化（jsonb 走 TOAST）。注意 payload 是 `strings.Repeat` 的重复字符，TOAST 压缩后落盘很小：这是可压缩 payload 的基线，不能推广到一般 250KB 文档的存储成本或延迟。
-3. **心跳 HOT 比例 93% 到 94%**（676 / 727、679 / 719），按上面的口径直接从计数器算出，不再估算。这低于 M1 单测在安静库上的 > 95%（`TestHeartbeatIsHot`，仍通过，判据见 [README](../README.md#验证判据)）；负载下的差额来自并发快照与页内空间让页内剪枝并非每次都成立，未进一步定位。claim 与 settle 改的是索引列，永远不是 HOT，属预期。
-4. **`idx_job_run_claim` 峰值 168KB**（4640 条 pending 同时入队），手动 VACUUM 后死元组归零但磁盘大小不回落（autovacuum 周期内的行为未测）：B-tree 页只标记可重用，不归还给文件系统。原验收所说"回落"在实践中的含义是页面被重用、大小由历史峰值积压决定而不随时间增长；要真正缩小只能 REINDEX。
-5. **锁等待为零**：两次运行的 1300 多次采样里没有后端在等锁。数据库忙碌度 0.32 到 0.55 秒/秒（`pg_stat_database.active_time`，后端处于 active 状态的时间，不是 CPU 时间），测试进程与数据库同机，数值偏保守。
-6. **长任务排队 p99 14 到 25s** 来自 240 条 3s 任务共享 48 个槽位（5 轮 × 3s），不是调度开销。
+1. **旧版吞吐受轮询限制。** 1s 轮询理论上限 3 × 16 / 1s = 48/s，实测 42/s；100ms 时为 184/s。M6 槽位释放唤醒后，5s 轮询达到 286 runs/s，见后续复跑。
+2. **参数可压缩。** 24 个提交 goroutine（每组 8 个）约 8300 条/s；1KB / 250KB trigger p50 约 1ms / 5ms，250KB 的 p99 为 26–37ms，排队与执行延迟未变。payload 使用重复字符，TOAST 压缩率高，不能外推一般 250KB 文档。
+3. **负载 HOT 与安静库判据分开。** 本轮 93%–94%（676/727、679/719）；安静库 `TestHeartbeatIsHot` >95% 仍通过（[判据](../README.md#验证判据)）。并发快照和页空间影响剪枝，差额未进一步定位。
+4. **VACUUM 回收页内空间，不缩小索引文件。** 4640 条 pending 使领取索引达 168KB；手动 VACUUM 后死元组归零、页可复用，真正缩小需 REINDEX。autovacuum 周期行为未测。
+5. **锁与 DB 忙碌度。** 1300 多次采样均无锁等待；active time 为 0.32–0.55 秒/墙钟秒，表示后端活跃时间，不是 CPU。同机测量偏保守。
+6. **长任务排队。** p99 14–25s 来自 240 条 3s 任务共享 48 槽位（5 轮），不能作为调度开销。
 
 ## 2026-09-07 并发修复后的复跑
 
-本轮修改未启动节点取消的候选加锁、停机与 Executor 登记的互斥，以及失租移除时的结果丢弃标记。按上面相同配置分别复跑 1s / 100ms 轮询，保留原结果供比较；以下仍是普通任务混合负载，不衡量工作流取消的争用性能。
+修复未启动节点取消加锁、停机与 Executor 登记互斥及失租结果丢弃后，以 1s / 100ms 轮询复跑。该普通任务负载不衡量工作流取消争用。
 
 ## Baseline 2026-09-07 16:47
 
-Workers 3 processes × Concurrency 16, PollInterval 1s, HeartbeatInterval 1s, LeaseTTL 4s; 100k seeded rows; PostgreSQL 18.4 (Homebrew).
+PollInterval = 1s；其余配置同上。
 
 | group | runs | payload | trigger p50 / p95 / p99 | queue p50 / p95 / p99 | exec p50 / p95 / p99 |
 |---|---|---|---|---|---|
@@ -85,7 +87,7 @@ Workers 3 processes × Concurrency 16, PollInterval 1s, HeartbeatInterval 1s, Le
 
 ## Baseline 2026-09-07 16:48
 
-Workers 3 processes × Concurrency 16, PollInterval 100ms, HeartbeatInterval 1s, LeaseTTL 4s; 100k seeded rows; PostgreSQL 18.4 (Homebrew).
+PollInterval = 100ms；其余配置同上。
 
 | group | runs | payload | trigger p50 / p95 / p99 | queue p50 / p95 / p99 | exec p50 / p95 / p99 |
 |---|---|---|---|---|---|
@@ -105,11 +107,11 @@ Workers 3 processes × Concurrency 16, PollInterval 100ms, HeartbeatInterval 1s,
 
 ## 2026-09-07 M6 精准触发后的复跑
 
-同一台机器、同一场景，worker 的 `PollInterval` 改为 5s（M6 默认值），其余参数不变。报告由 `SKEIN_BENCH_POLL=5s SKEIN_BENCH_OUT=… go test -run TestPerformanceBaseline` 追加。
+同机同场景，仅将 `PollInterval` 改为 M6 默认的 5s。通过 `SKEIN_BENCH_POLL=5s SKEIN_BENCH_OUT=… go test -run TestPerformanceBaseline` 追加报告。
 
 ## Baseline 2026-09-07 23:45
 
-Workers 3 processes × Concurrency 16, PollInterval 5s, HeartbeatInterval 1s, LeaseTTL 4s; 100k seeded rows; PostgreSQL 18.4 (Homebrew).
+PollInterval = 5s；其余配置同上。
 
 | group | runs | payload | trigger p50 / p95 / p99 | queue p50 / p95 / p99 | exec p50 / p95 / p99 |
 |---|---|---|---|---|---|
@@ -129,11 +131,10 @@ Workers 3 processes × Concurrency 16, PollInterval 5s, HeartbeatInterval 1s, Le
 
 解读：
 
-1. **吞吐不再被轮询封顶。** 5s 轮询下 286 runs/s，M6 之前 1s 轮询是 42/s、100ms 轮询是 184/s。槽位释放即再领，`PollInterval` 只剩兜底作用；评审方在 1s / 100ms / 5s 三档复跑得到 287 / 285 / 290，与此一致。
-2. **queue 延迟是积压，不是调度延迟。** 4640 条在 0.7s 内提交、48 个槽位 16s 排空，短任务 queue p50 15s 就是排队时长；M6 的触发精度由 `wake_test.go` 以 Executor 入口时刻（DB 时钟）减 `run_at` 在 CI 断言（≤ 300ms），不由这个基线量。
-3. **心跳 HOT 98%**（728 / 746），触发器不影响 HOT。
-4. **锁等待出现了**：159 次采样里最多 4 个后端在等锁、平均 0.09，之前两次为 0。来源未定位，候选是同时被唤醒的三个实例在同一批到期行上的 `SKIP LOCKED` 竞争，或带通知的提交串行化（现设计 §3.4）；量级很小，先记录。
-5. `idx_job_run_claim` 峰值 160KB、死元组 9316，与 M5 的 168KB / 同量级一致。
+1. 槽位释放即再领，PollInterval 仅作兜底；评审方以 1s / 100ms / 5s 复跑得到 287 / 285 / 290 runs/s。
+2. 4640 条在 0.7s 内提交，48 槽位约 16s 排空；短任务 queue p50 15s 属于排队。触发精度由 `wake_test.go` 以 DB 入口时刻减 run_at 验证 ≤300ms。
+3. 心跳 HOT 98%（728/746）；领取索引峰值 160KB、死元组 9316，与旧基线同量级。
+4. 159 次采样的锁等待最多 4、平均 0.09 个后端，来源未定位；候选为 SKIP LOCKED 竞争或 NOTIFY 提交串行化（设计 §3.4）。
 
 ## 2026-09-09 审查修复后的复跑
 
@@ -166,3 +167,88 @@ Go 1.27.0、PostgreSQL 18.4（Homebrew）；3 个进程 × 16 槽位、心跳 1s
 **未解决的测量差异**：相比上次 286 runs/s、心跳 HOT 98%，本次吞吐降至 174、HOT 90%，短任务执行尾延迟与 DB active time 上升。未做同环境旧代码对照，也未定位锁等待或主机 / 数据库其它负载，不能归因于本轮代码或仅归因于环境；此结果不支持“性能无回退”。未调整阈值或存储参数。
 
 本轮 `make lint`、required-DB 无缓存全集、默认并发三轮 race 均通过；M5 后单独无缓存执行 `TestHeartbeatIsHot` 也通过，其安静库 >95% 判据与上述负载估算不是同一指标。未运行 PG13 或 M7。
+
+## 2026-09-11 复跑
+
+三轮沿用 09-09 的命令、机器与参数：Go 1.27.0、PostgreSQL 18.4（Homebrew），
+3 进程 × 16 槽位、5s 轮询、1s 心跳、4s 租约、10 万条存量行，任务组成同上；均单独运行。
+测量不含 Observer、提交 Trace 或高频 Health / Stats 读取，仅覆盖基础执行路径，
+不能外推宿主追踪、回调队列或采集开销。心跳 SQL、索引及存储参数未变。
+
+- extra / Trace：276 runs/s，心跳估算 HOT 97%；原始输出 `/tmp/skein-phase1-m5.log`。
+- Observer：291 runs/s，心跳估算 HOT 97%；原始输出 `/tmp/skein-phase2-m5.log`。
+
+最终版本（含健康快照与分类统计）入口通过（50.97s），原始输出 `/tmp/skein-phase3-m5.log`：
+
+| 延迟 p50 / p95 / p99 | short_1k | short_256k | long_1k |
+|---|---|---|---|
+| trigger | 1ms / 5ms / 12ms | 5ms / 17ms / 36ms | 6ms / 15ms / 30ms |
+| queue | 15.094s / 15.231s / 15.238s | 14.948s / 14.978s / 14.98s | 5.99s / 12.003s / 12.038s |
+| exec | 7ms / 10ms / 15ms | 9ms / 21ms / 31ms | 3.002s / 3.015s / 3.023s |
+
+| 指标 | 最终实测 |
+|---|---|
+| 提交 | 4640 条 / 738ms，6290 triggers/s |
+| 完成 | 4640 条 / 16.1s，288 runs/s，0 failed |
+| job_run 更新 | 10024 = 4640 claims + 4640 settles + 744 heartbeats；722 HOT，心跳估算比例 97% |
+| idx_job_run_claim | 初始 16 KB、峰值及 VACUUM 后 160 KB；死元组 9319 → 0 |
+| idx_job_run_running | 16 KB → 16 KB |
+| DB active time | 0.59 s / 墙钟秒（不是 CPU） |
+| 锁等待 | 155 次采样，最多 5、平均 0.12 个后端 |
+
+三轮 M5 后均单独无缓存运行 `TestClaimUsesPartialIndexes` 与 `TestHeartbeatIsHot`，均通过；
+负载估算 HOT 不替代安静库 >95% 的独立心跳判据。
+
+未做同环境旧代码对照，不能把三轮差异归因于代码，也不能消除 09-09 记录的未解释差异；
+这些结果不支持“性能无回退”。
+
+## 2026-09-12 审查修复后的复跑
+
+领取改为每第 8 个有效轮次优先回收过期租约，并在过期分支按 `lease_expires_at, id` 排序；索引、心跳 SQL 与存储参数未变。沿用上轮机器和参数，独立运行，没有与其它测试并行：Go 1.27.0、PostgreSQL 18.4（Homebrew），3 进程 × 16 槽位、5s 轮询、1s 心跳、4s 租约、10 万条存量行，任务组成同上。
+
+```sh
+SKEIN_TEST_REQUIRE_DB=1 SKEIN_BENCH=1 SKEIN_BENCH_POLL=5s \
+  SKEIN_BENCH_CONCURRENCY=16 \
+  go test -count=1 -parallel=1 -run '^TestPerformanceBaseline$' -v -timeout 20m
+```
+
+基于未提交工作区；Go / SQL / 构建配置及测试源码摘要为 `5c52d9b9741a28ce9e6eaa181966216799ec467f2bb741e47ac813f7d25997f1`。入口通过（48.93s），原始报告及日志保存在本地 `skein-fix-validation` 交付制品中，包含源码归档与逐文件摘要。
+
+| 延迟 p50 / p95 / p99 | short_1k | short_256k | long_1k |
+|---|---|---|---|
+| trigger | 1ms / 4ms / 11ms | 5ms / 17ms / 64ms | 4ms / 19ms / 52ms |
+| queue | 15.142s / 15.375s / 15.387s | 14.992s / 15.014s / 15.019s | 5.993s / 12.005s / 12.029s |
+| exec | 7ms / 11ms / 20ms | 9ms / 17ms / 36ms | 3.002s / 3.012s / 3.022s |
+
+| 指标 | 实测 |
+|---|---|
+| 提交 | 4640 条 / 695ms，6675 triggers/s |
+| 完成 | 4640 条 / 16.254s，285 runs/s，0 failed |
+| job_run 更新 | 10016 = 4640 claims + 4640 settles + 736 heartbeats；674 HOT，心跳估算比例 92% |
+| idx_job_run_claim | 初始 16 KB、峰值及 VACUUM 后 160 KB；死元组 9619 → 0 |
+| idx_job_run_running | 16 KB → 16 KB |
+| DB active time | 0.56 s / 墙钟秒（不是 CPU） |
+| 锁等待 | 160 次采样，最多 3、平均 0.07 个后端 |
+
+随后分别在安静的 PG18.4 与 PG13.23 上独立、无缓存执行 `TestClaimUsesPartialIndexes` 和 `TestHeartbeatIsHot`，均通过。该判据不替代负载下的估算：与 09-11 的 288 runs/s、HOT 97% 相比，本次吞吐接近、HOT 降至 92%；未做同环境旧代码对照，差异原因未定位，不能宣称性能无回退。没有调整阈值或存储参数。
+
+M5 不含计划负载，不能证明新增名称锁及大量历史拍的跨表在途检查成本；计划行为另由确定性交错测试及 M7 smoke 验证，不据此外推容量。
+
+## 2026-09-12 全量 review 修复复跑
+
+沿用上轮 M5 参数：Go 1.27.0、PG18.4（Homebrew）、3 进程 × 16 槽位、5s 轮询、1s 心跳、4s 租约、10 万条存量行。本任务的数据库测试与测量串行执行。当前 M5 显式开启后强制数据库可达并校验参数，保存报告后校验每组完成数量与零非预期失败。
+
+基于未提交工作区，可执行源码、测试及构建配置清单摘要为 `b799805f5c9fa57025a8cd1df4b817d8b0df458d600669986fe1db020d10a53d`；源码归档、逐文件摘要及原始日志随本轮交付保存，尚无对应远程 CI 运行。
+
+| 指标 | 实测 |
+|---|---|
+| 入口 / 完成 | 49.80s；4640 条全部成功，0 failed |
+| 提交 / 完成吞吐 | 6148 triggers/s；287 runs/s，排空 16.162s |
+| 更新 / 估算心跳 HOT | 10018 次更新；738 次心跳、726 HOT，98% |
+| 领取索引 | 16KB → 峰值 160KB；VACUUM 后 160KB |
+| 死元组 | 9296 → 0 |
+| DB active time / 锁等待 | 0.57 s / 墙钟秒；最多 3、平均 0.06 个后端 |
+
+之后独立、无缓存执行领取索引与心跳 HOT 检查，均通过。与上次 285 runs/s、估算 HOT 92% 的差异未做同环境旧代码对照，不能据此归因或宣称性能无回退。
+
+工作流往返问题另以真实 PG 的 500 节点探针定位：每条语句注入 30ms 延迟，原逐节点插入在约 309 条语句、10.03s 时超时；同一探针改为批量插入后 6 条语句、约 215ms 完成。回归测试同时核对节点快照、依赖状态、插入失败整笔回滚与去重。该对照仅证明消除了逐节点往返；注入延迟不是实际网络测量，不证明 50 个大工作流同批或大量历史计划拍的容量。

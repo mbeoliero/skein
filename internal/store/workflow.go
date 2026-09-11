@@ -10,7 +10,6 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// NodeDef is one declared workflow node: a job and its direct predecessors.
 type NodeDef struct {
 	JobName string
 	Deps    []string
@@ -18,6 +17,43 @@ type NodeDef struct {
 
 // Dag is workflow_run.dag: job name → direct predecessors.
 type Dag map[string][]string
+
+type nodeStates map[string]string
+
+func statesOf(rows []NodeStatesRow) nodeStates {
+	states := make(nodeStates, len(rows))
+	for _, row := range rows {
+		states[row.JobName] = row.State
+	}
+	return states
+}
+
+func (states nodeStates) depsSucceeded(deps []string) bool {
+	for _, dep := range deps {
+		if states[dep] != "succeeded" {
+			return false
+		}
+	}
+	return true
+}
+
+func resumable(state string) bool {
+	return state == "failed" || state == "cancelled"
+}
+
+func (d Dag) resumeSet(states nodeStates) (names, next []string) {
+	for name, state := range states {
+		if !resumable(state) {
+			continue
+		}
+		nextState := "blocked"
+		if states.depsSucceeded(d[name]) {
+			nextState = "pending"
+		}
+		names, next = append(names, name), append(next, nextState)
+	}
+	return names, next
+}
 
 func parseDag(raw []byte) (Dag, error) {
 	var d Dag
@@ -27,9 +63,6 @@ func parseDag(raw []byte) (Dag, error) {
 	return d, nil
 }
 
-// ───────────── definitions (§2.1) ─────────────
-
-// MissingJobs reports which of names have no job definition.
 func (s *Store) MissingJobs(ctx context.Context, names []string) (missing []string, err error) {
 	err = s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		found, err := s.q.ExistingJobs(ctx, tx, names)
@@ -50,7 +83,6 @@ func (s *Store) MissingJobs(ctx context.Context, names []string) (missing []stri
 	return missing, err
 }
 
-// DeclareWorkflow upserts the workflow row and replaces its nodes.
 func (s *Store) DeclareWorkflow(ctx context.Context, name string, nodes []NodeDef) error {
 	return s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		if err := s.q.DeclareWorkflow(ctx, tx, name); err != nil {
@@ -91,8 +123,6 @@ func (s *Store) DeleteWorkflow(ctx context.Context, name string) error {
 		return nil
 	})
 }
-
-// ───────────── submit (§2.1) ─────────────
 
 // TriggerWorkflow snapshots the definition into a workflow_run plus one job_run per
 // node. With tx == nil it uses its own transaction. ErrDuplicate carries the id of the
@@ -164,18 +194,23 @@ func (s *Store) triggerWorkflow(ctx context.Context, tx pgx.Tx, p TriggerWorkflo
 	if !inserted {
 		return 0, ErrDuplicate
 	}
-	for _, n := range nodes {
+	batch := InsertNodeRunsParams{
+		WorkflowRunId: id,
+		JobNames:      make([]string, len(nodes)), ExecutorTypes: make([]string, len(nodes)),
+		Params: make([][]byte, len(nodes)), Timeouts: make([]int32, len(nodes)),
+		RetryPolicies: make([][]byte, len(nodes)), States: make([]string, len(nodes)),
+	}
+	for i, n := range nodes {
 		state := "pending"
 		if len(n.Deps) > 0 {
 			state = "blocked"
 		}
-		err := s.q.InsertNodeRun(ctx, tx, InsertNodeRunParams{
-			JobName: n.JobName, WorkflowRunId: id, ExecutorType: n.ExecutorType,
-			Params: n.Params, Timeout: n.Timeout, RetryPolicy: n.RetryPolicy, State: state,
-		})
-		if err != nil {
-			return 0, err
-		}
+		batch.JobNames[i], batch.ExecutorTypes[i] = n.JobName, n.ExecutorType
+		batch.Params[i], batch.Timeouts[i], batch.RetryPolicies[i] = n.Params, n.Timeout, n.RetryPolicy
+		batch.States[i] = state
+	}
+	if err := s.q.InsertNodeRuns(ctx, tx, batch); err != nil {
+		return 0, err
 	}
 	return id, nil
 }
@@ -199,12 +234,12 @@ func (s *Store) GetWorkflowRun(ctx context.Context, id int64) (w WorkflowRun, no
 	return w, nodes, err
 }
 
-// ───────────── claim, node side (§2.2) ─────────────
-
 type NodeContext struct {
-	Cancelling bool // the parent is no longer running: settle cancelled, do not execute
-	Input      []byte
-	Outputs    map[string][]byte // direct predecessors' output by job name
+	Cancelling   bool // the parent is no longer running: settle cancelled, do not execute
+	WorkflowName string
+	Input        []byte
+	Extra        []byte
+	Outputs      map[string][]byte // direct predecessors' output by job name
 }
 
 func (s *Store) NodeContext(ctx context.Context, workflowRunId int64, jobName string) (nc NodeContext, err error) {
@@ -213,6 +248,7 @@ func (s *Store) NodeContext(ctx context.Context, workflowRunId int64, jobName st
 		if err != nil {
 			return err
 		}
+		nc.WorkflowName, nc.Extra = h.WorkflowName, h.Extra
 		if h.State != "running" {
 			nc.Cancelling = true
 			return nil
@@ -237,71 +273,98 @@ func (s *Store) NodeContext(ctx context.Context, workflowRunId int64, jobName st
 	return nc, err
 }
 
-// ───────────── propagate and finalize (§2.4) ─────────────
-
 func terminal(state string) bool {
 	return state == "succeeded" || state == "failed" || state == "cancelled"
 }
 
-// propagate runs inside settle, under the parent's row lock, after node reached the
-// terminal state newState.
-func (s *Store) propagate(ctx context.Context, tx pgx.Tx, wf int64, dag Dag, wfState, node, newState string) error {
-	if (newState == "failed" || newState == "cancelled") && wfState == "running" { // fail-fast, written before the nodes are read
-		if _, err := s.q.MarkWorkflowCancelling(ctx, tx, wf); err != nil {
-			return err
+type upstreamError struct {
+	Attempt int       `json:"attempt"`
+	At      time.Time `json:"at"`
+	Kind    string    `json:"kind"`
+	Message string    `json:"message"`
+}
+
+// propagate runs inside settle, under the parent's row lock, after node became terminal.
+func (s *Store) propagate(
+	ctx context.Context,
+	tx pgx.Tx,
+	parent changedWorkflow,
+	dag Dag,
+	node Change,
+) ([]Change, error) {
+	changes := []Change{}
+	var cancelling *Change
+	failedOrCancelled := node.State == "failed" || node.State == "cancelled"
+	if failedOrCancelled && parent.State == "running" { // fail-fast, written before the nodes are read
+		row, err := s.q.MarkWorkflowCancelling(ctx, tx, parent.Id)
+		if err != nil {
+			return nil, err
 		}
-		wfState = "cancelling"
-		entry, _ := json.Marshal([]map[string]any{{"attempt": 0, "at": time.Now().UTC(), "kind": "upstream_" + newState, "message": node + " " + newState}})
-		if _, err := s.q.CancelUnstartedNodes(ctx, tx, CancelUnstartedNodesParams{WorkflowRunId: wf, Err: entry}); err != nil {
-			return err
+		parent = changedWorkflow(row)
+		reason := "upstream_" + node.State
+		cancelling = new(parent.change(ChangeWorkflowCancelRequested, reason))
+		message := node.JobName + " " + node.State
+		entry, err := json.Marshal([]upstreamError{{
+			At: time.Now().UTC(), Kind: reason, Message: message,
+		}})
+		if err != nil {
+			return nil, err
+		}
+		cancelled, err := s.q.CancelUnstartedNodes(ctx, tx, CancelUnstartedNodesParams{
+			WorkflowRunId: parent.Id, Err: entry,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range cancelled {
+			change := parent.nodeChange(changedRun(row), ChangeRunCancelled, reason)
+			change.Error = message
+			changes = append(changes, change)
 		}
 	}
 	// Read after cancellation: a skipped claim may still show as pending. Neither
 	// pending nor running nodes can become terminal without this parent lock (§2.4).
-	rows, err := s.q.NodeStates(ctx, tx, wf)
+	rows, err := s.q.NodeStates(ctx, tx, parent.Id)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	states := make(map[string]string, len(rows))
-	for _, r := range rows {
-		states[r.JobName] = r.State
-	}
-	states[node] = newState
+	states := statesOf(rows)
+	states[node.JobName] = node.State
 
-	if newState == "succeeded" && wfState == "running" {
+	if node.State == "succeeded" && parent.State == "running" {
 		var ready []string
 		for name, st := range states {
 			if st != "blocked" {
 				continue
 			}
-			ok := true
-			for _, dep := range dag[name] {
-				if states[dep] != "succeeded" {
-					ok = false
-					break
-				}
-			}
-			if ok {
+			if states.depsSucceeded(dag[name]) {
 				ready = append(ready, name)
 			}
 		}
 		if len(ready) > 0 {
-			if _, err := s.q.ActivateNodes(ctx, tx, ActivateNodesParams{WorkflowRunId: wf, JobNames: ready}); err != nil {
-				return err
+			if _, err := s.q.ActivateNodes(ctx, tx, ActivateNodesParams{WorkflowRunId: parent.Id, JobNames: ready}); err != nil {
+				return nil, err
 			}
 			for _, name := range ready {
 				states[name] = "pending"
 			}
 		}
 	}
-	if final, done := finalState(states, wfState); done {
-		return s.q.FinalizeWorkflowRun(ctx, tx, FinalizeWorkflowRunParams{Id: wf, State: final})
+	if final, done := finalState(states, parent.State); done {
+		row, err := s.q.FinalizeWorkflowRun(ctx, tx, FinalizeWorkflowRunParams{Id: parent.Id, State: final})
+		if err != nil {
+			return nil, err
+		}
+		changes = append(changes, changedWorkflow(row).finished())
+	} else if cancelling != nil {
+		// The cancelling state is observable only if this transaction leaves it there.
+		changes = append(changes, *cancelling)
 	}
-	return nil
+	return changes, nil
 }
 
 // finalState: once every node is terminal, any failed → failed; else cancelling → cancelled; else succeeded.
-func finalState(states map[string]string, wfState string) (string, bool) {
+func finalState(states nodeStates, wfState string) (string, bool) {
 	failed := false
 	for _, st := range states {
 		if !terminal(st) {
@@ -318,49 +381,76 @@ func finalState(states map[string]string, wfState string) (string, bool) {
 	return "succeeded", true
 }
 
-// ───────────── cancel (§2.5) ─────────────
-
 // CancelWorkflow ends unlocked unstarted nodes; skipped claims and running nodes
 // learn cancellation through the parent check or heartbeat. Repeated cancellation is a no-op.
-func (s *Store) CancelWorkflow(ctx context.Context, id int64) error {
-	return s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
-		n, err := s.q.MarkWorkflowCancelling(ctx, tx, id)
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			if _, err := s.q.GetWorkflowRun(ctx, tx, id); errors.Is(err, pgx.ErrNoRows) {
+func (s *Store) CancelWorkflow(ctx context.Context, id int64) ([]Change, error) {
+	changes := []Change{}
+	err := s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		row, err := s.q.MarkWorkflowCancelling(ctx, tx, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			_, err = s.q.GetWorkflowRun(ctx, tx, id)
+			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrNotFound
 			}
 			return err
 		}
-		if _, err := s.q.CancelUnstartedNodes(ctx, tx, CancelUnstartedNodesParams{WorkflowRunId: id, Err: []byte("[]")}); err != nil {
+		if err != nil {
 			return err
+		}
+		parent := changedWorkflow(row)
+		cancelled, err := s.q.CancelUnstartedNodes(ctx, tx, CancelUnstartedNodesParams{
+			WorkflowRunId: id, Err: []byte("[]"),
+		})
+		if err != nil {
+			return err
+		}
+		for _, row := range cancelled {
+			changes = append(changes, parent.nodeChange(changedRun(row), ChangeRunCancelled, "cancel_requested"))
 		}
 		rows, err := s.q.NodeStates(ctx, tx, id)
 		if err != nil {
 			return err
 		}
-		states := make(map[string]string, len(rows))
-		for _, r := range rows {
-			states[r.JobName] = r.State
-		}
+		states := statesOf(rows)
 		if final, done := finalState(states, "cancelling"); done {
-			return s.q.FinalizeWorkflowRun(ctx, tx, FinalizeWorkflowRunParams{Id: id, State: final})
+			row, err := s.q.FinalizeWorkflowRun(ctx, tx, FinalizeWorkflowRunParams{Id: id, State: final})
+			if err != nil {
+				return err
+			}
+			changes = append(changes, changedWorkflow(row).finished())
+		} else {
+			changes = append(changes, parent.change(ChangeWorkflowCancelRequested, "cancel_requested"))
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return changes, nil
 }
 
-// ───────────── resume (§2.5) ─────────────
-
-var ErrNotResumable = errors.New("store: run is not failed or cancelled")
+var ErrNotResumable = errors.New("store: run has no resumable work")
 
 // Resume re-queues the failed / cancelled nodes of a failed / cancelled workflow_run;
 // succeeded nodes keep their output. A terminal run has only terminal nodes (finalize
 // requires it), so "unsucceeded descendants" are already in that set.
-func (s *Store) Resume(ctx context.Context, id int64) error {
-	return s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+func (s *Store) Resume(ctx context.Context, id int64) ([]Change, error) {
+	changes := []Change{}
+	err := s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		name, err := s.q.WorkflowResumeIdentity(ctx, tx, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		var skip bool
+		if name != nil {
+			skip, err = s.lockScheduleForResume(ctx, tx, *name)
+			if err != nil {
+				return err
+			}
+		}
 		w, err := s.q.LockWorkflowRun(ctx, tx, id)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
@@ -368,7 +458,7 @@ func (s *Store) Resume(ctx context.Context, id int64) error {
 		if err != nil {
 			return err
 		}
-		if w.State != "failed" && w.State != "cancelled" {
+		if !resumable(w.State) {
 			return ErrNotResumable
 		}
 		dag, err := parseDag(w.Dag)
@@ -379,33 +469,43 @@ func (s *Store) Resume(ctx context.Context, id int64) error {
 		if err != nil {
 			return err
 		}
-		states := make(map[string]string, len(rows))
-		for _, r := range rows {
-			states[r.JobName] = r.State
+		names, newStates := dag.resumeSet(statesOf(rows))
+		if len(names) == 0 {
+			return ErrNotResumable
 		}
-		var names, newStates []string
-		for name, st := range states {
-			if st != "failed" && st != "cancelled" {
-				continue
+		if skip {
+			found, err := s.q.InflightScheduleRunExists(ctx, tx, InflightScheduleRunExistsParams{
+				Name: *name, ExcludeWorkflowRunID: id,
+			})
+			if err != nil {
+				return err
 			}
-			next := "pending"
-			for _, dep := range dag[name] {
-				if states[dep] != "succeeded" {
-					next = "blocked"
-					break
-				}
+			if found {
+				return ErrDuplicate
 			}
-			names, newStates = append(names, name), append(newStates, next)
 		}
-		if err := s.q.ResumeNodes(ctx, tx, ResumeNodesParams{WorkflowRunId: id, JobNames: names, States: newStates}); err != nil {
+		reset, err := s.q.ResumeNodes(ctx, tx, ResumeNodesParams{WorkflowRunId: id, JobNames: names, States: newStates})
+		if err != nil {
 			return err
 		}
-		err = s.q.ReopenWorkflowRun(ctx, tx, id)
+		reopened, err := s.q.ReopenWorkflowRun(ctx, tx, id)
 		if isPgCode(err, "23505") {
 			return ErrDuplicate
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		parent := changedWorkflow(reopened)
+		for _, row := range reset {
+			changes = append(changes, parent.nodeChange(changedRun(row), ChangeRunResumed, "manual_resume"))
+		}
+		changes = append(changes, parent.change(ChangeWorkflowResumed, "manual_resume"))
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return changes, nil
 }
 
 func (s *Store) ListWorkflowRuns(ctx context.Context, p ListWorkflowRunsParams) (rows []WorkflowRun, err error) {

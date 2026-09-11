@@ -18,37 +18,56 @@ UPDATE job_run
        finished_at      = CASE WHEN state = 'pending' THEN now() ELSE finished_at END,
        cancel_requested = CASE WHEN state = 'running' THEN true ELSE cancel_requested END
  WHERE id = $1 AND state IN ('pending', 'running') AND workflow_run_id IS NULL
-RETURNING state
+   AND (state = 'pending' OR NOT cancel_requested)
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra
 `
+
+type CancelRunRow struct {
+	Id            int64
+	JobName       string
+	WorkflowRunId *int64
+	ExecutorType  string
+	State         string
+	LeaseToken    *uuid.UUID
+	Extra         []byte
+}
 
 // §2.5 Runs.Cancel: plain runs only; a pending row ends now, a running row is flagged and its
 // holder settles it as cancelled after the next heartbeat. One statement for both states: a row
 // that a concurrent claim or settle moves between them is re-checked on its new version, so
-// zero rows keeps its §2.9 meaning (terminal, a node, or missing) and never means "moved".
-func (q *Queries) CancelRun(ctx context.Context, db DBTX, id int64) (string, error) {
+// zero rows means terminal, already requested, a node, or missing; never "moved".
+func (q *Queries) CancelRun(ctx context.Context, db DBTX, id int64) (CancelRunRow, error) {
 	row := db.QueryRow(ctx, CancelRun, id)
-	var state string
-	err := row.Scan(&state)
-	return state, err
+	var i CancelRunRow
+	err := row.Scan(
+		&i.Id,
+		&i.JobName,
+		&i.WorkflowRunId,
+		&i.ExecutorType,
+		&i.State,
+		&i.LeaseToken,
+		&i.Extra,
+	)
+	return i, err
 }
 
 const ClaimExpired = `-- name: ClaimExpired :many
 WITH picked AS (
     SELECT id FROM job_run
      WHERE state = 'running' AND executor_type = ANY($3::text[]) AND lease_expires_at <= now()
-     LIMIT $4::int
+     ORDER BY lease_expires_at, id LIMIT $4::int
        FOR UPDATE SKIP LOCKED)
 UPDATE job_run r
    SET attempt = LEAST(r.attempt + 1, 32767),
        errors = r.errors || jsonb_build_array(jsonb_build_object(
                   'attempt', LEAST(r.attempt + 1, 32767), 'at', now(), 'kind', 'interrupted',
-                  'message', 'lease expired; last owner ' || coalesce(r.lease_owner, '?'))),
-       lease_token = gen_random_uuid(), lease_owner = $1::text,
+                  'message', 'lease expired; last owner ' || coalesce(r.extra ->> 'lease_owner', '?'))),
+       lease_token = gen_random_uuid(), extra = jsonb_set(r.extra, '{lease_owner}', to_jsonb($1::text)),
        lease_expires_at = now() + $2::interval, started_at = now()
   FROM picked WHERE r.id = picked.id
 RETURNING r.id, r.job_name, r.workflow_run_id, r.executor_type, r.params, r.timeout,
           r.retry_policy, r.attempt, r.cancel_requested, r.lease_token::uuid AS lease_token,
-          extract(epoch FROM now() - r.run_at)::float8 AS waited_sec
+          extract(epoch FROM now() - r.run_at)::float8 AS waited_sec, r.extra
 `
 
 type ClaimExpiredParams struct {
@@ -70,6 +89,7 @@ type ClaimExpiredRow struct {
 	CancelRequested bool
 	LeaseToken      uuid.UUID
 	WaitedSec       float64
+	Extra           []byte
 }
 
 // §2.2 branch two: running rows whose lease expired via idx_job_run_running; the previous holder counts as one interrupted attempt.
@@ -101,6 +121,7 @@ func (q *Queries) ClaimExpired(ctx context.Context, db DBTX, arg ClaimExpiredPar
 			&i.CancelRequested,
 			&i.LeaseToken,
 			&i.WaitedSec,
+			&i.Extra,
 		); err != nil {
 			return nil, err
 		}
@@ -119,12 +140,13 @@ WITH picked AS (
      ORDER BY run_at LIMIT $4::int
        FOR UPDATE SKIP LOCKED)
 UPDATE job_run r
-   SET state = 'running', lease_token = gen_random_uuid(), lease_owner = $1::text,
+   SET state = 'running', lease_token = gen_random_uuid(),
+       extra = jsonb_set(r.extra, '{lease_owner}', to_jsonb($1::text)),
        lease_expires_at = now() + $2::interval, started_at = now()
   FROM picked WHERE r.id = picked.id
 RETURNING r.id, r.job_name, r.workflow_run_id, r.executor_type, r.params, r.timeout,
           r.retry_policy, r.attempt, r.cancel_requested, r.lease_token::uuid AS lease_token,
-          extract(epoch FROM now() - r.run_at)::float8 AS waited_sec
+          extract(epoch FROM now() - r.run_at)::float8 AS waited_sec, r.extra
 `
 
 type ClaimPendingParams struct {
@@ -146,6 +168,7 @@ type ClaimPendingRow struct {
 	CancelRequested bool
 	LeaseToken      uuid.UUID
 	WaitedSec       float64
+	Extra           []byte
 }
 
 // §2.2 branch one: due pending rows via idx_job_run_claim
@@ -175,6 +198,7 @@ func (q *Queries) ClaimPending(ctx context.Context, db DBTX, arg ClaimPendingPar
 			&i.CancelRequested,
 			&i.LeaseToken,
 			&i.WaitedSec,
+			&i.Extra,
 		); err != nil {
 			return nil, err
 		}
@@ -223,7 +247,7 @@ func (q *Queries) FindInflightBeat(ctx context.Context, db DBTX, arg FindInfligh
 }
 
 const GetJobRun = `-- name: GetJobRun :one
-SELECT id, job_name, schedule_name, scheduled_at, dedup_key, workflow_run_id, executor_type, params, timeout, retry_policy, state, attempt, cancel_requested, run_at, lease_expires_at, lease_token, lease_owner, created_at, started_at, finished_at, output, errors FROM job_run WHERE id = $1
+SELECT id, job_name, schedule_name, scheduled_at, dedup_key, workflow_run_id, executor_type, params, timeout, retry_policy, state, attempt, cancel_requested, run_at, lease_expires_at, lease_token, created_at, started_at, finished_at, output, errors, extra FROM job_run WHERE id = $1
 `
 
 // §3.3 Runs.Get and the tests' state reads
@@ -247,12 +271,12 @@ func (q *Queries) GetJobRun(ctx context.Context, db DBTX, id int64) (JobRun, err
 		&i.RunAt,
 		&i.LeaseExpiresAt,
 		&i.LeaseToken,
-		&i.LeaseOwner,
 		&i.CreatedAt,
 		&i.StartedAt,
 		&i.FinishedAt,
 		&i.Output,
 		&i.Errors,
+		&i.Extra,
 	)
 	return i, err
 }
@@ -308,7 +332,7 @@ func (q *Queries) Heartbeat(ctx context.Context, db DBTX, arg HeartbeatParams) (
 }
 
 const ListJobRuns = `-- name: ListJobRuns :many
-SELECT id, job_name, schedule_name, scheduled_at, dedup_key, workflow_run_id, executor_type, params, timeout, retry_policy, state, attempt, cancel_requested, run_at, lease_expires_at, lease_token, lease_owner, created_at, started_at, finished_at, output, errors FROM job_run
+SELECT id, job_name, schedule_name, scheduled_at, dedup_key, workflow_run_id, executor_type, params, timeout, retry_policy, state, attempt, cancel_requested, run_at, lease_expires_at, lease_token, created_at, started_at, finished_at, output, errors, extra FROM job_run
  WHERE ($1::text IS NULL OR job_name = $1::text)
    AND ($2::text IS NULL OR state = $2::text)
    AND ($3::bigint = 0 OR id < $3::bigint)
@@ -354,12 +378,12 @@ func (q *Queries) ListJobRuns(ctx context.Context, db DBTX, arg ListJobRunsParam
 			&i.RunAt,
 			&i.LeaseExpiresAt,
 			&i.LeaseToken,
-			&i.LeaseOwner,
 			&i.CreatedAt,
 			&i.StartedAt,
 			&i.FinishedAt,
 			&i.Output,
 			&i.Errors,
+			&i.Extra,
 		); err != nil {
 			return nil, err
 		}
@@ -369,6 +393,18 @@ func (q *Queries) ListJobRuns(ctx context.Context, db DBTX, arg ListJobRunsParam
 		return nil, err
 	}
 	return items, nil
+}
+
+const LockPlainRunState = `-- name: LockPlainRunState :one
+SELECT state FROM job_run WHERE id = $1 AND workflow_run_id IS NULL FOR UPDATE
+`
+
+// §2.5 / §2.9: scheduled Resume locks its plain run only after the name and schedule row; nodes are never locked here.
+func (q *Queries) LockPlainRunState(ctx context.Context, db DBTX, id int64) (string, error) {
+	row := db.QueryRow(ctx, LockPlainRunState, id)
+	var state string
+	err := row.Scan(&state)
+	return state, err
 }
 
 const NextPendingAt = `-- name: NextPendingAt :many
@@ -409,21 +445,39 @@ func (q *Queries) NextPendingAt(ctx context.Context, db DBTX, executorTypes []st
 	return items, nil
 }
 
-const ResumeRun = `-- name: ResumeRun :execrows
+const ResumeRun = `-- name: ResumeRun :one
 UPDATE job_run
    SET state = 'pending', attempt = 0, run_at = now(),
-       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL,
+       lease_token = NULL, lease_expires_at = NULL, extra = extra - 'lease_owner',
        started_at = NULL, finished_at = NULL, output = NULL, cancel_requested = false
  WHERE id = $1 AND workflow_run_id IS NULL AND state IN ('failed', 'cancelled')
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra
 `
 
+type ResumeRunRow struct {
+	Id            int64
+	JobName       string
+	WorkflowRunId *int64
+	ExecutorType  string
+	State         string
+	LeaseToken    *uuid.UUID
+	Extra         []byte
+}
+
 // §2.5: ordinary terminal runs only; recheck state after a concurrent resume.
-func (q *Queries) ResumeRun(ctx context.Context, db DBTX, id int64) (int64, error) {
-	result, err := db.Exec(ctx, ResumeRun, id)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+func (q *Queries) ResumeRun(ctx context.Context, db DBTX, id int64) (ResumeRunRow, error) {
+	row := db.QueryRow(ctx, ResumeRun, id)
+	var i ResumeRunRow
+	err := row.Scan(
+		&i.Id,
+		&i.JobName,
+		&i.WorkflowRunId,
+		&i.ExecutorType,
+		&i.State,
+		&i.LeaseToken,
+		&i.Extra,
+	)
+	return i, err
 }
 
 const RunIsNode = `-- name: RunIsNode :one
@@ -438,13 +492,30 @@ func (q *Queries) RunIsNode(ctx context.Context, db DBTX, id int64) (bool, error
 	return is_node, err
 }
 
+const RunResumeIdentity = `-- name: RunResumeIdentity :one
+SELECT schedule_name, workflow_run_id FROM job_run WHERE id = $1
+`
+
+type RunResumeIdentityRow struct {
+	ScheduleName  *string
+	WorkflowRunId *int64
+}
+
+// §2.5 / §2.9: read immutable ownership without locks before choosing the scheduled Resume lock order.
+func (q *Queries) RunResumeIdentity(ctx context.Context, db DBTX, id int64) (RunResumeIdentityRow, error) {
+	row := db.QueryRow(ctx, RunResumeIdentity, id)
+	var i RunResumeIdentityRow
+	err := row.Scan(&i.ScheduleName, &i.WorkflowRunId)
+	return i, err
+}
+
 const SettleCancelled = `-- name: SettleCancelled :one
 UPDATE job_run
    SET state = 'cancelled', finished_at = now(),
        errors = errors || COALESCE($1::jsonb, '[]'::jsonb),
-       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
+       lease_token = NULL, lease_expires_at = NULL, extra = extra - 'lease_owner'
  WHERE id = $2 AND lease_token = $3::uuid AND state = 'running'
-RETURNING state
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra
 `
 
 type SettleCancelledParams struct {
@@ -453,21 +524,39 @@ type SettleCancelledParams struct {
 	Token uuid.UUID
 }
 
+type SettleCancelledRow struct {
+	Id            int64
+	JobName       string
+	WorkflowRunId *int64
+	ExecutorType  string
+	State         string
+	LeaseToken    *uuid.UUID
+	Extra         []byte
+}
+
 // §2.4 cancelled exit, same fence
-func (q *Queries) SettleCancelled(ctx context.Context, db DBTX, arg SettleCancelledParams) (string, error) {
+func (q *Queries) SettleCancelled(ctx context.Context, db DBTX, arg SettleCancelledParams) (SettleCancelledRow, error) {
 	row := db.QueryRow(ctx, SettleCancelled, arg.Err, arg.Id, arg.Token)
-	var state string
-	err := row.Scan(&state)
-	return state, err
+	var i SettleCancelledRow
+	err := row.Scan(
+		&i.Id,
+		&i.JobName,
+		&i.WorkflowRunId,
+		&i.ExecutorType,
+		&i.State,
+		&i.LeaseToken,
+		&i.Extra,
+	)
+	return i, err
 }
 
 const SettleFailed = `-- name: SettleFailed :one
 UPDATE job_run
    SET state = CASE WHEN cancel_requested OR $1::boolean THEN 'cancelled' ELSE 'failed' END,
        attempt = attempt + 1, errors = errors || $2::jsonb, finished_at = now(),
-       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
+       lease_token = NULL, lease_expires_at = NULL, extra = extra - 'lease_owner'
  WHERE id = $3 AND lease_token = $4::uuid AND state = 'running'
-RETURNING state
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra
 `
 
 type SettleFailedParams struct {
@@ -477,26 +566,44 @@ type SettleFailedParams struct {
 	Token        uuid.UUID
 }
 
+type SettleFailedRow struct {
+	Id            int64
+	JobName       string
+	WorkflowRunId *int64
+	ExecutorType  string
+	State         string
+	LeaseToken    *uuid.UUID
+	Extra         []byte
+}
+
 // §2.4 permanent failure or no attempts left
-func (q *Queries) SettleFailed(ctx context.Context, db DBTX, arg SettleFailedParams) (string, error) {
+func (q *Queries) SettleFailed(ctx context.Context, db DBTX, arg SettleFailedParams) (SettleFailedRow, error) {
 	row := db.QueryRow(ctx, SettleFailed,
 		arg.WfCancelling,
 		arg.Err,
 		arg.Id,
 		arg.Token,
 	)
-	var state string
-	err := row.Scan(&state)
-	return state, err
+	var i SettleFailedRow
+	err := row.Scan(
+		&i.Id,
+		&i.JobName,
+		&i.WorkflowRunId,
+		&i.ExecutorType,
+		&i.State,
+		&i.LeaseToken,
+		&i.Extra,
+	)
+	return i, err
 }
 
 const SettleInterrupted = `-- name: SettleInterrupted :one
 UPDATE job_run
    SET state = CASE WHEN cancel_requested OR $1::boolean THEN 'cancelled' ELSE 'failed' END,
        finished_at = now(),
-       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
+       lease_token = NULL, lease_expires_at = NULL, extra = extra - 'lease_owner'
  WHERE id = $2 AND lease_token = $3::uuid AND state = 'running'
-RETURNING state
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra
 `
 
 type SettleInterruptedParams struct {
@@ -505,12 +612,30 @@ type SettleInterruptedParams struct {
 	Token        uuid.UUID
 }
 
+type SettleInterruptedRow struct {
+	Id            int64
+	JobName       string
+	WorkflowRunId *int64
+	ExecutorType  string
+	State         string
+	LeaseToken    *uuid.UUID
+	Extra         []byte
+}
+
 // §2.2: reclaimed with attempt >= max_attempts; the interrupted entry was appended by ClaimExpired
-func (q *Queries) SettleInterrupted(ctx context.Context, db DBTX, arg SettleInterruptedParams) (string, error) {
+func (q *Queries) SettleInterrupted(ctx context.Context, db DBTX, arg SettleInterruptedParams) (SettleInterruptedRow, error) {
 	row := db.QueryRow(ctx, SettleInterrupted, arg.WfCancelling, arg.Id, arg.Token)
-	var state string
-	err := row.Scan(&state)
-	return state, err
+	var i SettleInterruptedRow
+	err := row.Scan(
+		&i.Id,
+		&i.JobName,
+		&i.WorkflowRunId,
+		&i.ExecutorType,
+		&i.State,
+		&i.LeaseToken,
+		&i.Extra,
+	)
+	return i, err
 }
 
 const SettleReleased = `-- name: SettleReleased :one
@@ -518,9 +643,9 @@ UPDATE job_run
    SET state       = CASE WHEN cancel_requested OR $1::boolean THEN 'cancelled' ELSE 'pending' END,
        finished_at = CASE WHEN cancel_requested OR $1::boolean THEN now() END,
        run_at = now(), errors = errors || $2::jsonb,
-       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
+       lease_token = NULL, lease_expires_at = NULL, extra = extra - 'lease_owner'
  WHERE id = $3 AND lease_token = $4::uuid AND state = 'running'
-RETURNING state,
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra,
           (SELECT count(*) FROM jsonb_array_elements(errors) x WHERE x->>'kind' = 'released')::int AS released_count
 `
 
@@ -532,7 +657,13 @@ type SettleReleasedParams struct {
 }
 
 type SettleReleasedRow struct {
+	Id            int64
+	JobName       string
+	WorkflowRunId *int64
+	ExecutorType  string
 	State         string
+	LeaseToken    *uuid.UUID
+	Extra         []byte
 	ReleasedCount int32
 }
 
@@ -545,7 +676,16 @@ func (q *Queries) SettleReleased(ctx context.Context, db DBTX, arg SettleRelease
 		arg.Token,
 	)
 	var i SettleReleasedRow
-	err := row.Scan(&i.State, &i.ReleasedCount)
+	err := row.Scan(
+		&i.Id,
+		&i.JobName,
+		&i.WorkflowRunId,
+		&i.ExecutorType,
+		&i.State,
+		&i.LeaseToken,
+		&i.Extra,
+		&i.ReleasedCount,
+	)
 	return i, err
 }
 
@@ -554,9 +694,9 @@ UPDATE job_run
    SET state       = CASE WHEN cancel_requested OR $1::boolean THEN 'cancelled' ELSE 'pending' END,
        finished_at = CASE WHEN cancel_requested OR $1::boolean THEN now() END,
        attempt = attempt + 1, run_at = now() + $2::interval, errors = errors || $3::jsonb,
-       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
+       lease_token = NULL, lease_expires_at = NULL, extra = extra - 'lease_owner'
  WHERE id = $4 AND lease_token = $5::uuid AND state = 'running'
-RETURNING state
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra
 `
 
 type SettleRetryParams struct {
@@ -567,8 +707,18 @@ type SettleRetryParams struct {
 	Token        uuid.UUID
 }
 
+type SettleRetryRow struct {
+	Id            int64
+	JobName       string
+	WorkflowRunId *int64
+	ExecutorType  string
+	State         string
+	LeaseToken    *uuid.UUID
+	Extra         []byte
+}
+
 // §2.4 retryable failure with attempts left: pending again after backoff
-func (q *Queries) SettleRetry(ctx context.Context, db DBTX, arg SettleRetryParams) (string, error) {
+func (q *Queries) SettleRetry(ctx context.Context, db DBTX, arg SettleRetryParams) (SettleRetryRow, error) {
 	row := db.QueryRow(ctx, SettleRetry,
 		arg.WfCancelling,
 		arg.Backoff,
@@ -576,9 +726,17 @@ func (q *Queries) SettleRetry(ctx context.Context, db DBTX, arg SettleRetryParam
 		arg.Id,
 		arg.Token,
 	)
-	var state string
-	err := row.Scan(&state)
-	return state, err
+	var i SettleRetryRow
+	err := row.Scan(
+		&i.Id,
+		&i.JobName,
+		&i.WorkflowRunId,
+		&i.ExecutorType,
+		&i.State,
+		&i.LeaseToken,
+		&i.Extra,
+	)
+	return i, err
 }
 
 const SettleSnoozed = `-- name: SettleSnoozed :one
@@ -587,9 +745,9 @@ UPDATE job_run
        finished_at = CASE WHEN cancel_requested OR $1::boolean THEN now() END,
        run_at = now() + $2::interval
               + CASE WHEN $3::boolean THEN interval '1 microsecond' ELSE interval '0' END,
-       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
+       lease_token = NULL, lease_expires_at = NULL, extra = extra - 'lease_owner'
  WHERE id = $4 AND lease_token = $5::uuid AND state = 'running'
-RETURNING state
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra
 `
 
 type SettleSnoozedParams struct {
@@ -600,10 +758,20 @@ type SettleSnoozedParams struct {
 	Token        uuid.UUID
 }
 
+type SettleSnoozedRow struct {
+	Id            int64
+	JobName       string
+	WorkflowRunId *int64
+	ExecutorType  string
+	State         string
+	LeaseToken    *uuid.UUID
+	Extra         []byte
+}
+
 // §2.4 / §3.2: normal waiting, no attempt/error/output change; cancellation still wins.
 // Native interval input also handles PG 13; add the rounding remainder without Duration overflow.
 // sqlc.arg avoids sqlc 1.31's @ rewrite bug around this interval CASE.
-func (q *Queries) SettleSnoozed(ctx context.Context, db DBTX, arg SettleSnoozedParams) (string, error) {
+func (q *Queries) SettleSnoozed(ctx context.Context, db DBTX, arg SettleSnoozedParams) (SettleSnoozedRow, error) {
 	row := db.QueryRow(ctx, SettleSnoozed,
 		arg.WfCancelling,
 		arg.Delay,
@@ -611,18 +779,26 @@ func (q *Queries) SettleSnoozed(ctx context.Context, db DBTX, arg SettleSnoozedP
 		arg.Id,
 		arg.Token,
 	)
-	var state string
-	err := row.Scan(&state)
-	return state, err
+	var i SettleSnoozedRow
+	err := row.Scan(
+		&i.Id,
+		&i.JobName,
+		&i.WorkflowRunId,
+		&i.ExecutorType,
+		&i.State,
+		&i.LeaseToken,
+		&i.Extra,
+	)
+	return i, err
 }
 
 const SettleSucceeded = `-- name: SettleSucceeded :one
 
 UPDATE job_run
    SET state = 'succeeded', output = $1, finished_at = now(),
-       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL
+       lease_token = NULL, lease_expires_at = NULL, extra = extra - 'lease_owner'
  WHERE id = $2 AND lease_token = $3::uuid AND state = 'running'
-RETURNING state
+RETURNING id, job_name, workflow_run_id, executor_type, state, lease_token, extra
 `
 
 type SettleSucceededParams struct {
@@ -631,23 +807,41 @@ type SettleSucceededParams struct {
 	Token  uuid.UUID
 }
 
+type SettleSucceededRow struct {
+	Id            int64
+	JobName       string
+	WorkflowRunId *int64
+	ExecutorType  string
+	State         string
+	LeaseToken    *uuid.UUID
+	Extra         []byte
+}
+
 // §2.4 settle: one fenced UPDATE per outcome; WHERE lease_token = @token::uuid AND state = 'running' is the fence,
 // ErrNoRows = ErrLeaseLost. Non-terminal outcomes apply the cancel-hit CASE:
 // cancel_requested OR @wf_cancelling → cancelled instead of pending / failed.
 // §2.4 succeeded exit; the fence is lease_token AND state = 'running', zero rows = ErrLeaseLost
-func (q *Queries) SettleSucceeded(ctx context.Context, db DBTX, arg SettleSucceededParams) (string, error) {
+func (q *Queries) SettleSucceeded(ctx context.Context, db DBTX, arg SettleSucceededParams) (SettleSucceededRow, error) {
 	row := db.QueryRow(ctx, SettleSucceeded, arg.Output, arg.Id, arg.Token)
-	var state string
-	err := row.Scan(&state)
-	return state, err
+	var i SettleSucceededRow
+	err := row.Scan(
+		&i.Id,
+		&i.JobName,
+		&i.WorkflowRunId,
+		&i.ExecutorType,
+		&i.State,
+		&i.LeaseToken,
+		&i.Extra,
+	)
+	return i, err
 }
 
 const TriggerJob = `-- name: TriggerJob :one
-INSERT INTO job_run (job_name, dedup_key, schedule_name, scheduled_at, executor_type, params, timeout, retry_policy, state, run_at)
+INSERT INTO job_run (job_name, dedup_key, schedule_name, scheduled_at, executor_type, params, timeout, retry_policy, state, run_at, extra)
 SELECT j.name, $1::text, $2::text, $3::timestamptz,
        j.executor_type, j.params || $4::jsonb, j.timeout, j.retry_policy,
-       'pending', coalesce($5::timestamptz, now())
-  FROM job j WHERE j.name = $6
+       'pending', coalesce($5::timestamptz, now()), coalesce($6::jsonb, '{}'::jsonb)
+  FROM job j WHERE j.name = $7
 ON CONFLICT DO NOTHING
 RETURNING id
 `
@@ -658,6 +852,7 @@ type TriggerJobParams struct {
 	ScheduledAt  *time.Time
 	Params       []byte
 	RunAt        *time.Time
+	Extra        []byte
 	JobName      string
 }
 
@@ -669,6 +864,7 @@ func (q *Queries) TriggerJob(ctx context.Context, db DBTX, arg TriggerJobParams)
 		arg.ScheduledAt,
 		arg.Params,
 		arg.RunAt,
+		arg.Extra,
 		arg.JobName,
 	)
 	var id int64

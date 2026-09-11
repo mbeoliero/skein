@@ -3,6 +3,7 @@ package skein
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -26,17 +27,24 @@ import (
 // Knobs: SKEIN_BENCH_POLL (worker PollInterval, default 1s), SKEIN_BENCH_CONCURRENCY
 // (per worker, default 16), SKEIN_BENCH_OUT (append the report to this file).
 
-func benchWorkerConfig(schema string) Config {
-	poll, _ := time.ParseDuration(cmp.Or(os.Getenv("SKEIN_BENCH_POLL"), "1s"))
-	conc, _ := strconv.Atoi(cmp.Or(os.Getenv("SKEIN_BENCH_CONCURRENCY"), "16"))
-	return Config{
+func benchWorkerConfig(schema string) (Config, error) {
+	poll, err := time.ParseDuration(cmp.Or(os.Getenv("SKEIN_BENCH_POLL"), "1s"))
+	if err != nil || poll <= 0 {
+		return Config{}, fmt.Errorf("SKEIN_BENCH_POLL must be a positive duration, got %q", os.Getenv("SKEIN_BENCH_POLL"))
+	}
+	conc, err := strconv.Atoi(cmp.Or(os.Getenv("SKEIN_BENCH_CONCURRENCY"), "16"))
+	if err != nil || conc <= 0 {
+		return Config{}, fmt.Errorf("SKEIN_BENCH_CONCURRENCY must be a positive integer, got %q", os.Getenv("SKEIN_BENCH_CONCURRENCY"))
+	}
+	cfg := Config{
 		Schema:            schema,
 		PollInterval:      poll,
 		Concurrency:       conc,
 		HeartbeatInterval: time.Second, // long tasks outlive a few heartbeats so the HOT ratio means something
 		LeaseTTL:          4 * time.Second,
 		Logger:            slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
-	}
+	}.withDefaults()
+	return cfg, cfg.validate()
 }
 
 func registerBenchExecutors(e *Engine) {
@@ -73,10 +81,14 @@ func TestPerformanceBaseline(t *testing.T) {
 	if os.Getenv("SKEIN_BENCH") == "" {
 		t.Skip("set SKEIN_BENCH=1 to run the M5 baseline")
 	}
+	t.Setenv("SKEIN_TEST_REQUIRE_DB", "1")
+	workerCfg, err := benchWorkerConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
 	pool, schema := freshSchema(t)
 	ctx := t.Context()
-	jr, wf := qualified(schema, "job_run"), qualified(schema, "workflow_run")
-	_ = wf
+	jr := qualified(schema, "job_run")
 
 	// 100k existing terminal rows with ~1 KB params, finished over the last 20 days
 	execSql(t, pool, `INSERT INTO `+jr+` (job_name, executor_type, params, timeout, retry_policy, state, run_at, started_at, finished_at, created_at)
@@ -156,11 +168,14 @@ func TestPerformanceBaseline(t *testing.T) {
 	updBefore, hotBefore, _ := settledStats()
 	activeBefore := activeMs()
 
-	// lock-wait sampler
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	var lockSamples []int
-	var sampleMu sync.Mutex
-	go func() {
+	var sampler sync.WaitGroup
+	t.Cleanup(func() {
+		stopSampling()
+		sampler.Wait()
+	})
+	sampler.Go(func() {
 		for {
 			select {
 			case <-sampleCtx.Done():
@@ -174,11 +189,9 @@ func TestPerformanceBaseline(t *testing.T) {
 				}
 				return
 			}
-			sampleMu.Lock()
 			lockSamples = append(lockSamples, n)
-			sampleMu.Unlock()
 		}
-	}()
+	})
 
 	// submit phase: 8 goroutines per group, 24 in all; trigger latency per call
 	var mu sync.Mutex
@@ -215,7 +228,6 @@ func TestPerformanceBaseline(t *testing.T) {
 	wg.Wait()
 	submitted := time.Since(start)
 
-	// drain phase
 	var claimPeak int64
 	for {
 		var left int
@@ -230,16 +242,16 @@ func TestPerformanceBaseline(t *testing.T) {
 	}
 	wall := time.Since(start)
 	stopSampling()
+	sampler.Wait()
 	activeAfter := activeMs()
 	updAfter, hotAfter, deadAfter := settledStats()
 
 	// per-group queue and execution latency from the rows themselves; attempt + 1 is
 	// the number of starts, each one claim and one settle
 	type row struct {
-		job          string
-		queued, exec time.Duration
-		failed       bool
-		attempt      int
+		job     string
+		failed  bool
+		attempt int
 	}
 	rows, err := pool.Query(ctx, `SELECT job_name, extract(epoch FROM started_at - run_at), extract(epoch FROM finished_at - started_at), state <> 'succeeded', attempt
 		FROM `+jr+` WHERE job_name = ANY($1)`, []string{"short_1k", "short_256k", "long_1k"})
@@ -247,6 +259,7 @@ func TestPerformanceBaseline(t *testing.T) {
 		t.Fatal(err)
 	}
 	queued, execd := map[string][]time.Duration{}, map[string][]time.Duration{}
+	completed := map[string]int{}
 	failed, starts := 0, int64(0)
 	for rows.Next() {
 		var r row
@@ -257,6 +270,7 @@ func TestPerformanceBaseline(t *testing.T) {
 		queued[r.job] = append(queued[r.job], time.Duration(q*float64(time.Second)))
 		execd[r.job] = append(execd[r.job], time.Duration(x*float64(time.Second)))
 		starts += int64(r.attempt) + 1
+		completed[r.job]++
 		if r.failed {
 			failed++
 		}
@@ -266,25 +280,22 @@ func TestPerformanceBaseline(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// what the claim index looks like once vacuum has run (pending rows are gone)
 	execSql(t, pool, "VACUUM "+jr)
 	claimIdxAfter := sizeOf("idx_job_run_claim")
 	_, _, deadAfterVacuum := tableStats()
 
-	sampleMu.Lock()
 	maxLock, sumLock := 0, 0
 	for _, n := range lockSamples {
 		maxLock, sumLock = max(maxLock, n), sumLock+n
 	}
 	nSamples := len(lockSamples)
-	sampleMu.Unlock()
 
 	var b strings.Builder
 	w := func(format string, a ...any) { fmt.Fprintf(&b, format+"\n", a...) }
 	w("## Baseline %s", time.Now().Format("2006-01-02 15:04"))
 	w("")
 	w("Workers %d processes × Concurrency %d, PollInterval %s, HeartbeatInterval 1s, LeaseTTL 4s; 100k seeded rows; PostgreSQL %s.",
-		workers, benchWorkerConfig(schema).Concurrency, benchWorkerConfig(schema).PollInterval, pgVersion(t, pool))
+		workers, workerCfg.Concurrency, workerCfg.PollInterval, pgVersion(t, pool))
 	w("")
 	w("| group | runs | payload | trigger p50 / p95 / p99 | queue p50 / p95 / p99 | exec p50 / p95 / p99 |")
 	w("|---|---|---|---|---|---|")
@@ -301,7 +312,11 @@ func TestPerformanceBaseline(t *testing.T) {
 	w("| measure | value |")
 	w("|---|---|")
 	w("| submitted | %d runs in %s (%.0f triggers/s) |", total, submitted.Round(time.Millisecond), float64(total)/submitted.Seconds())
-	w("| completed | %d runs in %s (%.0f runs/s end to end), %d failed |", total, wall.Round(time.Millisecond), float64(total)/wall.Seconds(), failed)
+	observed := 0
+	for _, count := range completed {
+		observed += count
+	}
+	w("| completed | %d runs in %s (%.0f runs/s end to end), %d failed |", observed, wall.Round(time.Millisecond), float64(observed)/wall.Seconds(), failed)
 	// claims and settles change indexed columns and are never HOT, so every HOT update
 	// is a heartbeat and the heartbeats are what is left after claims and settles
 	upd, hot := updAfter-updBefore, hotAfter-hotBefore
@@ -324,13 +339,35 @@ func TestPerformanceBaseline(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer f.Close()
-		fmt.Fprintln(f, report)
+		_, writeErr := fmt.Fprintln(f, report)
+		if err := errors.Join(writeErr, f.Close()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := validateBenchCompletion(groups, completed, failed); err != nil {
+		t.Fatal(err)
 	}
 }
 
+// Performance comparisons are meaningful only for the intended successful work.
+func validateBenchCompletion(groups []benchGroup, completed map[string]int, failed int) error {
+	var errs []error
+	for _, group := range groups {
+		if got := completed[group.job]; got != group.count {
+			errs = append(errs, fmt.Errorf("%s: observed %d runs, want %d", group.job, got, group.count))
+		}
+	}
+	if failed != 0 {
+		errs = append(errs, fmt.Errorf("baseline has %d unsuccessful runs", failed))
+	}
+	return errors.Join(errs...)
+}
+
 func pgVersion(t *testing.T, pool *pgxpool.Pool) string {
+	t.Helper()
 	var v string
-	_ = pool.QueryRow(t.Context(), "SHOW server_version").Scan(&v)
+	if err := pool.QueryRow(t.Context(), "SHOW server_version").Scan(&v); err != nil {
+		t.Fatal(err)
+	}
 	return v
 }

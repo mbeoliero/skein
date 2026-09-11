@@ -16,16 +16,21 @@ import (
 )
 
 // schemaVersion is the migration this build expects; Start refuses anything else.
-const schemaVersion = 1
+const schemaVersion = 2
 
 // Migrate creates the schema and applies pending migrations. It is explicit and
 // serial by design: run it from the release step, not from Start.
+// Schema follows Config.Schema validation; an empty name uses "skein".
 func Migrate(ctx context.Context, pool *pgxpool.Pool, schema string) error {
+	schema = cmp.Or(schema, defaultSchema)
+	if err := validSchema(schema); err != nil {
+		return err
+	}
 	ms, err := loadMigrations()
 	if err != nil {
 		return err
 	}
-	return store.Open(pool, cmp.Or(schema, defaultSchema)).Migrate(ctx, ms)
+	return store.Open(pool, schema).Migrate(ctx, ms)
 }
 
 func loadMigrations() ([]store.Migration, error) {

@@ -84,7 +84,7 @@ func TestSnoozePreservesRun(t *testing.T) {
 	if run.Attempt != 0 || len(errorsOf(t, run)) != 0 || string(run.Output) != `{"done": true}` {
 		t.Fatalf("final result: %+v", run)
 	}
-	waitFor(t, "snoozed and succeeded observations", func() bool {
+	waitFor(t, "snoozed and succeeded observations", func(ctx context.Context) bool {
 		return rec.get("exec_duration", "executor_type", "poll", "outcome", "snoozed") == 3 &&
 			rec.get("exec_duration", "executor_type", "poll", "outcome", "succeeded") == 1
 	})
@@ -182,7 +182,7 @@ func TestSnoozeContextWins(t *testing.T) {
 					t.Fatalf("shutdown snoozed instead of releasing immediately: %+v", run)
 				}
 			}
-			waitFor(t, "context outcome observation", func() bool {
+			waitFor(t, "context outcome observation", func(ctx context.Context) bool {
 				return rec.get("exec_duration", "executor_type", "poll", "outcome", tc.outcome) == 1
 			})
 			if got := rec.get("exec_duration", "executor_type", "poll", "outcome", "snoozed"); got != 0 {
@@ -229,8 +229,8 @@ func TestSnoozeDurationPersistence(t *testing.T) {
 			declare(t, e, JobSpec{Name: "j", ExecutorType: "poll", Retry: RetryPolicy{MaxAttempts: 1}})
 			id := trigger(t, e, "j", `{}`)
 			var got int64
-			waitFor(t, "persisted snooze delay", func() bool {
-				return pool.QueryRow(t.Context(), "SELECT micros FROM "+audit).Scan(&got) == nil
+			waitFor(t, "persisted snooze delay", func(ctx context.Context) bool {
+				return pool.QueryRow(ctx, "SELECT micros FROM "+audit).Scan(&got) == nil
 			})
 			want := int64(tc.delay / time.Microsecond)
 			if tc.delay%time.Microsecond != 0 {

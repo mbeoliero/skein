@@ -20,11 +20,13 @@ type Node struct {
 	Deps []string
 }
 
+// WorkflowSpec defines a nonempty DAG of declared jobs, with each job used once.
 type WorkflowSpec struct {
 	Name  string
 	Nodes []Node
 }
 
+// WorkflowState is the persisted aggregate state of a workflow run.
 type WorkflowState string
 
 const (
@@ -47,6 +49,7 @@ type WorkflowRun struct {
 	ScheduledAt  *time.Time
 	DedupKey     string
 	Input        RawJSON
+	Extra        RawJSON             // library-managed metadata; tracing belongs to this parent, not each node
 	Dag          map[string][]string // job name → direct predecessors, snapshot at trigger
 	State        WorkflowState
 	CreatedAt    time.Time
@@ -54,6 +57,7 @@ type WorkflowRun struct {
 	Nodes        []JobRun // ordered by job name
 }
 
+// Workflows declares DAGs and submits, queries or controls their runs.
 type Workflows struct{ e *Engine }
 
 func (e *Engine) Workflows() *Workflows { return &Workflows{e: e} }
@@ -81,7 +85,7 @@ func (w *Workflows) Declare(ctx context.Context, spec WorkflowSpec) error {
 	return mapErr(w.e.st.DeclareWorkflow(ctx, spec.Name, nodes), spec.Name)
 }
 
-// validateWorkflow checks node count, unique names, dependency references and acyclicity (Kahn).
+// Kahn's algorithm detects dependency cycles.
 func validateWorkflow(spec WorkflowSpec, maxNodes int) ([]store.NodeDef, error) {
 	if len(spec.Nodes) == 0 {
 		return nil, errors.New("needs at least one node")
@@ -144,7 +148,7 @@ func (w *Workflows) Delete(ctx context.Context, name string) error {
 }
 
 // Trigger creates a workflow run with input readable by every node. DedupKey applies;
-// At does not (nodes without predecessors start at once).
+// At is rejected (nodes without predecessors start at once).
 func (w *Workflows) Trigger(ctx context.Context, name string, input RawJSON, opts ...TriggerOption) (int64, error) {
 	id, err := w.trigger(ctx, nil, name, input, opts)
 	if err == nil {
@@ -153,6 +157,9 @@ func (w *Workflows) Trigger(ctx context.Context, name string, input RawJSON, opt
 	return id, err
 }
 
+// TriggerTx applies Trigger inside the caller's transaction. It accepts DedupKey
+// and rejects At. Commit visibility, duplicate ids and search_path restoration
+// follow Jobs.TriggerTx; the caller owns commit and rollback.
 func (w *Workflows) TriggerTx(ctx context.Context, tx pgx.Tx, name string, input RawJSON, opts ...TriggerOption) (int64, error) {
 	if tx == nil {
 		return 0, errors.New("skein: TriggerTx needs a transaction")
@@ -172,7 +179,9 @@ func (w *Workflows) trigger(ctx context.Context, tx pgx.Tx, name string, input R
 	if err != nil {
 		return 0, fmt.Errorf("skein: trigger workflow %q input: %w", name, err)
 	}
-	id, err := w.e.st.TriggerWorkflow(ctx, tx, store.TriggerWorkflowParams{WorkflowName: name, DedupKey: o.dedup, Input: in})
+	id, err := w.e.st.TriggerWorkflow(ctx, tx, store.TriggerWorkflowParams{
+		WorkflowName: name, DedupKey: o.dedup, Input: in, Extra: traceExtra(ctx),
+	})
 	return id, mapErr(err, name)
 }
 
@@ -196,7 +205,7 @@ func (w *Workflows) GetRun(ctx context.Context, id int64) (*WorkflowRun, error) 
 func workflowRunFromStore(row store.WorkflowRun) (*WorkflowRun, error) {
 	run := &WorkflowRun{
 		Id: row.Id, WorkflowName: row.WorkflowName, ScheduleName: deref(row.ScheduleName), ScheduledAt: row.ScheduledAt,
-		DedupKey: deref(row.DedupKey), Input: RawJSON(row.Input), State: WorkflowState(row.State),
+		DedupKey: deref(row.DedupKey), Input: RawJSON(row.Input), Extra: RawJSON(row.Extra), State: WorkflowState(row.State),
 		CreatedAt: row.CreatedAt, FinishedAt: row.FinishedAt,
 	}
 	if err := json.Unmarshal(row.Dag, &run.Dag); err != nil {
@@ -205,6 +214,7 @@ func workflowRunFromStore(row store.WorkflowRun) (*WorkflowRun, error) {
 	return run, nil
 }
 
+// WorkflowRunFilter restricts a workflow page; empty fields do not filter.
 type WorkflowRunFilter struct {
 	WorkflowName string
 	State        WorkflowState
@@ -216,7 +226,7 @@ type WorkflowRunFilter struct {
 func (w *Workflows) ListRuns(ctx context.Context, f WorkflowRunFilter, cursor int64) (page []WorkflowRun, next int64, err error) {
 	limit := pageLimit(f.Limit)
 	rows, err := w.e.st.ListWorkflowRuns(ctx, store.ListWorkflowRunsParams{
-		WorkflowName: optional(f.WorkflowName), State: optional(string(f.State)), Cursor: cursor, Lim: int32(limit + 1), // one more row tells whether a next page exists
+		WorkflowName: optional(f.WorkflowName), State: optional(string(f.State)), Cursor: cursor, Lim: int32(limit + 1),
 	})
 	if err != nil {
 		return nil, 0, err
@@ -237,18 +247,26 @@ func (w *Workflows) ListRuns(ctx context.Context, f WorkflowRunFilter, cursor in
 // CancelRun stops a workflow: unstarted nodes end now, running nodes are cancelled
 // through their heartbeat, and the last one to settle finalises the run (§2.5).
 func (w *Workflows) CancelRun(ctx context.Context, id int64) error {
-	return mapErr(w.e.st.CancelWorkflow(ctx, id), strconv.FormatInt(id, 10))
+	changes, err := w.e.st.CancelWorkflow(ctx, id)
+	if err == nil {
+		w.e.observe(changes)
+	}
+	return mapErr(err, strconv.FormatInt(id, 10))
 }
 
 // Resume re-runs the failed / cancelled nodes and their unsucceeded descendants of a
 // failed or cancelled workflow run; succeeded nodes keep their output (§2.5).
+// ErrNotResumable also covers a cancelled workflow whose nodes all succeeded: its
+// terminal state is preserved. Scheduled runs obey the current overlap policy;
+// ErrDuplicate rolls back every node reset and leaves the parent unchanged.
 func (w *Workflows) Resume(ctx context.Context, id int64) error {
 	if id <= 0 {
 		return fmt.Errorf("skein: workflow run id must be positive")
 	}
-	err := w.e.st.Resume(ctx, id)
+	changes, err := w.e.st.Resume(ctx, id)
 	if err == nil {
 		w.e.wakeClaimer()
+		w.e.observe(changes)
 	}
 	return mapErr(err, strconv.FormatInt(id, 10))
 }

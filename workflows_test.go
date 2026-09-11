@@ -14,9 +14,6 @@ import (
 	"github.com/mbeoliero/skein/internal/store"
 )
 
-// Workflow acceptance checks. Executors record what they were handed so the tests can
-// check inputs, predecessor outputs and idempotency keys, not just final states.
-
 type recorder struct {
 	mu   sync.Mutex
 	reqs map[string][]*Request
@@ -64,24 +61,27 @@ func triggerWorkflow(t *testing.T, e *Engine, name, input string, opts ...Trigge
 
 func waitWorkflow(t *testing.T, e *Engine, id int64, state WorkflowState) *WorkflowRun {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		run, err := e.Workflows().GetRun(t.Context(), id)
-		if err != nil {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	var run *WorkflowRun
+	err := pollUntil(ctx, func(ctx context.Context) (bool, error) {
+		current, err := e.Workflows().GetRun(ctx, id)
+		if err == nil {
+			run = current
+		}
+		return err == nil && run.State == state, err
+	})
+	if err != nil {
+		if run == nil {
 			t.Fatalf("get workflow run %d: %v", id, err)
 		}
-		if run.State == state {
-			return run
+		var nodes []string
+		for _, n := range run.Nodes {
+			nodes = append(nodes, fmt.Sprintf("%s=%s", n.JobName, n.State))
 		}
-		if time.Now().After(deadline) {
-			var nodes []string
-			for _, n := range run.Nodes {
-				nodes = append(nodes, fmt.Sprintf("%s=%s", n.JobName, n.State))
-			}
-			t.Fatalf("workflow %d is %s, want %s; nodes %s", id, run.State, state, strings.Join(nodes, " "))
-		}
-		time.Sleep(20 * time.Millisecond)
+		t.Fatalf("workflow %d is %s, want %s; nodes %s: %v", id, run.State, state, strings.Join(nodes, " "), err)
 	}
+	return run
 }
 
 func nodeOf(t *testing.T, run *WorkflowRun, job string) *JobRun {
@@ -97,8 +97,8 @@ func nodeOf(t *testing.T, run *WorkflowRun, job string) *JobRun {
 
 func waitNode(t *testing.T, e *Engine, wf int64, job string, state RunState) {
 	t.Helper()
-	waitFor(t, job+" to be "+string(state), func() bool {
-		run, err := e.Workflows().GetRun(t.Context(), wf)
+	waitFor(t, job+" to be "+string(state), func(ctx context.Context) bool {
+		run, err := e.Workflows().GetRun(ctx, wf)
 		return err == nil && nodeOf(t, run, job).State == state
 	})
 }
@@ -189,7 +189,7 @@ func TestFanInActivatesOnce(t *testing.T) {
 	var rec recorder
 	var entered atomic.Int32
 	release := make(chan struct{})
-	cfg := fastConfig(schema)
+	cfg := behaviorConfig(schema)
 	cfg.Concurrency = fan
 	e := startEngine(t, pool, cfg, func(e *Engine) {
 		e.Register("fast", func(ctx context.Context, req *Request) (RawJSON, error) {
@@ -281,9 +281,8 @@ func TestFailFastCancelsTheRest(t *testing.T) {
 	}
 }
 
-// x fails while y, its pending sibling, is being claimed: the fail-fast cancel waits
-// for the claim's lock and skips y, so the node states must be read after it. Read
-// before, y counts as cancelled and the run ends failed with y executing (§2.4).
+// x fails while y's claim is uncommitted: cancellation must skip y without waiting.
+// Read node states after cancellation so the skipped y still counts as unfinished (§2.4).
 func TestCancellationSkipsClaimInProgress(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -328,7 +327,7 @@ func TestCancellationSkipsClaimInProgress(t *testing.T) {
 			if err != nil || len(rows) != 1 {
 				t.Fatalf("claim y: %v %v", rows, err)
 			}
-			y := store.Claimed(rows[0])
+			y := store.Claimed{ClaimPendingRow: rows[0]}
 			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 			defer cancel()
 			if tc.fail {
@@ -591,14 +590,14 @@ func TestResumeRejectsDuplicateKey(t *testing.T) {
 		}
 		dueAt(t, pool, schema, spec.Name, time.Now().Add(-2*time.Hour))
 	}
-	beats := func(schedule string) (ids []int64) {
+	beats := func(ctx context.Context, schedule string) (ids []int64) {
 		t.Helper()
 		if schedule == "pj" {
-			for _, r := range scheduledRuns(t, e, schedule) {
+			for _, r := range scheduledRunsContext(t, ctx, e, schedule) {
 				ids = append(ids, r.Id)
 			}
 		} else {
-			page, _, err := e.Workflows().ListRuns(t.Context(), WorkflowRunFilter{WorkflowName: "v"}, 0)
+			page, _, err := e.Workflows().ListRuns(ctx, WorkflowRunFilter{WorkflowName: "v"}, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -609,20 +608,20 @@ func TestResumeRejectsDuplicateKey(t *testing.T) {
 		slices.Sort(ids)
 		return ids
 	}
-	waitFor(t, "first beats failed", func() bool {
-		pj, pw := beats("pj"), beats("pw")
+	waitFor(t, "first beats failed", func(ctx context.Context) bool {
+		pj, pw := beats(ctx, "pj"), beats(ctx, "pw")
 		if len(pj) != 1 || len(pw) != 1 {
 			return false
 		}
-		r, _ := e.Runs().Get(t.Context(), pj[0])
-		w, _ := e.Workflows().GetRun(t.Context(), pw[0])
+		r, _ := e.Runs().Get(ctx, pj[0])
+		w, _ := e.Workflows().GetRun(ctx, pw[0])
 		return r != nil && r.State == StateFailed && w != nil && w.State == WorkflowFailed
 	})
-	beat1j, beat1w := beats("pj")[0], beats("pw")[0]
+	beat1j, beat1w := beats(t.Context(), "pj")[0], beats(t.Context(), "pw")[0]
 	dueAt(t, pool, schema, "pj", time.Now().Add(-time.Hour))
 	dueAt(t, pool, schema, "pw", time.Now().Add(-time.Hour))
-	waitFor(t, "second beats created", func() bool { return len(beats("pj")) == 2 && len(beats("pw")) == 2 })
-	beat2j, beat2w := beats("pj")[1], beats("pw")[1]
+	waitFor(t, "second beats created", func(ctx context.Context) bool { return len(beats(ctx, "pj")) == 2 && len(beats(ctx, "pw")) == 2 })
+	beat2j, beat2w := beats(t.Context(), "pj")[1], beats(t.Context(), "pw")[1]
 	waitRun(t, e, beat2j, StateRunning)
 	waitNode(t, e, beat2w, "yw", StateRunning)
 	if err := e.Runs().Resume(t.Context(), beat1j); !errors.Is(err, ErrDuplicate) {

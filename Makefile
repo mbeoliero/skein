@@ -1,5 +1,7 @@
 .PHONY: test test-ci race lint tidy sqlc sqlc-check pg-start
 
+RACE_TIMEOUT ?= 20m
+
 test:
 	go test ./...
 
@@ -7,7 +9,7 @@ test-ci:
 	SKEIN_TEST_REQUIRE_DB=1 go test -count=1 ./...
 
 race:
-	go test -race -count=3 ./...
+	go test -race -count=3 -timeout $(RACE_TIMEOUT) ./...
 
 lint: sqlc-check
 	@test -z "$$(gofmt -l .)" || { gofmt -l .; exit 1; }

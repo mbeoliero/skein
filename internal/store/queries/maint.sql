@@ -38,10 +38,12 @@ SELECT count(*)::int AS n FROM workflow_run WHERE state IN ('running', 'cancelli
 SELECT count(*)::int AS n FROM job_run
  WHERE state IN ('pending', 'running') AND workflow_run_id IS NULL AND created_at < now() - @age::interval;
 
--- name: Stats :one
--- §3.3 Engine.Stats: one statement over the in-flight rows (both partial indexes)
-SELECT count(*) FILTER (WHERE state = 'pending' AND run_at <= now())::int AS pending_due,
+-- name: Stats :many
+-- §3.3 Engine.Stats: type-level counts and totals share one snapshot over the in-flight rows
+SELECT executor_type,
+       count(*) FILTER (WHERE state = 'pending' AND run_at <= now())::int AS pending_due,
        count(*) FILTER (WHERE state = 'running')::int AS running,
        coalesce(extract(epoch FROM now() - min(run_at) FILTER (WHERE state = 'pending' AND run_at <= now())), 0)::float8 AS oldest_pending_sec,
-       count(*) FILTER (WHERE state = 'pending' AND run_at <= now() AND NOT (executor_type = ANY(@registered::text[])))::int AS unregistered_due
-  FROM job_run WHERE state IN ('pending', 'running');
+       (executor_type = ANY(@registered::text[]))::boolean AS registered
+  FROM job_run WHERE state IN ('pending', 'running')
+ GROUP BY executor_type;

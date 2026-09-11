@@ -15,19 +15,22 @@ type RawJSON = jsontext.Value
 // effects must deduplicate on req.IdempotencyKey.
 type Executor func(ctx context.Context, req *Request) (RawJSON, error)
 
+// Request contains this invocation's snapshot and stable business identity.
+// Input and Deps are set only for workflow nodes; callers own the request values.
 type Request struct {
 	RunId          int64
+	ExecutionId    string // unique to this claim; changes even when Attempt stays the same
+	TraceId        string // original submission trace; empty when no valid trace was submitted
 	JobName        string
 	Attempt        int                // failures/interruptions +1; releases and snoozes do not increment it
 	Params         RawJSON            // job.params merged with the caller's override
-	WorkflowRunId  *int64             // set for workflow nodes
+	WorkflowRunId  *int64             // independent copy for workflow nodes; mutations do not change settlement
 	Input          RawJSON            // workflow_run.input; nil for plain runs
 	Deps           map[string]RawJSON // direct predecessors' output by job name
 	IdempotencyKey string             // "run:<id>" or "wf:<wf_id>/<job_name>", stable across attempts and resumes
 }
 
-// Register binds an executor type to fn. It must run before Start; a duplicate
-// type panics, like http.Handle.
+// Register binds an executor type to fn before Start; a duplicate type panics.
 func (e *Engine) Register(executorType string, fn Executor) {
 	e.lifecycle.Lock()
 	defer e.lifecycle.Unlock()

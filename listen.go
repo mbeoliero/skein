@@ -7,11 +7,7 @@ import (
 	"time"
 )
 
-// listenLoop keeps the process's LISTEN connection alive (§2.7). Each payload is
-// routed to a loop: "run:<executor_type>" wakes the claimer when this process
-// registered that type, "schedule" wakes the scheduler, anything else wakes both.
-// Notifications only shorten a wait; a lost one costs at most a PollInterval, so an
-// error here is logged, counted, and retried after a jittered poll period.
+// Polling remains the fallback if LISTEN disconnects or loses notifications (§2.7).
 func (e *Engine) listenLoop(ctx context.Context) {
 	for {
 		l, err := e.st.Listen(ctx)

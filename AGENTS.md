@@ -13,7 +13,7 @@ one database, with no leader or extra service.
   obtain explicit approval. Also ask before starting each milestone.
 - Ask before adding dependencies or `internal/` packages; new packages need a real
   second import boundary. No DI frameworks or future scaffolding; no CLI unless requested.
-  Runtime dependencies are pgx/v5 and robfig/cron/v3.
+  Runtime dependencies are pgx/v5, robfig/cron/v3 and the OpenTelemetry API for TraceContext propagation.
 - Leave `AGENTS.md` unchanged unless long-term development rules or workflows change.
   Do not record individual requirements, implementation history or completion status.
 - After approval, update the relevant design section before implementation, following
@@ -82,7 +82,11 @@ acceptance evidence. Setup and source/test navigation: [README.md](README.md).
 
 ### Concurrency and lifecycle
 
-- Lock order: **`workflow_run → job_run`**. Claim and unstarted-node cancellation use
+- Lock order: **`schedule name advisory lock → schedule → workflow_run → job_run`**;
+  operations start at the first lock they need. Scheduled Resume acquires the name
+  lock before any run row; scan tries name locks without waiting before locking each
+  schedule. Settle, heartbeat and retention never acquire schedule/name locks.
+  Claim and unstarted-node cancellation use
   `FOR UPDATE SKIP LOCKED`; settle must not wait for additional cancellation candidates (§2.9).
 - Cancel running workflow nodes through parent state, never a batch UPDATE.
   `cancel_requested` is plain-run only; preserve ordering and convergence in §2.4–§2.5.

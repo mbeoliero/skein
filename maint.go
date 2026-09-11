@@ -25,11 +25,8 @@ func (e *Engine) maintenanceLoop(ctx context.Context) {
 	}
 }
 
-// maintainOnce is §2.8: retention plus the stale-active check, on whichever instance
-// wins the advisory lock; skipped reports that another holder had it. A silent failure
-// is this job's biggest risk, so every step that fails is logged at error level and counted.
-// It runs under the loop ctx: a batch is its own short transaction, so Shutdown cancels
-// the one in flight instead of waiting for it (§2.6 step 1), unlike a claim.
+// Retention batches follow the loop ctx so Shutdown cancels in-flight work (§2.6/§2.8).
+// skipped means another instance holds the advisory lock.
 func (e *Engine) maintainOnce(ctx context.Context) (skipped bool) {
 	mctx, cancel := context.WithTimeout(ctx, maintenanceTimeout)
 	defer cancel()
@@ -64,20 +61,41 @@ func (e *Engine) maintainOnce(ctx context.Context) (skipped bool) {
 
 // Stats is the §3.3 one-statement snapshot the host can scrape.
 type Stats struct {
-	PendingDue       int           // pending rows whose run_at has passed
-	Running          int           // rows holding a lease
-	OldestPendingAge time.Duration // now − run_at of the oldest due pending row
-	UnregisteredDue  int           // due rows whose executor type this process does not register
+	PendingDue       int                      // pending rows whose run_at has passed
+	Running          int                      // rows holding a lease
+	OldestPendingAge time.Duration            // now − run_at of the oldest due pending row
+	UnregisteredDue  int                      // due rows whose executor type this process does not register
+	ByExecutor       map[string]ExecutorStats // only types with pending or running rows
+}
+
+// ExecutorStats counts one type across this schema. Registered describes this
+// Engine's registry, not every process sharing the queue.
+type ExecutorStats struct {
+	PendingDue       int
+	Running          int
+	OldestPendingAge time.Duration
+	Registered       bool
 }
 
 func (e *Engine) Stats(ctx context.Context) (Stats, error) {
-	row, err := e.st.Stats(ctx, e.registeredTypes())
+	rows, err := e.st.Stats(ctx, e.registeredTypes())
 	if err != nil {
 		return Stats{}, err
 	}
-	return Stats{
-		PendingDue: int(row.PendingDue), Running: int(row.Running),
-		OldestPendingAge: time.Duration(row.OldestPendingSec * float64(time.Second)),
-		UnregisteredDue:  int(row.UnregisteredDue),
-	}, nil
+	stats := Stats{ByExecutor: make(map[string]ExecutorStats, len(rows))}
+	for _, row := range rows {
+		counts := ExecutorStats{
+			PendingDue: int(row.PendingDue), Running: int(row.Running),
+			OldestPendingAge: time.Duration(row.OldestPendingSec * float64(time.Second)),
+			Registered:       row.Registered,
+		}
+		stats.ByExecutor[row.ExecutorType] = counts
+		stats.PendingDue += counts.PendingDue
+		stats.Running += counts.Running
+		stats.OldestPendingAge = max(stats.OldestPendingAge, counts.OldestPendingAge)
+		if !counts.Registered {
+			stats.UnregisteredDue += counts.PendingDue
+		}
+	}
+	return stats, nil
 }

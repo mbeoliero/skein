@@ -14,16 +14,14 @@ import (
 
 // Wakeup acceptance checks (design §2.7): every check runs with a 5s PollInterval so that only a wake
 // source (NOTIFY, a local event, or the next-due timer) can explain a fast result.
-// slowPoll is the fastConfig with the poll backstop pushed out of the way.
 func slowPoll(schema string) Config {
 	cfg := fastConfig(schema)
 	cfg.PollInterval = 5 * time.Second
 	return cfg
 }
 
-// tight is the CI budget for one wake plus one or two round trips on a loaded local
-// machine: an upper bound, not the precision (README.md validation entry; the distribution is the
-// baseline's job).
+// tight is the acceptance bound for a wake and its database round trips on the
+// test machine; it is not a production SLA (README.md validation entry).
 const tight = 300 * time.Millisecond
 
 // entryClock is an executor that reads the database clock on entry, so that entry −
@@ -50,8 +48,6 @@ func runAt(t *testing.T, pool *pgxpool.Pool, schema string, id int64) time.Time 
 	return at
 }
 
-// expectEntry waits for the executor to enter and checks it did so within tight of
-// the row's run_at, both on the database clock.
 func expectEntry(t *testing.T, what string, entries <-chan time.Time, pool *pgxpool.Pool, schema string, id int64) {
 	t.Helper()
 	select {
@@ -267,8 +263,8 @@ func TestDueRowLeftBehindIsClaimedAtOnce(t *testing.T) {
 	}
 	defer rollbackTx(t, tx)
 	execSql(t, tx, "SELECT 1 FROM "+qualified(schema, "job_run")+" WHERE id = "+itoa(id)+" FOR UPDATE")
-	waitFor(t, "the row to be due", func() bool {
-		n, err := worker.st.Now(t.Context())
+	waitFor(t, "the row to be due", func(ctx context.Context) bool {
+		n, err := worker.st.Now(ctx)
 		return err == nil && n.After(due.Add(100*time.Millisecond))
 	})
 	select {
@@ -290,8 +286,8 @@ func TestDueRowLeftBehindIsClaimedAtOnce(t *testing.T) {
 	}
 }
 
-// Free slots are a wake source: with one slot and a 5s poll, five runs still finish
-// back to back, which the old poll-bound loop could not do (docs/baseline.md).
+// With one slot and a 5s poll, five runs must finish back to back because
+// freeing a slot wakes the claimer.
 func TestSlotReleaseClaimsAgainAtOnce(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
@@ -330,26 +326,26 @@ func TestListenerReconnects(t *testing.T) {
 
 	// the worker's listener is the backend whose last statement is LISTEN on this schema
 	listenStmt := "LISTEN " + pgx.Identifier{schema}.Sanitize()
-	listeners := func() int {
+	listeners := func(ctx context.Context) int {
 		var n int
-		if err := pool.QueryRow(t.Context(), "SELECT count(*) FROM pg_stat_activity WHERE query = $1", listenStmt).Scan(&n); err != nil {
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE query = $1", listenStmt).Scan(&n); err != nil {
 			return -1
 		}
 		return n
 	}
-	waitFor(t, "the listener backend", func() bool { return listeners() >= 1 })
+	waitFor(t, "the listener backend", func(ctx context.Context) bool { return listeners(ctx) >= 1 })
 	var killed int
 	if err := pool.QueryRow(t.Context(), "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE query = $1", listenStmt).Scan(&killed); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "the reconnect to be counted", func() bool { return rec.get("listener_reconnect_total") >= 1 })
+	waitFor(t, "the reconnect to be counted", func(ctx context.Context) bool { return rec.get("listener_reconnect_total") >= 1 })
 	id := trigger(t, api, "j", "{}")
 	select {
 	case <-entries:
 	case <-time.After(3 * time.Second):
 		t.Fatalf("run %d not started within the poll after the listener was killed", id)
 	}
-	waitFor(t, "the listener to be back", func() bool { return listeners() >= 1 })
+	waitFor(t, "the listener to be back", func(ctx context.Context) bool { return listeners(ctx) >= 1 })
 	id = trigger(t, api, "j", "{}")
 	expectEntry(t, "after reconnect", entries, pool, schema, id)
 }
@@ -387,11 +383,11 @@ func TestWakeTriggerRules(t *testing.T) {
 	}
 	execSql(t, pool, "INSERT INTO "+jobRun+" (job_name, executor_type, params, timeout, retry_policy, state) VALUES ('j','x','{}',60,'{}','pending'), ('j','x','{}',60,'{}','pending'), ('j','y','{}',60,'{}','pending')")
 	collect("insert pending", "run:x", "run:y")
-	execSql(t, pool, "UPDATE "+jobRun+" SET state = 'running', lease_token = gen_random_uuid(), lease_owner = 'me', lease_expires_at = now() + interval '1 minute', started_at = now()")
+	execSql(t, pool, "UPDATE "+jobRun+" SET state = 'running', lease_token = gen_random_uuid(), extra = extra || jsonb_build_object('lease_owner', 'me'), lease_expires_at = now() + interval '1 minute', started_at = now()")
 	collect("claim")
 	execSql(t, pool, "UPDATE "+jobRun+" SET lease_expires_at = now() + interval '2 minutes'")
 	collect("heartbeat")
-	execSql(t, pool, "UPDATE "+jobRun+" SET state = 'pending', run_at = now() + interval '10 seconds', lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL WHERE executor_type = 'y'")
+	execSql(t, pool, "UPDATE "+jobRun+" SET state = 'pending', run_at = now() + interval '10 seconds', lease_token = NULL, extra = extra - 'lease_owner', lease_expires_at = NULL WHERE executor_type = 'y'")
 	collect("retry with backoff", "run:y")
 	execSql(t, pool, "INSERT INTO "+jobRun+" (job_name, executor_type, params, timeout, retry_policy, state) VALUES ('j', repeat('t', 7996), '{}', 60, '{}', 'pending')")
 	collect("type too long for a payload", "")

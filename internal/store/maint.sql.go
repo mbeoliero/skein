@@ -97,32 +97,49 @@ func (q *Queries) StaleWorkflowRuns(ctx context.Context, db DBTX, age time.Durat
 	return n, err
 }
 
-const Stats = `-- name: Stats :one
-SELECT count(*) FILTER (WHERE state = 'pending' AND run_at <= now())::int AS pending_due,
+const Stats = `-- name: Stats :many
+SELECT executor_type,
+       count(*) FILTER (WHERE state = 'pending' AND run_at <= now())::int AS pending_due,
        count(*) FILTER (WHERE state = 'running')::int AS running,
        coalesce(extract(epoch FROM now() - min(run_at) FILTER (WHERE state = 'pending' AND run_at <= now())), 0)::float8 AS oldest_pending_sec,
-       count(*) FILTER (WHERE state = 'pending' AND run_at <= now() AND NOT (executor_type = ANY($1::text[])))::int AS unregistered_due
+       (executor_type = ANY($1::text[]))::boolean AS registered
   FROM job_run WHERE state IN ('pending', 'running')
+ GROUP BY executor_type
 `
 
 type StatsRow struct {
+	ExecutorType     string
 	PendingDue       int32
 	Running          int32
 	OldestPendingSec float64
-	UnregisteredDue  int32
+	Registered       bool
 }
 
-// §3.3 Engine.Stats: one statement over the in-flight rows (both partial indexes)
-func (q *Queries) Stats(ctx context.Context, db DBTX, registered []string) (StatsRow, error) {
-	row := db.QueryRow(ctx, Stats, registered)
-	var i StatsRow
-	err := row.Scan(
-		&i.PendingDue,
-		&i.Running,
-		&i.OldestPendingSec,
-		&i.UnregisteredDue,
-	)
-	return i, err
+// §3.3 Engine.Stats: type-level counts and totals share one snapshot over the in-flight rows
+func (q *Queries) Stats(ctx context.Context, db DBTX, registered []string) ([]StatsRow, error) {
+	rows, err := db.Query(ctx, Stats, registered)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []StatsRow{}
+	for rows.Next() {
+		var i StatsRow
+		if err := rows.Scan(
+			&i.ExecutorType,
+			&i.PendingDue,
+			&i.Running,
+			&i.OldestPendingSec,
+			&i.Registered,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const TryMaintenanceLock = `-- name: TryMaintenanceLock :one

@@ -2,8 +2,6 @@
 
 [源码与用法](../README.md) · [完整 DDL](../migrations/) · [性能基线](baseline.md) · [场景验收](scenarios.md)
 
-评审修订：2026-09-08（§1–§3）；2026-09-09（§1.3、§2.1、§2.5、§2.8、§3.3）；2026-09-09（§1–§3）。
-
 ## 1. 架构与模型
 
 ### 1.1 进程与职责
@@ -64,7 +62,7 @@ flowchart TB
         W -->|拥有节点| N
         N -->|引用 job 的 FK| J
     end
-    subgraph R["实例：创建时固定，不回读定义"]
+    subgraph R["实例：执行定义创建时固定"]
         WR["workflow_run<br/>input + 整张 DAG"]
         JR["job_run<br/>普通实例 / 节点实例"]
         WR -->|节点归属 FK / 级联删除| JR
@@ -73,7 +71,7 @@ flowchart TB
     W -.->|提交快照| WR
 ```
 
-虚线是**创建时复制，不是 FK**。被引用的定义不能删；实例与定义无 FK，删除定义不删除历史、不改变在途语义。
+虚线是**创建时复制，不是 FK**。被引用的定义不能删；实例与定义无 FK，删除定义不删除历史、不改变执行快照。计划拍的创建与 Resume 按当前重叠规则准入（§2.1）。
 
 | 固定在哪里 | 内容与理由 |
 |---|---|
@@ -87,9 +85,11 @@ flowchart TB
 | 字段 | 只表达什么 |
 |---|---|
 | run_at / lease_expires_at | pending 到期 / running 租约到期，不能混用 |
-| lease_token / lease_owner | 随机 UUID 持租凭证 / 排障标识；只有 token 参与 fence |
+| lease_token / extra.lease_owner | 随机 UUID 持租凭证 / 排障标识；只有 token 参与 fence |
 | started_at | 当前这次执行的开始，不是整个 run 历时 |
 | attempt / errors / output | 失败与中断计数 / 追加历史 / 成功结果；不另拆 attempts 表 |
+
+`job_run.extra` 与 `workflow_run.extra` 是库管理的 JSON 对象，默认 `{}`。普通实例保存提交时的追踪传播字段；工作流只在父实例保存，节点执行时随父输入读取（§3.5）。`lease_owner` 属于节点或普通实例自身的 extra；领取替换、清租约删除此键，保留其它元数据。`cancel_requested` 仍为独立列，参与取消守卫。
 
 ### 1.3 存储约束与索引
 
@@ -100,11 +100,12 @@ flowchart LR
     H["心跳只改<br/>lease_expires_at"] -.->|不写索引，争取 HOT| R
 ```
 
-两支都按 executor_type 限定候选，必须独立；`FOR UPDATE` 不能作用于 `UNION`。完整列、CHECK、索引与触发器见 [DDL](../migrations/00001_init.sql)。
+两支都按 executor_type 限定候选，必须独立；`FOR UPDATE` 不能作用于 `UNION`。完整列、CHECK、索引与触发器见 [DDL](../migrations/)。
 
 | 数据库守卫 | 依赖它的性质 |
 |---|---|
-| running ⇔ 有租约 | token / owner / expires_at 同生同灭；非法组合不能落库 |
+| running ⇔ 有租约 | token / expires_at 非空且 extra.lease_owner 为 JSON 字符串；无租约时 owner 键必须不存在，不能是 JSON null |
+| extra 是非 NULL JSON 对象 | 元数据不参与领取、排序与去重，不新增索引 |
 | 终态 ⇔ finished_at 非空 | 非终态不带完成时间；只有节点允许 blocked |
 | 去重键部分唯一索引 | 普通按 job_name、工作流按 workflow_name，与 dedup_key 联合唯一。仅扫描器写 schedule_name；按其 NULL / 非 NULL 分用户键 / skip 拍两条互斥索引，用户键不看 state，skip 拍限在途（§2.1） |
 | 节点无 dedup_key；计划拍次唯一 | 节点由父实例占位；拍次由 `(schedule_name, scheduled_at)` 兜底 |
@@ -126,8 +127,10 @@ flowchart LR
 |---|---|
 | 库事务，包括读取 | `Store.tx` 设置事务局部 `search_path = quoted(schema), pg_temp`；无前缀查询，不在连接 / 池层设置 |
 | pg_temp 显式在后 | 防止宿主同名临时表抢先接走库查询 |
+| schema 输入 | New / Migrate 共用校验：空值取默认，其余须为有效 UTF-8、无 NUL 且不超过 63 字节；拒绝静默改写或截断导致的命名空间别名 |
 | TriggerTx | 保存、临时设置、恢复调用方路径；恢复用脱离调用方取消的独立 5s ctx |
 | 恢复失败 | 单独返回，不能被 ErrDuplicate 掩盖；调用方事务不再可信 |
+| 计划名称锁 | `(schema, schedule_name)` 派生事务级 advisory lock，Put / Delete / 扫描 / 计划拍 Resume 共用；不依赖 schedule 行存在，提交或回滚释放。与迁移及维护锁区分命名空间；哈希冲突只扩大串行范围 |
 | Migrate → Start | 宿主显式迁移；数据库共享固定键的事务级 advisory lock 串行整个迁移，含建 schema（IF NOT EXISTS 本身不原子）。各 schema 记版本，已执行版本不重放；Start 仅校验版本相等，不检查索引定义；无 down migration |
 
 ## 2. 运行协议
@@ -139,7 +142,9 @@ flowchart LR
 ```mermaid
 flowchart TB
     T["Trigger / TriggerTx"] --> SNAP["读取定义<br/>创建实例快照"]
-    SC["扫描到期计划"] --> LOCK["SKIP LOCKED<br/>最多 50 个 enabled 计划"]
+    SC["枚举到期候选"] --> GATE{"取得名称锁？"}
+    GATE -->|否：不等待| SKIPLOCK["继续下一候选"]
+    GATE -->|是| LOCK["SKIP LOCKED 锁计划<br/>重判 enabled / 到期"]
     LOCK --> NEXT["保存原 due<br/>next 推到 DB 当前时间之后"]
     NEXT --> O{"skip 且在途？"}
     O -->|否| SNAP
@@ -150,10 +155,12 @@ flowchart TB
 
 图按一次提交 / 一个计划描述；扫描在对应批次事务中。跳过的本拍不产生通知，同批其它建 run 不受影响。
 
+扫描按 `(next_run_at, name)` 游标分段枚举，越过锁竞争候选；每批至多实际处理 50 个计划，Full 只按实际推进 / 禁用数判断。名称锁取得后才锁计划行；全批提交前不释放，取得额外名称锁不得等待。未锁到的计划不推进、不计 overlap 跳拍。
+
 | 入口 | 创建与确认 |
 |---|---|
 | 普通 Trigger | 一条 INSERT…SELECT；浅合并 params，同名键由调用方覆盖；At 只改变 run_at |
-| 工作流 Trigger | 一个事务写 input / DAG 父快照和全部节点：无依赖 pending，其余 blocked |
+| 工作流 Trigger | 一个事务写 input / DAG 父快照，并将已读取的全部节点快照批量写入：无依赖 pending，其余 blocked；避免逐节点网络往返耗尽扫描预算，不重读定义 |
 | TriggerTx | 与宿主业务共用事务，只有宿主 Commit 才确认；不发本地唤醒，提交触发器负责通知 |
 | 扫描 | 建 run 时保存 schedule_name、scheduled_at=原 due；错过多拍只补一拍 |
 
@@ -163,6 +170,10 @@ flowchart TB
 |---|---|---|
 | 用户 DedupKey | 保留窗口内唯一，不看 state | 幂等需覆盖历史，而非只防重叠 |
 | overlap=skip 的 `sched:<name>` | 在途唯一，终态释放 | 重叠是在途属性：上一拍结束后下一拍必须能建 |
+
+**当前 skip 规则**：持名称锁，跨 `job_run` / `workflow_run` 检查同 `schedule_name` 的全部在途拍，包含历史 allow 的 NULL 键和旧目标；Resume 排除自身。存在其它拍时，扫描推进 next 并记 skipped，Resume 返回 ErrDuplicate 且回滚。已有 dedup_key / 唯一约束仍保留，不转换历史键。
+
+Put 可将 allow 改成 skip，已在途拍继续；新拍与 Resume 才受新规则约束。删除计划后，历史 Resume 仍持名称锁并遵循原唯一约束；同名重建视为该名称的延续，旧在途拍参与新 skip 检查。Put / Delete 每次只锁一个名称。准入查询不锁其它 run；结算只移出在途集合，读到其提交前状态最多多跳一拍。
 
 | INSERT / 查找结果 | 返回或继续 |
 |---|---|
@@ -189,10 +200,10 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    FREE["空闲槽位 n"] --> P["先领到期 pending<br/>不超过 n"]
+    FREE["空闲槽位 n"] --> P["按轮次选首支<br/>不超过 n"]
     P --> ROOM{"仍有空位？"}
-    ROOM -->|是| R["再领过期 running"]
-    ROOM -->|否| CHECK["提交后检查<br/>普通取消 → 父取消 → 预算耗尽"]
+    ROOM -->|是| R["另一支填剩余空位"]
+    ROOM -->|否| CHECK["提交后依次检查<br/>普通取消 → 父取消<br/>→ 预算耗尽"]
     R --> CHECK
     CHECK -->|命中| SETTLE["直接结算，不调用 Executor"]
     CHECK -->|通过| ADMIT{"锁内已停机？"}
@@ -206,6 +217,8 @@ flowchart TB
 | running：租约已过期 | 换租约与 started_at，attempt +1，追加 interrupted |
 
 - 两支均 `SKIP LOCKED`，不预取；加锁后重判状态。新 token 拒绝旧持有者写入。
+- 有空槽且有注册类型才计领取轮次，每 8 轮中第 8 轮先领过期 running，其余先领 pending；失败也推进轮次。另一支填剩余空位，共用本轮有界 ctx；时间未耗尽时首支失败仍尝试另一支，所有已提交领取都须派发。
+- 过期候选按 `lease_expires_at, id` 排序，保持到期列不入索引。轮次保证领取机会，不承诺墙钟恢复上界；单行进展还依赖 DB 可用、槽位释放、该行可锁及更早候选有限。
 - 重领用 `LEAST(attempt+1,32767)` 防止整批溢出；后续预算检查不再加 attempt / interrupted。
 - 节点以独立 10s ctx 读取父 input / DAG / 直接前驱 output。被取消跳过的领取，提交后查父；回滚后由后来领取检查。
 
@@ -275,7 +288,7 @@ stateDiagram-v2
 
 `id 匹配 AND lease_token 匹配 AND state='running'`
 
-零行 → ErrLeaseLost → **整个事务回滚、丢结果、不重试陈旧写入**。所有出口清租约；只有终态写 finished_at。
+零行 → ErrLeaseLost → **整个事务回滚、丢结果、不重试陈旧写入**。所有出口清租约；只有终态写 finished_at。结算及传播的事件事实随事务结果返回，提交失败时全部丢弃（§3.5）。
 
 | 结果 | 写入 | attempt / errors |
 |---|---|---|
@@ -317,6 +330,8 @@ flowchart TB
 
 `min(max, base×2^(n−1)) × U[1−jitter,1+jitter)`；n 为累计失败序号。错误分类与输出校验见 §3.2。
 
+退避与轮询抖动计算超出 time.Duration 上限时饱和到上限，不得溢出为负时长；正时长的亚纳秒舍入至少保留 1ns。
+
 ### 2.5 取消与续跑
 
 **普通取消：一条 UPDATE，以锁到的新版本决定动作。**
@@ -324,7 +339,7 @@ flowchart TB
 | 锁到的状态 | 动作 |
 |---|---|
 | 无父行的 pending | 直接 cancelled |
-| 无父行的 running | 设置 cancel_requested，心跳送达 ctx |
+| 无父行的 running | 首次设置 cancel_requested，心跳送达 ctx；已经请求取消时不重复更新或通知 |
 | 工作流节点 | 不接受单节点控制，走父工作流 |
 
 不能拆成两条分别匹配 pending / running：并发领取或重排可能让两条都错过。
@@ -351,8 +366,10 @@ flowchart TB
 flowchart TB
     P["failed / cancelled 父实例"] --> L["锁父，读取原 DAG"]
     L --> KEEP["成功节点原样保留"]
-    L --> RESET["重置失败 / 取消节点<br/>及其未成功后代"]
-    RESET --> DEP{"直接依赖全成功？"}
+    L --> RESET["选择失败 / 取消节点<br/>及其未成功后代"]
+    RESET --> EMPTY{"恢复集合为空？"}
+    EMPTY -->|是| REJECT["ErrNotResumable<br/>保持原终态"]
+    EMPTY -->|否| DEP{"直接依赖全成功？"}
     DEP -->|是| READY["pending"]
     DEP -->|否| BLOCK["blocked"]
     READY --> OPEN["父回 running<br/>提交后唤醒领取器"]
@@ -362,12 +379,15 @@ flowchart TB
 | Resume | 重置 / 保留 |
 |---|---|
 | 工作流重置集合 | attempt=0、run_at=DB now()；清 started_at / finished_at / output |
+| 工作流空恢复集合 | cancelled 父可能全节点 succeeded；返回 ErrNotResumable，父子状态、时间和 output 不变，不通知 resumed |
 | 普通 failed / cancelled | 条件 UPDATE → pending、run_at=now()、attempt=0；清租约、起止时间、output、cancel_requested |
 | 两者共同保留 | 原 id、定义快照、errors、dedup_key 与业务幂等键；不读取新定义 |
-| 重新占位冲突 | 用户键由原行持有，不自撞；skip 拍撞上在途新拍则**整个事务回滚**，不留部分重置 |
+| 重新占位冲突 | 用户键由原行持有，不自撞；计划拍遵循 §2.1 的当前规则和原唯一约束；冲突则**整个事务回滚**，不留部分重置 |
 | 并发 / 零行 | 不重置已 pending / running 者；无锁分类不存在、节点、不可续跑状态（§3.3） |
 
 Resume 只重置同一意图的执行预算；同一 run id 可再次进入终态。
+
+计划拍先无锁读取不可变 schedule_name，再取得名称锁，随后锁父 / 普通行重判。不存在、节点、非终态及空恢复集合先按各自错误分类，再检查其它在途拍；非计划 Resume 保留原锁序。
 
 ### 2.6 启动与停机
 
@@ -495,15 +515,19 @@ flowchart TB
 
 ### 2.9 锁序与故障窗口
 
-**合法锁序：workflow_run → job_run。**
+**合法锁序：计划名称锁 → 必要的 schedule 行锁 → workflow_run → job_run。** 非计划操作从其需要的行开始，不能反向取锁。
 
 | 操作 | 行锁 |
 |---|---|
+| Put / Delete | 一个名称锁，再修改 schedule |
+| 扫描 | 名称锁非阻塞尝试，再 SKIP LOCKED 锁单个 schedule；批次中取得更多名称锁时不等待 |
 | 结算 / 取消工作流 / 推进 / Resume | 先父行，再节点；结算可等自己的节点，不等其它取消候选 |
 | 领取 | 只锁候选 job_run，SKIP LOCKED |
 | 心跳 | 可等本进程 running 行，不等父行锁 |
 | 普通取消 | 只更新一行 |
 | LISTEN / NOTIFY | 无这条行锁链；监听无事务，触发器只入队通知 |
+
+计划拍 Resume 先取得其名称锁；结算、心跳、保留清理不取名称锁或 schedule 行锁。在途检查只读其它 run，新增 / 恢复同名拍已被名称锁串行；退出在途集合不需要该锁。扫描的跨名称非阻塞获取避免批次间等待环，也不能先批量锁计划行再等待名称锁。
 
 **为什么不能直接批量 UPDATE 兄弟节点：**
 
@@ -549,6 +573,8 @@ flowchart LR
 ```
 
 Register 在 Start 前完成；重复类型报错。泛型解码 params 为 P，失败不可重试。工作流先校验，再原子替换定义与节点，不能留下半张图。
+
+Request 的可变引用不得改变内部结算身份；WorkflowRunId 提供独立副本，执行器修改请求不影响父行选择。
 
 | 输入 | 校验 |
 |---|---|
@@ -619,18 +645,22 @@ ErrLeaseLost 仅内部使用；[公共错误](../errors.go) · [分类实现](..
 |---|---|
 | Trigger / TriggerTx | 提交与去重结果见 §2.1；TriggerTx 路径隔离见 §1.3 |
 | Get / GetRun | 实例快照；工作流父与全部节点来自**同一语句快照**，不能拼出不同时点状态 |
+| 实例 Extra | 只读暴露库管理的元数据；JobRun.LeaseOwner 仍从 extra 映射为字符串，不开放任意元数据写入接口 |
 | List | 名称 / 状态过滤、id DESC；上页最后 id 作游标，多读一行判断尾页，不用 created_at |
-| Stats | 单 SQL 读到期 pending、running、最老到期年龄、未注册类型积压；无注册类型传空数组，不传 NULL |
+| Stats | 单 SQL 按 executor_type 聚合到期量、running、最老年龄与注册标记，返回 ByExecutor 和汇总；无注册类型传空数组，不传 NULL |
+| Health | 不访问数据库的本进程快照，口径见 §3.5 |
 | Delete | 被引用定义报 ErrReferenced；不存在按操作契约报 ErrNotFound |
 
 Stats 的注册集合属于本实例，不是集群注册表；所有读取 / 分类也经过库事务，不能泄漏 search_path。
+
+ByExecutor 只含有 pending / running 行的类型；未来 pending 不计到期量，blocked 与终态不参与。汇总取分类的和与最大年龄，未注册到期量只累加未注册类型；空库返回零总量和空分类。
 
 | 控制结果 | 含义 |
 |---|---|
 | Cancel 成功 | 幂等控制，不代表 goroutine / 供应商任务已同步停止；普通 running 经下次心跳送达 |
 | Runs.Cancel / Resume 节点 | 拒绝，走工作流控制；跳过未启动节点的收敛条件见 §2.5 |
 | Resume 非法 / 不存在 | 非法 id 拒绝；不存在 ErrNotFound |
-| Resume 非终态 | 非 failed / cancelled → ErrNotResumable |
+| Resume 不可恢复 | 非 failed / cancelled 或工作流恢复集合为空 → ErrNotResumable |
 | Resume 去重冲突 | ErrDuplicate；触发条件与回滚见 §2.5 |
 
 ### 3.4 时间、幂等与能力边界
@@ -660,6 +690,7 @@ flowchart TB
 | timeout / max_attempts | 单次 ctx 期限 / 失败与中断预算；都不是工作流总历时或 Snooze 总期限 |
 | token | DB 只认可一个持有者；不能阻止物理调用重叠，也不替外部资源 fencing |
 | IdempotencyKey | 普通 `run:<id>`；节点 `wf:<workflow_run_id>/<job_name>`；跨 attempt / Resume 不变，业务据此去重 |
+| ExecutionId | 由新 lease token 派生的非凭证标识，每次领取不同，即使 attempt 未增加或未调用 Executor；不保存独立执行历史 |
 | 时钟 | DB 前跳 / 回拨可提前 / 延后接管；宿主仅用于单调耗时、ctx 与本地失租，不能代替 DB 驱动持久状态 |
 
 | 能力边界 | 宿主责任 |
@@ -674,9 +705,50 @@ flowchart TB
 
 ### 3.5 日志与观测
 
-日志：`log/slog → instance → run_id / job_name / attempt`。
+日志：`log/slog → instance → run_id / job_name / attempt / execution_id`；有提交追踪时附带 `trace_id`。Request 提供 ExecutionId 与原提交 TraceId；跨重试用 RunId / WorkflowRunId 关联（§3.4）。
+
+**追踪传播**：使用 OTel W3C TraceContext，存储位置见 §1.2。
+
+| 入口 / 阶段 | 行为 |
+|---|---|
+| Trigger / TriggerTx | 只保存有效的 traceparent / tracestate；去重、重试、Snooze、released 与 Resume 均保留原提交 |
+| Worker | 背景 ctx 恢复远端父上下文，附加本次取消与超时；不继承请求取消、deadline、baggage 或其它 ctx 值 |
+| 无有效提交追踪 / Cron | 不保存传播字段、不生成 trace |
+
+库不创建 span；恢复的 Span ID 只代表原提交。宿主创建本次 span（或新 trace 加 link），配置 SDK / exporter；工作流节点共享提交来源，不推导前驱 links。
+
+**提交后 Observer**：Store 在原事务内从 UPDATE 返回行收集事实，root 在 Commit 成功后、事务和内部锁外调用可选的 Config.Observer。提交失败、失租、幂等空操作不通知；不持久化事件或创建通知任务。
+
+| 变化 | 事件语义 |
+|---|---|
+| 执行结算 | 按实际状态区分成功、重试、Snooze、释放、最终失败和取消；取消守卫命中只报 cancelled |
+| 普通 Cancel / Resume | pending 取消、running 首次取消请求、恢复成功分别通知 |
+| 过期接管 | reclaimed 关联新持有者，不作为旧执行失败 |
+| 工作流取消与传播 | 通知实际取消的未启动节点、父首次 cancelling 及父终态 |
+| 工作流 Resume | 通知实际重置节点和父恢复，保留成功节点 |
+| 不通知 | 创建、普通领取、依赖激活、心跳、保留删除 |
+
+同事务中父先 cancelling 后终态，只通知终态，原因取全部节点的聚合结果。
+
+字段与事件类型见 [observer.go](../observer.go)。EventId 是随机通知标识；ExecutionId 关联结算、接管或取消请求的租约，未执行节点、Resume 和父事件为空。Duration 只计 Executor 调用耗时，其余为零；事件不暴露 token 或 payload。
+
+回调 ctx 独立恢复追踪，不继承提交或执行的取消与 deadline；回收节点读父输入失败时仍可通知接管，追踪允许为空。执行前的接管通知须先登记租约，回调后重查取消与失租。
+
+回调同步、可并发，逐次隔离并记录 panic；慢回调会阻塞槽位释放或控制 API，异步处理归宿主。尽力通知，无投递重试；提交后崩溃可漏报，回调时状态可能已变，不保证全局顺序，仍需查询与巡检。
 
 Config.Metrics 被执行 goroutine 与循环并发调用，宿主实现须并发安全、不阻塞。[指标名称](../metrics.go)
+
+**本地健康快照**：Health 复用现有循环记录进展；生命周期区分 new / starting / running / stopping / stopped，查版本期间为 starting，stopped 表示 Shutdown 已返回，仍可能残留执行器（§2.6）。
+
+| 快照 | 口径 |
+|---|---|
+| 实例与角色 | 本进程标识及 Worker / Scheduler 配置 |
+| Concurrency / SlotsUsed / Leases | 槽位容量 / 占用量 / 续租数；槽位含准备、Executor、结算及 Observer，可大于续租数 |
+| Claim / Heartbeat / Scan | LastTick 含空转；LastSuccess 只计完整 DB 轮次成功并清空错误，空转保留结果 |
+
+各循环每轮失败只累加一次 ConsecutiveErrors、更新 LastError。领取轮次含两支领取与到点查询，失败仍派发已提交的领取。空领取、空扫描、跳拍或禁用无下一拍算成功；停机取消心跳不改变结果。宿主时刻只供观测，不参与持久状态或 lastOK 失租判断。
+
+快照只在短锁内复制，不持 lifecycle 锁，不嵌套健康锁与 inflight 锁，也不执行回调；各项独立采样。宿主结合角色、积压和预期周期判断健康。
 
 | 观测值 | 口径 |
 |---|---|

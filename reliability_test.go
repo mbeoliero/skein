@@ -15,9 +15,6 @@ import (
 	"github.com/mbeoliero/skein/internal/store"
 )
 
-// Multi-instance reliability acceptance checks. Fixtures that would need a paused
-// process or a clock are raw SQL on the test schema.
-
 func submitOnly(schema string) Config {
 	cfg := fastConfig(schema)
 	cfg.DisableWorker = true
@@ -26,12 +23,15 @@ func submitOnly(schema string) Config {
 
 func qualified(schema, table string) string { return pgx.Identifier{schema, table}.Sanitize() }
 
-// stealLease is what ClaimExpired does once a lease has expired, in one statement so
-// the holder cannot renew between expiring and reclaiming: a new token and owner, one
-// interrupted attempt.
+// Replace the holder atomically so it cannot renew between expiry and reclaim.
 func stealLease(t *testing.T, pool *pgxpool.Pool, schema string, id int64, owner string) {
 	t.Helper()
-	execSql(t, pool, "UPDATE "+qualified(schema, "job_run")+" SET lease_token = gen_random_uuid(), lease_owner = '"+owner+"', lease_expires_at = now() + interval '1 minute', attempt = attempt + 1 WHERE id = "+itoa(id))
+	_, err := pool.Exec(t.Context(), "UPDATE "+qualified(schema, "job_run")+
+		" SET lease_token = gen_random_uuid(), extra = extra || jsonb_build_object('lease_owner', $1::text),"+
+		" lease_expires_at = now() + interval '1 minute', attempt = attempt + 1 WHERE id = $2", owner, id)
+	if err != nil {
+		t.Fatalf("steal lease: %v", err)
+	}
 }
 
 func leaseToken(t *testing.T, pool *pgxpool.Pool, schema string, id int64) uuid.UUID {
@@ -43,34 +43,6 @@ func leaseToken(t *testing.T, pool *pgxpool.Pool, schema string, id int64) uuid.
 	return token
 }
 
-// kill -9 the holder; another instance takes over after the lease expires, attempt +1.
-func TestKillTakeover(t *testing.T) {
-	t.Parallel()
-	pool, schema := freshSchema(t)
-	sub := startEngine(t, pool, submitOnly(schema), nil)
-	declare(t, sub, JobSpec{Name: "j", ExecutorType: "crash", Retry: RetryPolicy{MaxAttempts: 3}})
-	id := trigger(t, sub, "j", "")
-
-	child := startHelper(t, schema)
-	waitRun(t, sub, id, StateRunning)
-	_ = child.Process.Kill()
-	_ = child.Wait()
-	killed := time.Now()
-
-	b := startEngine(t, pool, fastConfig(schema), func(e *Engine) {
-		e.Register("crash", func(ctx context.Context, req *Request) (RawJSON, error) { return RawJSON(`"took over"`), nil })
-	})
-	run := waitRun(t, b, id, StateSucceeded)
-	took := time.Since(killed)
-	es := errorsOf(t, run)
-	if run.Attempt != 1 || len(es) != 1 || es[0].Kind != "interrupted" || es[0].Attempt != 1 {
-		t.Fatalf("attempt %d errors %+v", run.Attempt, es)
-	}
-	if took > 5*time.Second {
-		t.Fatalf("takeover took %s", took)
-	}
-}
-
 func TestSnoozeSurvivesProcessExit(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
@@ -79,9 +51,9 @@ func TestSnoozeSurvivesProcessExit(t *testing.T) {
 	id := trigger(t, sub, "j", "")
 	child := startHelper(t, schema, "SKEIN_HELPER_MODE=snooze")
 	var saved *JobRun
-	waitFor(t, "committed snooze", func() bool {
+	waitFor(t, "committed snooze", func(ctx context.Context) bool {
 		var err error
-		saved, err = sub.Runs().Get(t.Context(), id)
+		saved, err = sub.Runs().Get(ctx, id)
 		return err == nil && saved.State == StatePending && saved.StartedAt != nil
 	})
 	if saved.LeaseExpiresAt != nil || saved.LeaseOwner != "" || saved.Attempt != 0 || len(errorsOf(t, saved)) != 0 {
@@ -203,9 +175,9 @@ func TestSnoozeWorkflowSubmitCrash(t *testing.T) {
 	id := triggerWorkflow(t, sub, "video", "")
 	child := startHelper(t, schema, "SKEIN_HELPER_MODE=snooze")
 	var saved []byte
-	waitFor(t, "provider submission before crash", func() bool {
+	waitFor(t, "provider submission before crash", func(ctx context.Context) bool {
 		return pool.QueryRow(
-			t.Context(),
+			ctx,
 			"SELECT jsonb_build_object('task_id', task_id, 'deadline', deadline) FROM "+provider,
 		).Scan(&saved) == nil
 	})
@@ -233,9 +205,9 @@ func TestSnoozeWorkflowSubmitCrash(t *testing.T) {
 		})
 	})
 	var waiting *WorkflowRun
-	waitFor(t, "poll snooze after submit recovery", func() bool {
+	waitFor(t, "poll snooze after submit recovery", func(ctx context.Context) bool {
 		var err error
-		waiting, err = b.Workflows().GetRun(t.Context(), id)
+		waiting, err = b.Workflows().GetRun(ctx, id)
 		if err != nil {
 			return false
 		}
@@ -278,7 +250,6 @@ func TestStaleTokenCannotWrite(t *testing.T) {
 	waitRun(t, a, id, StateRunning)
 	old := leaseToken(t, pool, schema, id)
 
-	// B takes over as if A had paused past its lease
 	stealLease(t, pool, schema, id, "B")
 	st := store.Open(pool, schema)
 	if c := <-cause; !errors.Is(c, errLeaseLost) {
@@ -341,7 +312,7 @@ func TestShutdownCancelsBlockedHeartbeat(t *testing.T) {
 	pool, schema := freshSchema(t)
 	cfg := fastConfig(schema)
 	cfg.HeartbeatInterval, cfg.LeaseTTL = 2*time.Second, 5*time.Second
-	e := startEngine(t, namedPool(t, "hb-blocked"), cfg, func(e *Engine) {
+	e := startEngineNotDrained(t, namedPool(t, "hb-blocked"), cfg, func(e *Engine) {
 		e.Register("wait", func(ctx context.Context, req *Request) (RawJSON, error) { <-ctx.Done(); return nil, ctx.Err() })
 	})
 	declare(t, e, JobSpec{Name: "j", ExecutorType: "wait"})
@@ -371,9 +342,8 @@ func TestShutdownCancelsBlockedHeartbeat(t *testing.T) {
 	waitRun(t, e, id, StatePending)
 }
 
-// A holder that dies at the attempt cap: the reclaim keeps attempt at 32767 instead
-// of overflowing the smallint, which failed the whole ClaimExpired batch and left every
-// expired row in it unclaimable. The capped row settles failed, the healthy one runs.
+// A capped holder must fail without overflowing smallint or aborting the whole
+// ClaimExpired batch; another expired row in that batch must still execute.
 func TestReclaimAtAttemptCapConverges(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
@@ -409,14 +379,21 @@ func TestShutdownNotDrainedThenReclaimed(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
 	gate, entered := make(chan struct{}), make(chan struct{}, 1)
+	openGate := sync.OnceFunc(func() { close(gate) })
 	cfg := fastConfig(schema)
 	cfg.ShutdownGrace, cfg.CancelTimeout = 100*time.Millisecond, 100*time.Millisecond
-	a := startEngine(t, pool, cfg, func(e *Engine) {
+	a := startEngineNotDrained(t, pool, cfg, func(e *Engine) {
 		e.Register("stubborn", func(ctx context.Context, req *Request) (RawJSON, error) {
 			entered <- struct{}{}
 			<-gate
 			return RawJSON(`"late"`), nil
 		})
+	})
+	t.Cleanup(func() {
+		openGate()
+		if !waitGroup(context.Background(), &a.execs, 5*time.Second) {
+			t.Error("executor did not return after gate opened")
+		}
 	})
 	declare(t, a, JobSpec{Name: "j", ExecutorType: "stubborn"})
 	id := trigger(t, a, "j", "")
@@ -432,7 +409,7 @@ func TestShutdownNotDrainedThenReclaimed(t *testing.T) {
 	if run.Attempt != 1 || string(run.Output) != `"b"` {
 		t.Fatalf("attempt %d output %s", run.Attempt, run.Output)
 	}
-	close(gate) // A's executor returns now; its settle is rejected by the fence
+	openGate()
 	a.execs.Wait()
 	if r, _ := b.Runs().Get(t.Context(), id); r.State != StateSucceeded || string(r.Output) != `"b"` {
 		t.Fatalf("A's late result was written over B's: %s %s", r.State, r.Output)
@@ -449,20 +426,23 @@ func TestShutdownReportsExecutorOfEarlierAttempt(t *testing.T) {
 	var calls atomic.Int32
 	cfg := fastConfig(schema)
 	cfg.ShutdownGrace = 100 * time.Millisecond
-	a := startEngine(t, pool, cfg, func(e *Engine) {
+	a := startEngineNotDrained(t, pool, cfg, func(e *Engine) {
 		e.Register("stubborn", func(ctx context.Context, req *Request) (RawJSON, error) {
 			if calls.Add(1) == 1 {
-				<-gate // ignores ctx
+				<-gate
 				return RawJSON(`"late"`), nil
 			}
 			return RawJSON(`"second"`), nil
 		})
 	})
-	t.Cleanup(func() { close(gate) })
+	t.Cleanup(func() {
+		close(gate)
+		if !waitGroup(context.Background(), &a.execs, 5*time.Second) {
+			t.Error("executor did not return after gate opened")
+		}
+	})
 	declare(t, a, JobSpec{Name: "j", ExecutorType: "stubborn", Timeout: time.Second})
 	id := trigger(t, a, "j", "")
-	// the first attempt times out, stops being renewed after CancelTimeout, its lease
-	// expires, and the claim loop of this process reclaims the run
 	run := waitRun(t, a, id, StateSucceeded)
 	if run.Attempt != 1 || string(run.Output) != `"second"` || calls.Load() != 2 {
 		t.Fatalf("attempt %d output %s calls %d", run.Attempt, run.Output, calls.Load())
@@ -579,7 +559,7 @@ func TestCancelSeesRunReleasedMeanwhile(t *testing.T) {
 			go func() { cancelled <- e.Runs().Cancel(ctx, id) }()
 			waitBlocked(t, pool, schema)
 			execSql(t, tx, "UPDATE "+jr+" SET state = 'pending', attempt = "+itoa(int64(tc.attempt))+
-				", run_at = now() + interval '1 hour', lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL "+
+				", run_at = now() + interval '1 hour', lease_token = NULL, extra = extra - 'lease_owner', lease_expires_at = NULL "+
 				"WHERE id = "+itoa(id))
 
 			if err := tx.Commit(ctx); err != nil {
@@ -621,54 +601,6 @@ func TestCancelRunningRun(t *testing.T) {
 	}
 	if run.Output != nil || run.Attempt != 0 || string(run.Errors) != "[]" {
 		t.Fatalf("%+v", run)
-	}
-}
-
-// Metrics follow the persisted state even if cancellation wins only inside settle.
-func TestExecDurationLabelFollowsSettledState(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		name string
-		err  error
-	}{
-		{name: "retry", err: errors.New("boom")},
-		{name: "snooze", err: Snooze(time.Hour)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			pool, schema := freshSchema(t)
-			rec := &metricsRec{}
-			cfg := submitOnly(schema)
-			cfg.Metrics = rec
-			e := startEngine(t, pool, cfg, nil)
-			declare(t, e, JobSpec{Name: "j", ExecutorType: "x"})
-			id := trigger(t, e, "j", "")
-			c := claimAsDeadHolder(t, pool, schema, "x")
-			if err := e.Runs().Cancel(t.Context(), id); err != nil {
-				t.Fatal(err)
-			}
-			e.settleResult(
-				e.log,
-				c,
-				parseRetry(c.RetryPolicy),
-				nil,
-				tc.err,
-				nil,
-				time.Millisecond,
-			)
-			if run, _ := e.Runs().Get(t.Context(), id); run.State != StateCancelled {
-				t.Fatalf("run %s", run.State)
-			}
-			for _, outcome := range []string{"cancelled", "failed", "snoozed"} {
-				want := 0
-				if outcome == "cancelled" {
-					want = 1
-				}
-				if got := rec.get("exec_duration", "executor_type", "x", "outcome", outcome); got != want {
-					t.Fatalf("%s observations: %d, want %d", outcome, got, want)
-				}
-			}
-		})
 	}
 }
 
@@ -744,7 +676,7 @@ func TestShutdownLaterCallerHonoursItsCtx(t *testing.T) {
 
 	first := make(chan error, 1)
 	go func() { first <- e.Shutdown(context.Background()) }()
-	waitFor(t, "the first Shutdown to start", func() bool { return e.shutting.Load() })
+	waitFor(t, "the first Shutdown to start", func(ctx context.Context) bool { return e.shutting.Load() })
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	start := time.Now()
@@ -795,7 +727,7 @@ func TestShutdownCancelsStart(t *testing.T) {
 	})
 	started := make(chan error, 1)
 	go func() { started <- e.Start(startCtx) }()
-	waitFor(t, "Start to begin its blocked schema check", func() bool { return e.started.Load() })
+	waitFor(t, "Start to begin its blocked schema check", func(ctx context.Context) bool { return e.started.Load() })
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	stopped := make(chan error, 1)

@@ -20,13 +20,10 @@ func (e *Engine) heartbeatLoop(ctx context.Context) {
 	}
 }
 
-// heartbeatOnce renews every lease this process holds in one statement and brings
-// back cancel signals (§2.3). A lease the database no longer attributes to us is
-// dropped: its ctx is cancelled and its result will not be reported. The statement is
-// bounded by HeartbeatInterval and derives from hbCtx, not the host's ctx: only
-// Shutdown step 6 cancels it, when inflight is already empty and nothing is left to
-// renew, so hb.Wait cannot outlast the host's budget by a blocked statement.
+// Heartbeat I/O uses hbCtx and is bounded by HeartbeatInterval. Shutdown cancels it
+// only after draining inflight, so blocked I/O cannot extend hb.Wait (§2.3/§2.6).
 func (e *Engine) heartbeatOnce(ctx context.Context) {
+	e.heartbeatHealth.tick()
 	ids, tokens, infs := e.inflight.snapshot()
 	if len(ids) == 0 {
 		e.lastOK = time.Now()
@@ -42,9 +39,9 @@ func (e *Engine) heartbeatOnce(ctx context.Context) {
 			return
 		}
 		e.log.Error("heartbeat failed", "err", err, "leases", len(ids))
-		// local deadline on the monotonic clock: never assume a lease we could not renew.
-		// Only a heartbeat moves it: a claim succeeding meanwhile proves the database is
-		// reachable, not that the older leases were renewed.
+		e.heartbeatHealth.finish(err)
+		// Only a successful heartbeat resets the monotonic deadline; a successful
+		// claim does not prove older leases were renewed.
 		if time.Since(e.lastOK) > e.cfg.LeaseTTL-e.cfg.HeartbeatInterval {
 			for _, inf := range infs {
 				e.drop(inf)
@@ -68,6 +65,9 @@ func (e *Engine) heartbeatOnce(ctx context.Context) {
 			inf.cancel(errCancelRequested)
 		}
 	}
+	if ctx.Err() == nil {
+		e.heartbeatHealth.finish(nil)
+	}
 }
 
 func (e *Engine) drop(inf *inflight) {
@@ -76,5 +76,5 @@ func (e *Engine) drop(inf *inflight) {
 	}
 	inf.cancel(errLeaseLost)
 	e.metrics.Count("lease_lost_total", 1)
-	e.log.Warn("lease lost", "run_id", inf.id)
+	e.log.Warn("lease lost", "run_id", inf.id, "execution_id", executionId(inf.token))
 }

@@ -12,8 +12,6 @@ import (
 	"github.com/mbeoliero/skein/internal/store"
 )
 
-// Schedules, retention, Stats and listing acceptance checks.
-
 type metricsRec struct {
 	mu     sync.Mutex
 	counts map[string]int
@@ -65,12 +63,19 @@ func dueAt(t *testing.T, pool *pgxpool.Pool, schema, name string, at time.Time) 
 // lock, which is one per database, not per schema.
 func maintain(t *testing.T, e *Engine) {
 	t.Helper()
-	waitFor(t, "the maintenance lock", func() bool { return !e.maintainOnce(t.Context()) })
+	waitFor(t, "the maintenance lock", func(ctx context.Context) bool { return !e.maintainOnce(ctx) })
 }
 
 func scheduledRuns(t *testing.T, e *Engine, schedule string) []JobRun {
 	t.Helper()
-	page, _, err := e.Runs().List(t.Context(), RunFilter{Limit: 500}, 0)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	return scheduledRunsContext(t, ctx, e, schedule)
+}
+
+func scheduledRunsContext(t *testing.T, ctx context.Context, e *Engine, schedule string) []JobRun {
+	t.Helper()
+	page, _, err := e.Runs().List(ctx, RunFilter{Limit: 500}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +155,6 @@ func TestSchedulePutValidationAndIdempotence(t *testing.T) {
 	if row, _ = st.GetSchedule(t.Context(), "s"); !row.NextRunAt.Equal(first.Add(-time.Hour)) {
 		t.Fatalf("same config moved next_run_at to %v", row.NextRunAt)
 	}
-	// a changed rule recomputes
 	spec.Cron = "0 4 * * *"
 	if err := e.Schedules().Put(t.Context(), spec); err != nil {
 		t.Fatal(err)
@@ -239,7 +243,7 @@ func TestTwoInstancesFireOnce(t *testing.T) {
 	for beat := 1; beat <= 5; beat++ {
 		due := time.Now().Add(-time.Duration(beat) * time.Hour).Truncate(time.Second)
 		dueAt(t, pool, schema, "s", due)
-		waitFor(t, "beat to fire", func() bool { return len(scheduledRuns(t, a, "s")) >= beat })
+		waitFor(t, "beat to fire", func(ctx context.Context) bool { return len(scheduledRunsContext(t, ctx, a, "s")) >= beat })
 		for _, engine := range []*Engine{a, b} {
 			if _, err := engine.st.ScanDue(t.Context(), nextRun); err != nil {
 				t.Fatal(err)
@@ -271,9 +275,9 @@ func TestCatchUpOneBeat(t *testing.T) {
 	if err := e.Schedules().Put(t.Context(), ScheduleSpec{Name: "s", Job: "j", Cron: yearly, Overlap: OverlapAllow}); err != nil {
 		t.Fatal(err)
 	}
-	missed := time.Now().AddDate(-3, 0, 0).Truncate(time.Second) // three periods behind
+	missed := time.Now().AddDate(-3, 0, 0).Truncate(time.Second)
 	dueAt(t, pool, schema, "s", missed)
-	waitFor(t, "catch-up beat", func() bool { return len(scheduledRuns(t, e, "s")) >= 1 })
+	waitFor(t, "catch-up beat", func(ctx context.Context) bool { return len(scheduledRunsContext(t, ctx, e, "s")) >= 1 })
 	if _, err := e.st.ScanDue(t.Context(), nextRun); err != nil {
 		t.Fatal(err)
 	}
@@ -305,9 +309,9 @@ func TestOverlapSkip(t *testing.T) {
 		t.Fatal(err)
 	}
 	dueAt(t, pool, schema, "s", time.Now().Add(-2*time.Hour))
-	waitFor(t, "first beat", func() bool { return len(scheduledRuns(t, e, "s")) == 1 })
+	waitFor(t, "first beat", func(ctx context.Context) bool { return len(scheduledRunsContext(t, ctx, e, "s")) == 1 })
 	dueAt(t, pool, schema, "s", time.Now().Add(-time.Hour))
-	waitFor(t, "second beat skipped", func() bool { return rec.get("schedule_skipped_total", "reason", "overlap") == 1 })
+	waitFor(t, "second beat skipped", func(ctx context.Context) bool { return rec.get("schedule_skipped_total", "reason", "overlap") == 1 })
 	if runs := scheduledRuns(t, e, "s"); len(runs) != 1 || runs[0].DedupKey != "sched:s" {
 		t.Fatalf("runs %+v", runs)
 	}
@@ -316,7 +320,7 @@ func TestOverlapSkip(t *testing.T) {
 		t.Fatal(err)
 	}
 	dueAt(t, pool, schema, "s", time.Now().Add(-30*time.Minute))
-	waitFor(t, "allowed beat", func() bool { return len(scheduledRuns(t, e, "s")) == 2 })
+	waitFor(t, "allowed beat", func(ctx context.Context) bool { return len(scheduledRunsContext(t, ctx, e, "s")) == 2 })
 	close(gate)
 	for _, r := range scheduledRuns(t, e, "s") {
 		waitRun(t, e, r.Id, StateSucceeded)
@@ -338,8 +342,8 @@ func TestScheduledWorkflow(t *testing.T) {
 	due := time.Now().Add(-time.Hour).Truncate(time.Second)
 	dueAt(t, pool, schema, "s", due)
 	var run *WorkflowRun
-	waitFor(t, "scheduled workflow", func() bool {
-		page, _, err := e.Workflows().ListRuns(t.Context(), WorkflowRunFilter{WorkflowName: "w"}, 0)
+	waitFor(t, "scheduled workflow", func(ctx context.Context) bool {
+		page, _, err := e.Workflows().ListRuns(ctx, WorkflowRunFilter{WorkflowName: "w"}, 0)
 		if err != nil || len(page) == 0 {
 			return false
 		}
@@ -371,7 +375,7 @@ func TestRetentionKeepsNodesOfLiveWorkflows(t *testing.T) {
 	declareWorkflow(t, e, WorkflowSpec{Name: "w", Nodes: []Node{{Job: "a"}, {Job: "b", Deps: []string{"a"}}}})
 
 	finish := func(id int64, state string, age time.Duration) {
-		execSql(t, pool, "UPDATE "+qualified(schema, "job_run")+" SET state = '"+state+"', finished_at = now() - interval '"+age.String()+"', lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL WHERE id = "+itoa(id))
+		execSql(t, pool, "UPDATE "+qualified(schema, "job_run")+" SET state = '"+state+"', finished_at = now() - interval '"+age.String()+"', lease_token = NULL, extra = extra - 'lease_owner', lease_expires_at = NULL WHERE id = "+itoa(id))
 	}
 	oldOK := trigger(t, e, "j", "")
 	finish(oldOK, "succeeded", 8*24*time.Hour)
@@ -432,7 +436,7 @@ func TestRetentionSkipsResumedWorkflow(t *testing.T) {
 	execSql(t, pool, "UPDATE "+jr+" SET state = 'failed', finished_at = now() - interval '31 days' WHERE id = "+itoa(nodeOf(t, run, "a").Id))
 	execSql(t, pool, "UPDATE "+wr+" SET state = 'failed', finished_at = now() - interval '31 days' WHERE id = "+itoa(id))
 
-	// Resume's first statement, held while retention runs (§2.5)
+	// Hold the parent lock while retention selects the expired workflow (§2.5).
 	tx, err := pool.Begin(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -447,7 +451,6 @@ func TestRetentionSkipsResumedWorkflow(t *testing.T) {
 		}
 	}()
 	waitBlocked(t, pool, schema)
-	// the rest of Resume, then commit: the workflow is running again
 	execSql(t, tx, "UPDATE "+jr+" SET state = 'pending', attempt = 0, run_at = now(), started_at = NULL, finished_at = NULL, output = NULL WHERE workflow_run_id = "+itoa(id))
 	execSql(t, tx, "UPDATE "+wr+" SET state = 'running', finished_at = NULL WHERE id = "+itoa(id))
 	if err := tx.Commit(t.Context()); err != nil {
@@ -485,30 +488,13 @@ func TestScanDisablesScheduleWithoutNextFireTime(t *testing.T) {
 	if n := len(scheduledRuns(t, e, "s")); n != 0 || rec.get("schedule_skipped_total", "reason", "no_next") != 1 {
 		t.Fatalf("runs %d, counts %v", n, rec.counts)
 	}
-	e.scanOnce() // disabled: not picked up again
+	e.scanOnce()
 	if rec.get("schedule_skipped_total", "reason", "no_next") != 1 {
 		t.Fatalf("counts %v", rec.counts)
 	}
 }
 
-// A process that registered nothing must still report the backlog it cannot serve:
-// a nil slice would reach the database as NULL, and NOT x = ANY(NULL) is never true.
-func TestStatsWithoutExecutors(t *testing.T) {
-	t.Parallel()
-	pool, schema := freshSchema(t)
-	e := startEngine(t, pool, submitOnly(schema), nil)
-	declare(t, e, JobSpec{Name: "j", ExecutorType: "nobody"})
-	trigger(t, e, "j", "")
-	s, err := e.Stats(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s.PendingDue != 1 || s.UnregisteredDue != 1 {
-		t.Fatalf("%+v", s)
-	}
-}
-
-func TestStatsAndList(t *testing.T) {
+func TestRunsList(t *testing.T) {
 	t.Parallel()
 	pool, schema := freshSchema(t)
 	cfg := submitOnly(schema)
@@ -520,13 +506,6 @@ func TestStatsAndList(t *testing.T) {
 	ids := []int64{trigger(t, e, "x1", ""), trigger(t, e, "x1", ""), trigger(t, e, "y1", ""), trigger(t, e, "x1", "", At(time.Now().Add(time.Hour)))}
 	ids = append(ids, trigger(t, e, "x1", ""))
 	claimAsDeadHolder(t, pool, schema, "x")
-	s, err := e.Stats(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s.PendingDue != 3 || s.Running != 1 || s.UnregisteredDue != 1 || s.OldestPendingAge <= 0 {
-		t.Fatalf("%+v", s)
-	}
 
 	var seen []int64
 	var cursor int64
