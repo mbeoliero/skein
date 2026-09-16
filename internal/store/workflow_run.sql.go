@@ -596,3 +596,75 @@ func (q *Queries) WorkflowRunWithNodes(ctx context.Context, db DBTX, id int64) (
 	}
 	return items, nil
 }
+
+const WorkflowRunWithNodesByDedup = `-- name: WorkflowRunWithNodesByDedup :many
+SELECT w.id, w.workflow_name, w.schedule_name, w.scheduled_at, w.dedup_key, w.input, w.dag, w.state, w.created_at, w.finished_at, w.extra, r.id, r.job_name, r.schedule_name, r.scheduled_at, r.dedup_key, r.workflow_run_id, r.executor_type, r.params, r.timeout, r.retry_policy, r.state, r.attempt, r.cancel_requested, r.run_at, r.lease_expires_at, r.lease_token, r.created_at, r.started_at, r.finished_at, r.output, r.errors, r.extra
+  FROM workflow_run w JOIN job_run r ON r.workflow_run_id = w.id
+ WHERE w.workflow_name = $1 AND w.dedup_key = $2::text AND w.schedule_name IS NULL
+ ORDER BY r.job_name
+`
+
+type WorkflowRunWithNodesByDedupParams struct {
+	WorkflowName string
+	DedupKey     string
+}
+
+type WorkflowRunWithNodesByDedupRow struct {
+	WorkflowRun WorkflowRun
+	JobRun      JobRun
+}
+
+// §3.3 Workflows.FindRun: WorkflowRunWithNodes keyed by the user dedup key (idx_workflow_run_dedup)
+func (q *Queries) WorkflowRunWithNodesByDedup(ctx context.Context, db DBTX, arg WorkflowRunWithNodesByDedupParams) ([]WorkflowRunWithNodesByDedupRow, error) {
+	rows, err := db.Query(ctx, WorkflowRunWithNodesByDedup, arg.WorkflowName, arg.DedupKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WorkflowRunWithNodesByDedupRow{}
+	for rows.Next() {
+		var i WorkflowRunWithNodesByDedupRow
+		if err := rows.Scan(
+			&i.WorkflowRun.Id,
+			&i.WorkflowRun.WorkflowName,
+			&i.WorkflowRun.ScheduleName,
+			&i.WorkflowRun.ScheduledAt,
+			&i.WorkflowRun.DedupKey,
+			&i.WorkflowRun.Input,
+			&i.WorkflowRun.Dag,
+			&i.WorkflowRun.State,
+			&i.WorkflowRun.CreatedAt,
+			&i.WorkflowRun.FinishedAt,
+			&i.WorkflowRun.Extra,
+			&i.JobRun.Id,
+			&i.JobRun.JobName,
+			&i.JobRun.ScheduleName,
+			&i.JobRun.ScheduledAt,
+			&i.JobRun.DedupKey,
+			&i.JobRun.WorkflowRunId,
+			&i.JobRun.ExecutorType,
+			&i.JobRun.Params,
+			&i.JobRun.Timeout,
+			&i.JobRun.RetryPolicy,
+			&i.JobRun.State,
+			&i.JobRun.Attempt,
+			&i.JobRun.CancelRequested,
+			&i.JobRun.RunAt,
+			&i.JobRun.LeaseExpiresAt,
+			&i.JobRun.LeaseToken,
+			&i.JobRun.CreatedAt,
+			&i.JobRun.StartedAt,
+			&i.JobRun.FinishedAt,
+			&i.JobRun.Output,
+			&i.JobRun.Errors,
+			&i.JobRun.Extra,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

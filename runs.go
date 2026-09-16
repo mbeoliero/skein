@@ -71,6 +71,19 @@ func (r *Runs) Get(ctx context.Context, id int64) (*JobRun, error) {
 	return jobRunFromStore(row), nil
 }
 
+// Find returns the run holding a user dedup key, the row a colliding Trigger reports,
+// terminal or not, without creating one; never triggered or already cleaned up is ErrNotFound.
+func (r *Runs) Find(ctx context.Context, jobName, dedupKey string) (*JobRun, error) {
+	row, err := r.e.st.FindJobRun(ctx, jobName, dedupKey)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return nil, fmt.Errorf("%w: %q key %q", ErrNotFound, jobName, dedupKey)
+	case err != nil:
+		return nil, err
+	}
+	return jobRunFromStore(row), nil
+}
+
 // Resume gives a failed or cancelled ordinary run a fresh retry budget with the same identity.
 // A scheduled run also obeys its current schedule's overlap policy; an in-flight
 // conflict returns ErrDuplicate without changing the run. Workflow nodes must be

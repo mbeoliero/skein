@@ -221,17 +221,34 @@ func (s *Store) GetWorkflowRun(ctx context.Context, id int64) (w WorkflowRun, no
 		if err != nil {
 			return err
 		}
-		if len(rows) == 0 {
-			return ErrNotFound
-		}
-		w = rows[0].WorkflowRun
-		nodes = make([]JobRun, 0, len(rows))
-		for _, r := range rows {
-			nodes = append(nodes, r.JobRun)
-		}
-		return nil
+		w, nodes, err = workflowRunFromRows(rows)
+		return err
 	})
 	return w, nodes, err
+}
+
+func (s *Store) FindWorkflowRun(ctx context.Context, workflowName, dedupKey string) (w WorkflowRun, nodes []JobRun, err error) {
+	err = s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := s.q.WorkflowRunWithNodesByDedup(ctx, tx, WorkflowRunWithNodesByDedupParams{WorkflowName: workflowName, DedupKey: dedupKey})
+		if err != nil {
+			return err
+		}
+		w, nodes, err = workflowRunFromRows(rows)
+		return err
+	})
+	return w, nodes, err
+}
+
+// Both readers split the same one-statement parent-plus-nodes shape (§3.3).
+func workflowRunFromRows[R WorkflowRunWithNodesRow | WorkflowRunWithNodesByDedupRow](rows []R) (WorkflowRun, []JobRun, error) {
+	if len(rows) == 0 {
+		return WorkflowRun{}, nil, ErrNotFound
+	}
+	nodes := make([]JobRun, 0, len(rows))
+	for _, r := range rows {
+		nodes = append(nodes, WorkflowRunWithNodesRow(r).JobRun)
+	}
+	return WorkflowRunWithNodesRow(rows[0]).WorkflowRun, nodes, nil
 }
 
 type NodeContext struct {

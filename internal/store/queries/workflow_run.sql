@@ -50,6 +50,13 @@ SELECT sqlc.embed(w), sqlc.embed(r)
   FROM workflow_run w JOIN job_run r ON r.workflow_run_id = w.id
  WHERE w.id = @id ORDER BY r.job_name;
 
+-- name: WorkflowRunWithNodesByDedup :many
+-- §3.3 Workflows.FindRun: WorkflowRunWithNodes keyed by the user dedup key (idx_workflow_run_dedup)
+SELECT sqlc.embed(w), sqlc.embed(r)
+  FROM workflow_run w JOIN job_run r ON r.workflow_run_id = w.id
+ WHERE w.workflow_name = @workflow_name AND w.dedup_key = @dedup_key::text AND w.schedule_name IS NULL
+ ORDER BY r.job_name;
+
 -- name: NodeStates :many
 -- §2.4 / §2.5: propagate / finalize / resume view of the workflow, via idx_job_run_node
 SELECT job_name, state FROM job_run WHERE workflow_run_id = @workflow_run_id::bigint;

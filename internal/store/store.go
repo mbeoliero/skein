@@ -271,6 +271,17 @@ func (s *Store) GetJobRun(ctx context.Context, id int64) (r JobRun, err error) {
 	return r, err
 }
 
+func (s *Store) FindJobRun(ctx context.Context, jobName, dedupKey string) (r JobRun, err error) {
+	err = s.tx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		r, err = s.q.FindJobRunByDedup(ctx, tx, FindJobRunByDedupParams{JobName: jobName, DedupKey: dedupKey})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	})
+	return r, err
+}
+
 type Claimed struct {
 	ClaimPendingRow
 	Reclaimed bool

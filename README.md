@@ -120,6 +120,8 @@ cfg.Observer = skein.ObserverFunc(func(_ context.Context, event skein.Event) {
 3. 成功占键至 `RetentionSucceeded`（默认 7 天），失败 / 取消至 `RetentionFailed`（默认 30 天）；清理后同键可新建。更长幂等由 retention 或业务记录保证。
 4. 键包含业务身份与周期，如 `invoice:2026-09`；固定 `"nightly"` 键会变成“7 天只跑一次”。防重叠用 `ScheduleSpec.Overlap = OverlapSkip`。
 
+调用方手头没有 id 时（触发前、重启后），`Runs().Find(ctx, job, key)` / `Workflows().FindRun(ctx, workflow, key)` 按键只读定位同一行，不创建 run；未触发或已清理都返回 `ErrNotFound`。
+
 计划拍次由 `(schedule_name, scheduled_at)` 单独保证一拍一行，与手动 Trigger 的键互不影响。
 
 ### 执行器取消与手工续跑
@@ -207,7 +209,7 @@ SKEIN_TEST_REQUIRE_DB=1 SKEIN_SCENARIO=1 SKEIN_SCENARIO_PROFILE=smoke \
 | 领取与租约 | 两支领取及每类型到点读取使用各自索引；安静库心跳 HOT >95%；失败则评审 run_at 兼作租约到期、合并领取的单列退路，接受心跳写索引，不叠加参数。无持续积压、数据库可用且有空槽的独立窗口中，60s 租约配置下 kill 后 ≤75s 接管且 attempt +1；暂停超过 60s 恢复后旧 token 不可写；预算耗尽重领直接 failed。持续双类积压时，每 8 个有效领取轮次至少一次优先回收，单槽也须双方进展；这不构成满载时的秒数 SLA。见 [store_test.go](store_test.go)、[reliability_test.go](reliability_test.go)、[lease_process_test.go](lease_process_test.go)、[claim_fairness_test.go](claim_fairness_test.go)；真实 60s 租约验收单轮约 65–90s。 |
 | 工作流与锁序 | 空定义拒绝；100 个并行前驱只激活一次汇合；fail-fast 收敛全部节点；Resume 不重跑成功节点且 started_at 不变；关键事务对并发 1000 轮无死锁，取消须在领取未提交时完成，并覆盖提交与回滚。清理不得删除在途工作流的已完成节点，或被 Resume 改回运行中的父行。见 [workflows_test.go](workflows_test.go)、[race_test.go](race_test.go)、[schedules_maintenance_test.go](schedules_maintenance_test.go)。 |
 | 计划与唤醒 | 两实例同拍只建一份；反复 Put 不推迟；错过三个周期仅补一拍；在途重叠须跳过。5s 轮询、独立无积压窗口中，以 DB 入口时刻减 run_at 验证 Trigger / TriggerTx、700ms 延迟、退避、cron、released 与锁后到期行均不提前且 ≤300ms；监听中断仍须在 PollInterval 内领取，重连计数 =1；核查触发器规则、心跳 HOT 不变及短任务吞吐不再被轮询封顶（对照 [baseline](docs/baseline.md)）。见 [wake_test.go](wake_test.go)。 |
-| 输出、去重与生命周期 | nil / 非 nil 空输出均成功；无效 jsonb 与非法错误文本可结算；同键返回原 id，含已终态且不改 params；持有者被清理时重试新建，三轮耗尽零 id；停机不能等待启动查库或补启动循环，不合作执行器须报 ErrNotDrained。见 `TestEmptyOutputSucceeds`、`TestDedupHoldsAfterFinish`、`TestDedupRoundsWhenWinnersVanish`、`TestShutdownCancelsStart` 及 [worker_test.go](worker_test.go)。 |
+| 输出、去重与生命周期 | nil / 非 nil 空输出均成功；无效 jsonb 与非法错误文本可结算；同键返回原 id，含已终态且不改 params；按键只读定位返回同一行，未持有为 ErrNotFound；持有者被清理时重试新建，三轮耗尽零 id；停机不能等待启动查库或补启动循环，不合作执行器须报 ErrNotDrained。见 `TestEmptyOutputSucceeds`、`TestDedupHoldsAfterFinish`、`TestFindByDedupKey`、`TestDedupRoundsWhenWinnersVanish`、`TestShutdownCancelsStart` 及 [worker_test.go](worker_test.go)。 |
 | 元数据与追踪 | schema 1 升级保留状态及租约，拒绝非法 owner / extra 组合；普通任务与工作流跨进程恢复 TraceContext，不继承请求取消与 deadline；重试、Snooze、Resume、去重保留提交关联，每次领取使用独立 ExecutionId。见 [migration_test.go](migration_test.go)、[tracing_test.go](tracing_test.go)。 |
 | 提交后通知 | 回调时已提交且无事务行锁；Commit 失败、失租、幂等空操作不通知；取消守卫、下游取消、工作流聚合终态和 Resume 事件正确；回调 panic 不破坏已提交结果或后续通知；接管回调期间保持租约跟踪，失租后不进入 Executor。见 [observer_test.go](observer_test.go)、[observer_workflow_test.go](observer_workflow_test.go)、[observer_reclaim_test.go](observer_reclaim_test.go)。 |
 | 健康与分类积压 | 区分启动中、运行、停机和残留槽位；Observer 内读取健康不得等待 Shutdown；领取部分失败仍派发已提交任务，空转保留前次结果，故障恢复清除错误，停机取消心跳不计失败；Stats 分类和总量同一快照，覆盖未来、blocked、终态与本实例注册口径。见 [health_test.go](health_test.go)、[health_loops_test.go](health_loops_test.go)、[stats_test.go](stats_test.go)。 |

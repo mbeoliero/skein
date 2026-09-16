@@ -191,6 +191,22 @@ func (w *Workflows) GetRun(ctx context.Context, id int64) (*WorkflowRun, error) 
 	if err != nil {
 		return nil, mapErr(err, strconv.FormatInt(id, 10))
 	}
+	return workflowRunWithNodesFromStore(row, nodes)
+}
+
+// FindRun returns the workflow run holding a user dedup key with all its nodes; see Runs.Find.
+func (w *Workflows) FindRun(ctx context.Context, workflowName, dedupKey string) (*WorkflowRun, error) {
+	row, nodes, err := w.e.st.FindWorkflowRun(ctx, workflowName, dedupKey)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return nil, fmt.Errorf("%w: %q key %q", ErrNotFound, workflowName, dedupKey)
+	case err != nil:
+		return nil, err
+	}
+	return workflowRunWithNodesFromStore(row, nodes)
+}
+
+func workflowRunWithNodesFromStore(row store.WorkflowRun, nodes []store.JobRun) (*WorkflowRun, error) {
 	run, err := workflowRunFromStore(row)
 	if err != nil {
 		return nil, err

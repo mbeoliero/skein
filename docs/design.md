@@ -645,6 +645,7 @@ ErrLeaseLost 仅内部使用；[公共错误](../errors.go) · [分类实现](..
 |---|---|
 | Trigger / TriggerTx | 提交与去重结果见 §2.1；TriggerTx 路径隔离见 §1.3 |
 | Get / GetRun | 实例快照；工作流父与全部节点来自**同一语句快照**，不能拼出不同时点状态 |
+| Find / FindRun | 按名称与用户 DedupKey 只读定位持有者：命中即撞键 Trigger 会返回的那一行，不看 state，不创建 run；未触发与已清理同为 ErrNotFound；计划拍的 sched 键不匹配 |
 | 实例 Extra | 只读暴露库管理的元数据；JobRun.LeaseOwner 仍从 extra 映射为字符串，不开放任意元数据写入接口 |
 | List | 名称 / 状态过滤、id DESC；上页最后 id 作游标，多读一行判断尾页，不用 created_at |
 | Stats | 单 SQL 按 executor_type 聚合到期量、running、最老年龄与注册标记，返回 ByExecutor 和汇总；无注册类型传空数组，不传 NULL |

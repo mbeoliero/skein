@@ -13,6 +13,11 @@ RETURNING id;
 SELECT id FROM job_run
  WHERE job_name = @job_name AND dedup_key = @dedup_key::text AND schedule_name IS NULL;
 
+-- name: FindJobRunByDedup :one
+-- §3.3 Runs.Find: the whole row holding a user dedup key, terminal or not (idx_job_run_dedup)
+SELECT * FROM job_run
+ WHERE job_name = @job_name AND dedup_key = @dedup_key::text AND schedule_name IS NULL;
+
 -- name: FindInflightBeat :one
 -- §2.1: the in-flight overlap=skip beat holding 'sched:<name>' (idx_job_run_overlap)
 SELECT id FROM job_run

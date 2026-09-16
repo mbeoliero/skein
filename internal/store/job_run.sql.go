@@ -246,6 +246,47 @@ func (q *Queries) FindInflightBeat(ctx context.Context, db DBTX, arg FindInfligh
 	return id, err
 }
 
+const FindJobRunByDedup = `-- name: FindJobRunByDedup :one
+SELECT id, job_name, schedule_name, scheduled_at, dedup_key, workflow_run_id, executor_type, params, timeout, retry_policy, state, attempt, cancel_requested, run_at, lease_expires_at, lease_token, created_at, started_at, finished_at, output, errors, extra FROM job_run
+ WHERE job_name = $1 AND dedup_key = $2::text AND schedule_name IS NULL
+`
+
+type FindJobRunByDedupParams struct {
+	JobName  string
+	DedupKey string
+}
+
+// §3.3 Runs.Find: the whole row holding a user dedup key, terminal or not (idx_job_run_dedup)
+func (q *Queries) FindJobRunByDedup(ctx context.Context, db DBTX, arg FindJobRunByDedupParams) (JobRun, error) {
+	row := db.QueryRow(ctx, FindJobRunByDedup, arg.JobName, arg.DedupKey)
+	var i JobRun
+	err := row.Scan(
+		&i.Id,
+		&i.JobName,
+		&i.ScheduleName,
+		&i.ScheduledAt,
+		&i.DedupKey,
+		&i.WorkflowRunId,
+		&i.ExecutorType,
+		&i.Params,
+		&i.Timeout,
+		&i.RetryPolicy,
+		&i.State,
+		&i.Attempt,
+		&i.CancelRequested,
+		&i.RunAt,
+		&i.LeaseExpiresAt,
+		&i.LeaseToken,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.Output,
+		&i.Errors,
+		&i.Extra,
+	)
+	return i, err
+}
+
 const GetJobRun = `-- name: GetJobRun :one
 SELECT id, job_name, schedule_name, scheduled_at, dedup_key, workflow_run_id, executor_type, params, timeout, retry_policy, state, attempt, cancel_requested, run_at, lease_expires_at, lease_token, created_at, started_at, finished_at, output, errors, extra FROM job_run WHERE id = $1
 `

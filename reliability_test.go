@@ -800,3 +800,49 @@ func TestDedupHoldsAfterFinish(t *testing.T) {
 		t.Fatalf("duplicate trigger changed params: %s -> %s", run.Params, again.Params)
 	}
 }
+
+// The job and the workflow share the key text: names isolate keys, and the
+// workflow's node of the same job holds none, so Runs.Find never returns it.
+func TestFindByDedupKey(t *testing.T) {
+	t.Parallel()
+	pool, schema := freshSchema(t)
+	e := startEngine(t, pool, fastConfig(schema), func(e *Engine) {
+		e.Register("quick", func(ctx context.Context, req *Request) (RawJSON, error) { return req.Params, nil })
+	})
+	declare(t, e, JobSpec{Name: "j", ExecutorType: "quick"})
+	declareWorkflow(t, e, WorkflowSpec{Name: "w", Nodes: []Node{{Job: "j"}}})
+
+	if _, err := e.Runs().Find(t.Context(), "j", "k"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("find before trigger: %v, want ErrNotFound", err)
+	}
+	jobId := trigger(t, e, "j", `{"n":1}`, DedupKey("k"))
+	wfId := triggerWorkflow(t, e, "w", "", DedupKey("k"))
+	waitRun(t, e, jobId, StateSucceeded)
+	waitWorkflow(t, e, wfId, WorkflowSucceeded)
+
+	run, err := e.Runs().Find(t.Context(), "j", "k")
+	if err != nil {
+		t.Fatalf("find job: %v", err)
+	}
+	if run.Id != jobId || run.State != StateSucceeded || run.DedupKey != "k" {
+		t.Fatalf("find job: id %d state %s key %q, want %d succeeded k", run.Id, run.State, run.DedupKey, jobId)
+	}
+	wf, err := e.Workflows().FindRun(t.Context(), "w", "k")
+	if err != nil {
+		t.Fatalf("find workflow: %v", err)
+	}
+	if wf.Id != wfId || wf.State != WorkflowSucceeded || len(wf.Nodes) != 1 || wf.Nodes[0].JobName != "j" {
+		t.Fatalf("find workflow: id %d state %s nodes %d, want %d succeeded with node j", wf.Id, wf.State, len(wf.Nodes), wfId)
+	}
+	if again, err := e.Jobs().Trigger(t.Context(), "j", RawJSON(`{}`), DedupKey("k")); !errors.Is(err, ErrDuplicate) || again != jobId {
+		t.Fatalf("trigger after find: %d %v, want %d ErrDuplicate", again, err, jobId)
+	}
+	for _, key := range []string{"other", ""} {
+		if _, err := e.Runs().Find(t.Context(), "j", key); !errors.Is(err, ErrNotFound) {
+			t.Errorf("find job key %q: %v, want ErrNotFound", key, err)
+		}
+		if _, err := e.Workflows().FindRun(t.Context(), "w", key); !errors.Is(err, ErrNotFound) {
+			t.Errorf("find workflow key %q: %v, want ErrNotFound", key, err)
+		}
+	}
+}
