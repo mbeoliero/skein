@@ -468,7 +468,7 @@ func TestResumeRerunsFailedChain(t *testing.T) {
 	var rec recorder
 	var fixed sync.Map
 	bMayFail := make(chan struct{})
-	e := startEngine(t, pool, fastConfig(schema), func(e *Engine) {
+	e := startEngine(t, pool, behaviorConfig(schema), func(e *Engine) {
 		e.Register("ok", func(ctx context.Context, req *Request) (RawJSON, error) {
 			rec.add(req)
 			return RawJSON(`"` + req.JobName + `"`), nil

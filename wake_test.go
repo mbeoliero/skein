@@ -22,6 +22,8 @@ func slowPoll(schema string) Config {
 
 // tight is the acceptance bound for a wake and its database round trips on the
 // test machine; it is not a production SLA (README.md validation entry).
+// Timing checks run without t.Parallel so this package's other tests cannot load
+// the database during the independent measurement window required by that check.
 const tight = 300 * time.Millisecond
 
 // entryClock is an executor that reads the database clock on entry, so that entry −
@@ -69,7 +71,6 @@ func apiOnly(schema string) Config {
 // A run triggered on one instance starts on another within a round trip: the API
 // instance (DisableWorker) has no claim loop, so only NOTIFY can carry it.
 func TestRemoteTriggerStartsAtOnce(t *testing.T) {
-	t.Parallel()
 	pool, schema := freshSchema(t)
 	exec, entries := entryClock(pool)
 	worker := startEngine(t, pool, slowPoll(schema), func(e *Engine) { e.Register("echo", exec) })
@@ -102,7 +103,6 @@ func TestRemoteTriggerStartsAtOnce(t *testing.T) {
 // A delayed run starts at its run_at, not at the next poll: the claimer read the
 // nearest pending run_at and slept until then.
 func TestDelayedRunStartsOnTime(t *testing.T) {
-	t.Parallel()
 	pool, schema := freshSchema(t)
 	exec, entries := entryClock(pool)
 	worker := startEngine(t, pool, slowPoll(schema), func(e *Engine) { e.Register("echo", exec) })
@@ -119,7 +119,6 @@ func TestDelayedRunStartsOnTime(t *testing.T) {
 
 // A retry with backoff is a delayed run created by a settle: the same timer covers it.
 func TestRetryBackoffFiresOnTime(t *testing.T) {
-	t.Parallel()
 	pool, schema := freshSchema(t)
 	cfg := slowPoll(schema)
 	cfg.BackoffBase, cfg.BackoffMax = 500*time.Millisecond, 500*time.Millisecond
@@ -146,7 +145,6 @@ func TestRetryBackoffFiresOnTime(t *testing.T) {
 // next_run_at instead of waiting for the poll. The beat is placed 700ms ahead through
 // the fixture, then the loop is nudged so it reads the new time.
 func TestCronBeatFiresOnTime(t *testing.T) {
-	t.Parallel()
 	pool, schema := freshSchema(t)
 	exec, entries := entryClock(pool)
 	e := startEngine(t, pool, slowPoll(schema), func(e *Engine) { e.Register("echo", exec) })
@@ -181,7 +179,6 @@ func TestCronBeatFiresOnTime(t *testing.T) {
 // Put on one instance wakes the scheduler of another through the schedule trigger:
 // the scanning instance had nothing to sleep for and would otherwise poll in 5s.
 func TestRemotePutWakesScheduler(t *testing.T) {
-	t.Parallel()
 	pool, schema := freshSchema(t)
 	exec, entries := entryClock(pool)
 	scanner := startEngine(t, pool, slowPoll(schema), func(e *Engine) { e.Register("echo", exec) })
@@ -212,7 +209,6 @@ func TestRemotePutWakesScheduler(t *testing.T) {
 // Shutdown releases a run; another instance picks it up at once through NOTIFY
 // (settle released leaves a pending row) instead of at its next poll.
 func TestReleasedRunIsReclaimedAtOnce(t *testing.T) {
-	t.Parallel()
 	pool, schema := freshSchema(t)
 	entered := make(chan struct{}, 1)
 	cfgA := slowPoll(schema)
@@ -245,7 +241,6 @@ func TestReleasedRunIsReclaimedAtOnce(t *testing.T) {
 // then rolled back, or one that came due right after the claim) is found by the
 // next-due read and reclaimed after wakeFloor, not at the next poll.
 func TestDueRowLeftBehindIsClaimedAtOnce(t *testing.T) {
-	t.Parallel()
 	pool, schema := freshSchema(t)
 	exec, entries := entryClock(pool)
 	worker := startEngine(t, pool, slowPoll(schema), func(e *Engine) { e.Register("echo", exec) })
@@ -289,7 +284,6 @@ func TestDueRowLeftBehindIsClaimedAtOnce(t *testing.T) {
 // With one slot and a 5s poll, five runs must finish back to back because
 // freeing a slot wakes the claimer.
 func TestSlotReleaseClaimsAgainAtOnce(t *testing.T) {
-	t.Parallel()
 	pool, schema := freshSchema(t)
 	cfg := slowPoll(schema)
 	cfg.Concurrency = 1
@@ -313,7 +307,6 @@ func TestSlotReleaseClaimsAgainAtOnce(t *testing.T) {
 // The listener's backend is killed: the next trigger still arrives within the poll,
 // the reconnect is counted, and once reconnected delivery is immediate again.
 func TestListenerReconnects(t *testing.T) {
-	t.Parallel()
 	pool, schema := freshSchema(t)
 	rec := &metricsRec{}
 	cfg := slowPoll(schema)
